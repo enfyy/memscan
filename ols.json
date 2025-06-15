@@ -1,0 +1,51 @@
+{
+    "$schema": "https://raw.githubusercontent.com/DanielGavin/ols/master/misc/ols.schema.json",
+    "collections": [
+        {
+            "name": "core",
+            "path": "C:\\dev\\Odin\\core"
+        },
+        {
+            "name": "vendor",
+            "path": "C:\\dev\\Odin\\vendor"
+        },
+        {
+            "name": "base",
+            "path": "C:\\dev\\Odin\\base"
+        }
+    ],
+    "checker_args": "-ignore-unknown-attributes -error-pos-style:unix",
+    "enable_format": true,
+    "enable_hover": true,
+    "enable_snippets": true,
+    "enable_semantic_tokens": true,
+    "enable_document_symbols": true,
+    "enable_inlay_hints": false,
+    "enable_procedure_snippet": true,
+    "enable_fake_methods": true,
+    "profile": "default",
+    "profiles": [
+        {
+            "name": "default",
+            "checker_path": [
+                "src",
+                "lib"
+            ]
+        },
+        {
+            "name": "linux_profile",
+            "os": "linux",
+            "checker_path": [
+                "src/main.odin"
+            ]
+        },
+        {
+            "name": "windows_profile",
+            "os": "windows",
+            "checker_path": [
+                "src",
+                "lib"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,24 @@
+{
+  "actionButtons": {
+    "commands": [
+      {
+        "name": "Build debug",
+        "command": ".\\build.bat debug",
+        "cwd": "${workspaceFolder}",
+        "singleInstance": true,
+      },
+      {
+        "name": "Build release",
+        "command": ".\\build.bat release",
+        "cwd": "${workspaceFolder}",
+        "singleInstance": true,
+      }
+    ],
+    "defaultColor": "white",
+    "reloadButton": "↻",
+    "loadNpmCommands": false
+  },
+  "editor.rulers": [
+    120
+  ]
+}

@@ -1,3 +1,0 @@
-Paths to libs / Пути до библиотек:
-    import rlimgui "../lib/imgui_impl_raylib"
-    import imgui "../lib/odin-imgui"
