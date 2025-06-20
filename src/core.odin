@@ -10,6 +10,14 @@ import "core:strconv"
 
 MAX_SEARCH_RESULTS: uint = 10000
 
+Process_Search_Result :: struct {
+  process_id:   u32,
+  process_name: string,
+  window_title: string,
+}
+
+Scan_Result :: struct {
+}
 // main :: proc() {
 //   PROCESS_NAME :: "Neuz.exe"
 
@@ -55,6 +63,8 @@ initial_scan :: proc(
   start_address: ^win.BYTE,
   end_address: ^win.BYTE,
   value_target: T,
+) -> (
+  result: Scan_Result,
 ) {
   results_count: uint = 0
   search_value_size: uint = size_of(T)
@@ -64,8 +74,11 @@ initial_scan :: proc(
   buffer := new([4096]byte)
 
   fmt.println("Performing initial scan...")
-  for mem.ptr_sub(end_address, current_address) > 0 &&
-      win.VirtualQueryEx(process_handle, current_address, &mem_info, mem_info_size) == mem_info_size {
+
+  // iterate memory regions
+  for ; mem.ptr_sub(end_address, current_address) > 0 &&
+      win.VirtualQueryEx(process_handle, current_address, &mem_info, mem_info_size) == mem_info_size;
+      current_address = mem.ptr_offset(current_address, mem_info.RegionSize) {
 
     memory_region_is_readable :=
       mem_info.State == win.MEM_COMMIT &&
@@ -74,73 +87,45 @@ initial_scan :: proc(
 
     if !memory_region_is_readable {
       fmt.println("Skipping unreadable memory region")
-    } else {
-      scan_end := mem.ptr_offset(current_address, mem_info.RegionSize)
-      if scan_end > end_address do scan_end = end_address // clamp end address
-      bytes_to_read: uint = min(4096, uint(mem.ptr_sub(scan_end, current_address))) // ensure we don't read past region boundary
+      continue
+    }
 
-      fmt.printfln("Scanning memory region %#v (%d bytes)", current_address, bytes_to_read)
-      size_read: uint
-      read_ok := win.ReadProcessMemory(process_handle, current_address, raw_data(buffer), bytes_to_read, &size_read)
-      fmt.printfln("ReadProcessMemory: %v - READ %d bytes out of %d", read_ok, size_read, bytes_to_read)
-      if !read_ok {
-        fmt.println("Failed to read process memory. Error code:", win.GetLastError())
-        return
+    // read region
+    scan_end := mem.ptr_offset(current_address, mem_info.RegionSize)
+    if scan_end > end_address do scan_end = end_address // clamp end address
+    bytes_to_read: uint = min(4096, uint(mem.ptr_sub(scan_end, current_address))) // ensure we don't read past region boundary
+
+    fmt.printfln("Scanning memory region %#v (%d bytes)", current_address, bytes_to_read)
+    size_read: uint
+    read_ok := win.ReadProcessMemory(process_handle, current_address, raw_data(buffer), bytes_to_read, &size_read)
+    fmt.printfln("ReadProcessMemory: %v - READ %d bytes out of %d", read_ok, size_read, bytes_to_read)
+    if !read_ok {
+      fmt.println("Failed to read process memory. Error code:", win.GetLastError())
+      continue
+    }
+
+    // iterate every address but skip the ones that dont align with the type
+    for offset: uint = 0; offset < size_read - search_value_size && results_count < MAX_SEARCH_RESULTS; offset += 1 {
+      if offset % align_of(T) != 0 {
+        continue
       }
 
-      for offset: uint = 0; offset < size_read - search_value_size && results_count < MAX_SEARCH_RESULTS; offset += 1 {
-        if offset % align_of(T) != 0 {
-          continue
-        }
+      // // Safely read the value
+      // value: T
+      // mem.copy(&value, &buffer[offset], size_of(T))
 
-        // // Safely read the value
-        // value: T
-        // mem.copy(&value, &buffer[offset], size_of(T))
-
-        // if value == value_target {
-        //   fmt.printfln(
-        //     "\n\nFound target value %v at address: %#v\n\n",
-        //     value_target,
-        //     mem.ptr_offset(current_address, offset),
-        //   )
-        //   results_count += 1
-        // }
-      }
+      // if value == value_target {
+      //   fmt.printfln(
+      //     "\n\nFound target value %v at address: %#v\n\n",
+      //     value_target,
+      //     mem.ptr_offset(current_address, offset),
+      //   )
+      //   results_count += 1
+      // }
     }
-    current_address = mem.ptr_offset(current_address, mem_info.RegionSize)
-  }
-}
-
-pick_type :: proc() -> (typ: typeid, ok: bool) {
-  buf: [256]byte
-  fmt.println("\nPick a type to search for:")
-  fmt.println("1. Integer (4 bytes)")
-  fmt.println("2. Float32 (4 bytes)")
-  fmt.println("3. Float64 (8 bytes)")
-  fmt.println("4. Byte (1 byte)")
-  n, err := os.read(os.stdin, buf[:])
-  if err != nil {
-    fmt.eprintln("Error reading: ", err)
-    return nil, false
   }
 
-  input := string(buf[:n])
-  choice, success := strconv.parse_int(strings.trim_space(input), 10)
-  if success && choice >= 1 && choice <= 4 {
-    switch choice {
-    case 1:
-      return int, true
-    case 2:
-      return f32, true
-    case 3:
-      return f64, true
-    case:
-      return byte, true
-    }
-  } else {
-    fmt.println("invalid input, please try again\n\n")
-    return nil, false
-  }
+  return result
 }
 
 get_process_module_info :: proc(process_id: u32) -> (base_address: ^win.BYTE, module_size: u32, ok: bool) {
@@ -165,12 +150,6 @@ get_process_module_info :: proc(process_id: u32) -> (base_address: ^win.BYTE, mo
   module_size = module_entry.modBaseSize
   ok = true
   return
-}
-
-Process_Search_Result :: struct {
-  process_id:   u32,
-  process_name: string,
-  window_title: string,
 }
 
 find_process_id_by_name :: proc(name: string, allocator := context.allocator) -> (result: []Process_Search_Result) {
@@ -222,7 +201,13 @@ find_process_id_by_name :: proc(name: string, allocator := context.allocator) ->
   return results[:]
 }
 
-find_window_title_by_process_id :: proc(process_id: u32) -> (title: string, ok: bool) {
+find_window_title_by_process_id :: proc(
+  process_id: u32,
+  allocator := context.temp_allocator,
+) -> (
+  title: string,
+  ok: bool,
+) {
   Window_Info :: struct {
     hwnd: win.HWND,
     pid:  u32,
@@ -250,7 +235,7 @@ find_window_title_by_process_id :: proc(process_id: u32) -> (title: string, ok: 
     buf: [256]u16
     length := win.GetWindowTextW(info.hwnd, raw_data(&buf), 256)
     if length > 0 {
-      title, _ = win.wstring_to_utf8(raw_data(&buf), int(length)) //TODO: temp alloc
+      title, _ = win.wstring_to_utf8(raw_data(&buf), int(length), allocator)
       ok = true
       return
     }
