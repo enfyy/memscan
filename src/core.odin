@@ -8,8 +8,6 @@ import win "core:sys/windows"
 import "base:runtime"
 import "core:strconv"
 
-MAX_SEARCH_RESULTS: uint = 10000
-
 Process_Search_Result :: struct {
   process_id:   u32,
   process_name: string,
@@ -17,68 +15,74 @@ Process_Search_Result :: struct {
 }
 
 Scan_Result :: struct {
+  addresses:      [dynamic]^win.BYTE,
+  count:          uint,
+  searched_value: cstring,
+  searched_type:  typeid,
 }
-// main :: proc() {
-//   PROCESS_NAME :: "Neuz.exe"
 
-//   process_search_results := find_process_id_by_name(PROCESS_NAME, context.temp_allocator)
-//   if len(process_search_results) == 0 {
-//     fmt.println(PROCESS_NAME, "not found")
-//     return
-//   } else {
-//     fmt.printfln("%s found: %#v", PROCESS_NAME, process_search_results)
-//   }
+Initial_Scan_Type :: enum {
+  Equal,
+  Greater_Than,
+  Less_Than,
+  In_Range,
+  Unknown,
+}
 
-//   neuz_process_id := process_search_results[0].process_id // Assuming we want the first one
-//   fmt.println("Neuz process ID:", neuz_process_id)
-
-//   neuz_process_handle := win.OpenProcess(win.PROCESS_VM_READ | win.PROCESS_QUERY_INFORMATION, false, neuz_process_id)
-//   if neuz_process_handle == win.INVALID_HANDLE_VALUE {
-//     fmt.println("Failed to open process")
-//     return
-//   }
-//   defer win.CloseHandle(neuz_process_handle)
-
-//   module_base_addr, module_size, get_module_ok := get_process_module_info(neuz_process_id)
-//   if !get_module_ok {
-//     fmt.println("Failed to get module info")
-//     return
-//   }
-
-//   fmt.println("Module base address:", module_base_addr)
-//   fmt.println("Module size:", module_size)
-//   end_address := mem.ptr_offset(module_base_addr, module_size)
-
-//   // search_type: typeid
-//   // type_input_ok := false
-//   // for search_type, type_input_ok = pick_type(); !type_input_ok; search_type, type_input_ok = pick_type() {}
-//   // fmt.println("Selected search type:", search_type)
-
-//   initial_scan(int, neuz_process_handle, module_base_addr, end_address, 66907012)
-// }
+Scan_Type :: enum {
+  Equal,
+  Greater_Than,
+  Less_Than,
+  In_Range,
+  Unknown,
+  Decreased,
+  Increased,
+  Decreased_By,
+  Increased_By,
+  Unchanged_Value,
+  Changed_Value,
+}
 
 initial_scan :: proc(
   $T: typeid,
   process_handle: win.HANDLE,
   start_address: ^win.BYTE,
   end_address: ^win.BYTE,
+  scan_buffer: ^[4096]byte,
   value_target: T,
+  allocator: runtime.Allocator = context.allocator,
+  writeable_only: bool = true,
 ) -> (
   result: Scan_Result,
 ) {
   results_count: uint = 0
+  result.searched_type = T
   search_value_size: uint = size_of(T)
-  current_address := start_address
+  when T == string {
+    search_value_size = len(value_target)
+  }
+  current_region_address: ^win.BYTE
   mem_info: win.MEMORY_BASIC_INFORMATION
   mem_info_size: uint = size_of(mem_info)
-  buffer := new([4096]byte)
+
+  result.searched_value = fmt.caprint(value_target, allocator = allocator)
+  result.addresses = make([dynamic]^win.BYTE, allocator)
+  result.count = 0
 
   fmt.println("Performing initial scan...")
+  fmt.printfln("Searching for type: %v (size: %d bytes)", typeid_of(T), size_of(T))
+  fmt.printfln("Target value: %v", value_target)
 
-  // iterate memory regions
-  for ; mem.ptr_sub(end_address, current_address) > 0 &&
-      win.VirtualQueryEx(process_handle, current_address, &mem_info, mem_info_size) == mem_info_size;
-      current_address = mem.ptr_offset(current_address, mem_info.RegionSize) {
+  for ; win.VirtualQueryEx(process_handle, current_region_address, &mem_info, mem_info_size) == mem_info_size;
+      current_region_address = mem.ptr_offset(current_region_address, mem_info.RegionSize) {
+
+    region_scan_end := mem.ptr_offset(current_region_address, mem_info.RegionSize)
+    debugptr := uintptr(0x7FF74E15B0A8)
+    debug_region: bool
+    if uintptr(region_scan_end) < debugptr && uintptr(region_scan_end) > debugptr {
+      fmt.printfln("addr: %X | debug: %X", region_scan_end, debugptr)
+      debug_region = true
+    }
 
     memory_region_is_readable :=
       mem_info.State == win.MEM_COMMIT &&
@@ -86,45 +90,94 @@ initial_scan :: proc(
       (mem_info.Protect & win.PAGE_NOACCESS == 0)
 
     if !memory_region_is_readable {
-      fmt.println("Skipping unreadable memory region")
-      continue
-    }
-
-    // read region
-    scan_end := mem.ptr_offset(current_address, mem_info.RegionSize)
-    if scan_end > end_address do scan_end = end_address // clamp end address
-    bytes_to_read: uint = min(4096, uint(mem.ptr_sub(scan_end, current_address))) // ensure we don't read past region boundary
-
-    fmt.printfln("Scanning memory region %#v (%d bytes)", current_address, bytes_to_read)
-    size_read: uint
-    read_ok := win.ReadProcessMemory(process_handle, current_address, raw_data(buffer), bytes_to_read, &size_read)
-    fmt.printfln("ReadProcessMemory: %v - READ %d bytes out of %d", read_ok, size_read, bytes_to_read)
-    if !read_ok {
-      fmt.println("Failed to read process memory. Error code:", win.GetLastError())
-      continue
-    }
-
-    // iterate every address but skip the ones that dont align with the type
-    for offset: uint = 0; offset < size_read - search_value_size && results_count < MAX_SEARCH_RESULTS; offset += 1 {
-      if offset % align_of(T) != 0 {
-        continue
+      fmt.printfln("Skipping memory region %#v because it is not read-able", current_region_address)
+      if debug_region {
+        fmt.println("i flubbed it")
       }
-
-      // // Safely read the value
-      // value: T
-      // mem.copy(&value, &buffer[offset], size_of(T))
-
-      // if value == value_target {
-      //   fmt.printfln(
-      //     "\n\nFound target value %v at address: %#v\n\n",
-      //     value_target,
-      //     mem.ptr_offset(current_address, offset),
-      //   )
-      //   results_count += 1
-      // }
+      continue
     }
-  }
 
+    memory_region_is_writable :=
+      (mem_info.Protect & win.PAGE_READWRITE != 0) ||
+      (mem_info.Protect & win.PAGE_WRITECOPY != 0) ||
+      (mem_info.Protect & win.PAGE_EXECUTE_READWRITE != 0) ||
+      (mem_info.Protect & win.PAGE_EXECUTE_WRITECOPY != 0)
+
+    if writeable_only && !memory_region_is_writable {
+      fmt.printfln("Skipping memory region %#v because it is not write-able", current_region_address)
+      continue
+    }
+
+    region_offset: uint
+    size_read: uint
+    current_address := mem.ptr_offset(current_region_address, 4096)
+    bytes_to_read: uint = min(4096, uint(mem.ptr_sub(region_scan_end, current_region_address)))
+    read_ok := win.ReadProcessMemory(process_handle, current_address, raw_data(scan_buffer), bytes_to_read, &size_read)
+
+    for ; read_ok && mem.ptr_offset(current_address, bytes_to_read) < region_scan_end;
+        read_ok = win.ReadProcessMemory(
+          process_handle,
+          current_address,
+          raw_data(scan_buffer),
+          bytes_to_read,
+          &size_read,
+        ) {
+
+      fmt.printfln(
+        "Scanning memory region %#v+%X (%d bytes) (Region Size:%d)",
+        region_offset,
+        current_address,
+        bytes_to_read,
+        mem_info.RegionSize,
+      )
+
+      for offset: uint = 0; offset <= size_read - search_value_size; offset += 1 {
+        when T != string && T == [dynamic]u8 {
+          if offset % align_of(T) != 0 {
+            continue
+          }
+        }
+
+        when T == [dynamic]u8 {
+          value := scan_buffer[offset:offset + search_value_size]
+          if mem.compare(value, value_target[:]) == 0 {
+            addr := mem.ptr_offset(current_address, offset)
+            append(&result.addresses, addr)
+            results_count += 1
+          }
+        } else when T == string {
+          if debug_region {
+            fmt.println("DEBUG:", offset)
+          }
+          addr := mem.ptr_offset(current_address, offset)
+          if uintptr(addr) == debugptr {
+            fmt.printfln("addr: %X | debug: %X", addr, debugptr)
+            continue
+          }
+          value := scan_buffer[offset:offset + search_value_size]
+          if mem.compare(value, transmute([]u8)value_target) == 0 {
+            append(&result.addresses, addr)
+            results_count += 1
+          }
+
+        } else {
+          value: T
+          mem.copy(&value, &scan_buffer[offset], int(search_value_size))
+          addr := mem.ptr_offset(current_address, offset)
+          if value == value_target {
+            append(&result.addresses, addr)
+            results_count += 1
+          }
+        }
+      } // each byte
+
+      current_address = mem.ptr_offset(current_address, bytes_to_read)
+      bytes_to_read = min(4096, uint(mem.ptr_sub(current_address, region_scan_end)))
+    } // each page
+
+  } // each region
+
+  result.count = results_count
   return result
 }
 
