@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:mem"
+import "core:slice"
 import "core:strconv"
 import "core:strings"
 import win "core:sys/windows"
@@ -467,6 +468,67 @@ refine_matches :: proc(
     }
     if compare_values(prev.vtype, new_v, ref_v, op) {
       append(&set.matches, Match{addr = m.addr, value = new_v})
+    }
+  }
+  return
+}
+
+// Returns true if `p` lies inside one of `regions`, which MUST be sorted ascending
+// by base address.
+region_contains :: proc(regions: []Region, p: uintptr) -> bool {
+  lo := 0
+  hi := len(regions)
+  for lo < hi {
+    mid := (lo + hi) / 2
+    if regions[mid].base <= p {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  idx := lo - 1
+  if idx < 0 {
+    return false
+  }
+  r := regions[idx]
+  return p >= r.base && p < r.base + uintptr(r.size)
+}
+
+// Keep only matches whose current value, read as a pointer, is non-zero and points
+// into a committed writable region of the target (i.e. looks like a heap pointer).
+// This is the decisive filter when hunting a value we know is a pointer.
+filter_pointers :: proc(
+  handle: win.HANDLE,
+  prev: Match_Set,
+  ptr_size: int,
+  allocator := context.allocator,
+) -> (
+  set: Match_Set,
+) {
+  set.vtype = prev.vtype
+  set.matches = make([dynamic]Match, allocator)
+
+  regions := collect_regions(handle, true)
+  defer delete(regions)
+  slice.sort_by(regions[:], proc(a, b: Region) -> bool {
+    return a.base < b.base
+  })
+
+  pt := Value_Type.U64
+  if ptr_size == 4 {
+    pt = .U32
+  }
+  for m in prev.matches {
+    v, ok := read_value(handle, m.addr, pt)
+    if !ok {
+      continue
+    }
+    p := uintptr(value_as_u64(pt, v))
+    if p == 0 {
+      continue
+    }
+    if region_contains(regions[:], p) {
+      append(&set.matches, Match{addr = m.addr, value = v})
     }
   }
   return

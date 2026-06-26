@@ -19,10 +19,24 @@ run_cli :: proc(session: ^Session) {
     if line == "" {
       continue
     }
-    args := strings.fields(line, context.temp_allocator)
+    // Allow several commands on one line, separated by ';' or '&&' (both run
+    // sequentially; '&&' does not short-circuit).
+    normalized, _ := strings.replace_all(line, "&&", ";", context.temp_allocator)
+    segments := strings.split(normalized, ";", context.temp_allocator)
     quit := false
-    if len(args) > 0 {
-      quit = cli_dispatch(session, args[0], args[1:])
+    for seg in segments {
+      s := strings.trim_space(seg)
+      if s == "" {
+        continue
+      }
+      args := strings.fields(s, context.temp_allocator)
+      if len(args) == 0 {
+        continue
+      }
+      if cli_dispatch(session, args[0], args[1:]) {
+        quit = true
+        break
+      }
     }
     free_all(context.temp_allocator)
     if quit {
@@ -80,6 +94,8 @@ cli_dispatch :: proc(session: ^Session, cmd: string, args: []string) -> (quit: b
     cli_list(session, args)
   case "count":
     cli_count(session)
+  case "pointers", "ptr":
+    cli_pointers(session)
   case "clearmatches", "cm":
     session_clear_matches(session)
     fmt.println("matches cleared (snapshot kept).")
@@ -114,6 +130,7 @@ cli_help :: proc() {
   next <op> [value]          refine matches/snapshot; op = eq ne gt lt changed unchanged inc dec
   list [n]                   show first n matches (default 20)
   count                      show number of matches
+  pointers                   keep only matches whose value is a valid heap pointer
   clearmatches               drop matches but keep snapshot
   reset                      clear all scan state
   read  <addr> [t]           read a value at an absolute address
@@ -121,7 +138,10 @@ cli_help :: proc() {
   peek  [i]                  read match #i live (default 0)
   poke  [i] <value>          write <value> to match #i (default i=0)
   deref <addr> [off ...]     follow a pointer chain, show the final address+value
-  quit                       exit`)
+  quit                       exit
+
+chain multiple commands on one line with ';' or '&&', e.g.
+  write 0x18D0E04 0x1EDCF820 u32; write 0x1A828B48 0x1EDCF820 u32`)
 }
 
 cli_ps :: proc(args: []string) {
@@ -374,6 +394,21 @@ cli_list :: proc(session: ^Session, args: []string) {
     e := m.matches[i]
     fmt.printfln("  [%d] 0x%X = %s", i, e.addr, format_value(m.vtype, e.value))
   }
+}
+
+cli_pointers :: proc(session: ^Session) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if !session.has_matches {
+    fmt.eprintln("no matches.")
+    return
+  }
+  before := len(session.matches.matches)
+  set := filter_pointers(session.proc_info.handle, session.matches, session.ptr_size, session_scan_allocator(session))
+  session.matches = set
+  fmt.printfln("pointers: %d -> %d match(es)", before, len(set.matches))
 }
 
 cli_count :: proc(session: ^Session) {
