@@ -1,184 +1,485 @@
 package main
 
 import "core:fmt"
-import "core:os"
-import "core:strings"
 import "core:mem"
-import win "core:sys/windows"
-import "base:runtime"
 import "core:strconv"
+import "core:strings"
+import win "core:sys/windows"
+
+// ===========================================================================
+// Value types
+// ===========================================================================
+
+Value_Type :: enum u8 {
+  U8,
+  I8,
+  U16,
+  I16,
+  U32,
+  I32,
+  U64,
+  I64,
+  F32,
+  F64,
+}
+
+// A value is stored as up to 8 raw little-endian bytes.
+Value :: [8]byte
+
+value_size :: proc(t: Value_Type) -> int {
+  switch t {
+  case .U8, .I8:
+    return 1
+  case .U16, .I16:
+    return 2
+  case .U32, .I32, .F32:
+    return 4
+  case .U64, .I64, .F64:
+    return 8
+  }
+  return 0
+}
+
+value_type_name :: proc(t: Value_Type) -> string {
+  switch t {
+  case .U8:
+    return "u8"
+  case .I8:
+    return "i8"
+  case .U16:
+    return "u16"
+  case .I16:
+    return "i16"
+  case .U32:
+    return "u32"
+  case .I32:
+    return "i32"
+  case .U64:
+    return "u64"
+  case .I64:
+    return "i64"
+  case .F32:
+    return "f32"
+  case .F64:
+    return "f64"
+  }
+  return "?"
+}
+
+is_float :: proc(t: Value_Type) -> bool {
+  return t == .F32 || t == .F64
+}
+
+is_signed :: proc(t: Value_Type) -> bool {
+  return t == .I8 || t == .I16 || t == .I32 || t == .I64
+}
+
+bytes_to_value :: proc(b: []byte) -> (out: Value) {
+  n := min(len(b), 8)
+  copy(out[:n], b[:n])
+  return
+}
+
+value_as_u64 :: proc(t: Value_Type, v: Value) -> u64 {
+  n := value_size(t)
+  out: u64 = 0
+  for i in 0 ..< n {
+    out |= u64(v[i]) << uint(8 * i)
+  }
+  return out
+}
+
+value_as_i64 :: proc(t: Value_Type, v: Value) -> i64 {
+  n := value_size(t)
+  u := value_as_u64(t, v)
+  shift := uint(64 - 8 * n)
+  return i64(u << shift) >> shift
+}
+
+value_as_f64 :: proc(t: Value_Type, v: Value) -> f64 {
+  if t == .F32 {
+    return f64(transmute(f32)u32(value_as_u64(t, v)))
+  }
+  return transmute(f64)value_as_u64(t, v)
+}
+
+// Parse a textual value of the given type into raw little-endian bytes.
+// Integers accept decimal or 0x / 0o / 0b prefixes (and a leading '-').
+parse_value :: proc(t: Value_Type, s: string) -> (out: Value, ok: bool) {
+  if is_float(t) {
+    f := strconv.parse_f64(s) or_return
+    if t == .F32 {
+      u := transmute(u32)f32(f)
+      for i in 0 ..< 4 {
+        out[i] = byte(u >> uint(8 * i))
+      }
+    } else {
+      u := transmute(u64)f
+      for i in 0 ..< 8 {
+        out[i] = byte(u >> uint(8 * i))
+      }
+    }
+    return out, true
+  }
+  i := strconv.parse_i64(s) or_return
+  u := u64(i)
+  n := value_size(t)
+  for k in 0 ..< n {
+    out[k] = byte(u >> uint(8 * k))
+  }
+  return out, true
+}
+
+format_value :: proc(t: Value_Type, v: Value) -> string {
+  if is_float(t) {
+    return fmt.tprintf("%v", value_as_f64(t, v))
+  } else if is_signed(t) {
+    return fmt.tprintf("%d (0x%X)", value_as_i64(t, v), value_as_u64(t, v))
+  }
+  uv := value_as_u64(t, v)
+  return fmt.tprintf("%d (0x%X)", uv, uv)
+}
+
+// ===========================================================================
+// Comparison
+// ===========================================================================
+
+Compare_Op :: enum {
+  Eq,
+  Ne,
+  Gt,
+  Lt,
+  Changed,
+  Unchanged,
+  Increased,
+  Decreased,
+}
+
+// Compares a freshly-read value `new_v` against a reference `ref_v`. For Eq/Ne/
+// Gt/Lt the reference is a user-supplied target; for Changed/Unchanged/Increased/
+// Decreased it is the value from the previous scan.
+compare_values :: proc(t: Value_Type, new_v, ref_v: Value, op: Compare_Op) -> bool {
+  size := value_size(t)
+  a := new_v
+  b := ref_v
+  switch op {
+  case .Eq, .Unchanged:
+    return mem.compare(a[:size], b[:size]) == 0
+  case .Ne, .Changed:
+    return mem.compare(a[:size], b[:size]) != 0
+  case .Gt, .Lt, .Increased, .Decreased:
+    if is_float(t) {
+      a := value_as_f64(t, new_v)
+      b := value_as_f64(t, ref_v)
+      #partial switch op {
+      case .Gt, .Increased:
+        return a > b
+      case .Lt, .Decreased:
+        return a < b
+      }
+    } else if is_signed(t) {
+      a := value_as_i64(t, new_v)
+      b := value_as_i64(t, ref_v)
+      #partial switch op {
+      case .Gt, .Increased:
+        return a > b
+      case .Lt, .Decreased:
+        return a < b
+      }
+    } else {
+      a := value_as_u64(t, new_v)
+      b := value_as_u64(t, ref_v)
+      #partial switch op {
+      case .Gt, .Increased:
+        return a > b
+      case .Lt, .Decreased:
+        return a < b
+      }
+    }
+  }
+  return false
+}
+
+// ===========================================================================
+// Process memory read / write
+// ===========================================================================
+
+read_into :: proc(handle: win.HANDLE, addr: uintptr, buf: []byte) -> (n: uint, ok: bool) {
+  read: uint
+  res := win.ReadProcessMemory(handle, rawptr(addr), raw_data(buf), uint(len(buf)), &read)
+  return read, res != win.FALSE
+}
+
+read_value :: proc(handle: win.HANDLE, addr: uintptr, t: Value_Type) -> (out: Value, ok: bool) {
+  size := value_size(t)
+  read: uint
+  res := win.ReadProcessMemory(handle, rawptr(addr), raw_data(out[:size]), uint(size), &read)
+  ok = res != win.FALSE && read == uint(size)
+  return
+}
+
+write_value :: proc(handle: win.HANDLE, addr: uintptr, t: Value_Type, v: Value) -> bool {
+  size := value_size(t)
+  b := v
+  written: uint
+  res := win.WriteProcessMemory(handle, rawptr(addr), raw_data(b[:size]), uint(size), &written)
+  return res != win.FALSE && written == uint(size)
+}
+
+// Follow a pointer chain. Reads a pointer-sized value at `base`, then for each
+// offset adds it and dereferences again, EXCEPT the final offset is added without
+// a trailing dereference. With no offsets it simply returns the pointer at `base`.
+deref_chain :: proc(handle: win.HANDLE, base: uintptr, offsets: []i64, ptr_size: int) -> (addr: uintptr, ok: bool) {
+  pt := Value_Type.U64
+  if ptr_size == 4 {
+    pt = .U32
+  }
+  v, rok := read_value(handle, base, pt)
+  if !rok {
+    return base, false
+  }
+  addr = uintptr(value_as_u64(pt, v))
+  for off, i in offsets {
+    addr += uintptr(off)
+    if i < len(offsets) - 1 {
+      v2, rok2 := read_value(handle, addr, pt)
+      if !rok2 {
+        return addr, false
+      }
+      addr = uintptr(value_as_u64(pt, v2))
+    }
+  }
+  return addr, true
+}
+
+// ===========================================================================
+// Memory regions
+// ===========================================================================
+
+Region :: struct {
+  base:    uintptr,
+  size:    uint,
+  protect: u32,
+}
+
+region_is_readable :: proc(mbi: win.MEMORY_BASIC_INFORMATION) -> bool {
+  return(
+    mbi.State == win.MEM_COMMIT &&
+    (mbi.Protect & win.PAGE_GUARD) == 0 &&
+    (mbi.Protect & win.PAGE_NOACCESS) == 0 \
+  )
+}
+
+region_is_writable :: proc(mbi: win.MEMORY_BASIC_INFORMATION) -> bool {
+  return(
+    mbi.Protect &
+        (win.PAGE_READWRITE |
+                win.PAGE_WRITECOPY |
+                win.PAGE_EXECUTE_READWRITE |
+                win.PAGE_EXECUTE_WRITECOPY) !=
+    0 \
+  )
+}
+
+collect_regions :: proc(handle: win.HANDLE, writable_only: bool, allocator := context.allocator) -> [dynamic]Region {
+  regions := make([dynamic]Region, allocator)
+  mbi: win.MEMORY_BASIC_INFORMATION
+  mbi_size := uint(size_of(mbi))
+  addr: uintptr = 0
+  for win.VirtualQueryEx(handle, rawptr(addr), &mbi, mbi_size) == mbi_size {
+    base := uintptr(mbi.BaseAddress)
+    size := uint(mbi.RegionSize)
+    next := base + uintptr(size)
+    if region_is_readable(mbi) && (!writable_only || region_is_writable(mbi)) {
+      append(&regions, Region{base = base, size = size, protect = u32(mbi.Protect)})
+    }
+    if next <= addr {
+      break
+    }
+    addr = next
+  }
+  return regions
+}
+
+// ===========================================================================
+// Scanning
+// ===========================================================================
+
+Match :: struct {
+  addr:  uintptr,
+  value: Value,
+}
+
+Match_Set :: struct {
+  vtype:   Value_Type,
+  matches: [dynamic]Match,
+}
+
+Region_Capture :: struct {
+  base: uintptr,
+  data: []byte,
+}
+
+Mem_Snapshot :: struct {
+  vtype:   Value_Type,
+  regions: [dynamic]Region_Capture,
+}
+
+snapshot_total_bytes :: proc(snap: Mem_Snapshot) -> (total: int) {
+  for rc in snap.regions {
+    total += len(rc.data)
+  }
+  return
+}
+
+// Exact-value scan over the target's committed memory. Candidates are aligned to
+// the value size. `allocator` owns the resulting matches; scratch buffers use the
+// ambient context.allocator and are freed here.
+scan_exact :: proc(
+  handle: win.HANDLE,
+  t: Value_Type,
+  target: Value,
+  writable_only: bool,
+  allocator := context.allocator,
+) -> (
+  set: Match_Set,
+) {
+  set.vtype = t
+  set.matches = make([dynamic]Match, allocator)
+  size := value_size(t)
+  if size == 0 {
+    return
+  }
+
+  tgt := target
+  regions := collect_regions(handle, writable_only)
+  defer delete(regions)
+
+  for r in regions {
+    buf := make([]byte, r.size)
+    n, ok := read_into(handle, r.base, buf)
+    if ok {
+      off := 0
+      for off + size <= int(n) {
+        if mem.compare(buf[off:off + size], tgt[:size]) == 0 {
+          append(&set.matches, Match{addr = r.base + uintptr(off), value = bytes_to_value(buf[off:off + size])})
+        }
+        off += size
+      }
+    }
+    delete(buf)
+  }
+  return
+}
+
+// Capture the current bytes of every scanned region (unknown-initial value scan).
+take_snapshot :: proc(
+  handle: win.HANDLE,
+  t: Value_Type,
+  writable_only: bool,
+  allocator := context.allocator,
+) -> (
+  snap: Mem_Snapshot,
+) {
+  snap.vtype = t
+  snap.regions = make([dynamic]Region_Capture, allocator)
+  regions := collect_regions(handle, writable_only)
+  defer delete(regions)
+
+  for r in regions {
+    buf := make([]byte, r.size, allocator)
+    n, ok := read_into(handle, r.base, buf)
+    if !ok || n == 0 {
+      delete(buf, allocator)
+      continue
+    }
+    append(&snap.regions, Region_Capture{base = r.base, data = buf[:n]})
+  }
+  return
+}
+
+// First refine after a snapshot: re-read each region and keep the addresses whose
+// (aligned) value satisfies the comparator against the snapshot (or a target).
+refine_from_snapshot :: proc(
+  handle: win.HANDLE,
+  snap: Mem_Snapshot,
+  op: Compare_Op,
+  target: Value,
+  has_target: bool,
+  allocator := context.allocator,
+) -> (
+  set: Match_Set,
+) {
+  set.vtype = snap.vtype
+  set.matches = make([dynamic]Match, allocator)
+  size := value_size(snap.vtype)
+  if size == 0 {
+    return
+  }
+
+  for rc in snap.regions {
+    buf := make([]byte, len(rc.data))
+    n, ok := read_into(handle, rc.base, buf)
+    if ok {
+      limit := min(int(n), len(rc.data))
+      off := 0
+      for off + size <= limit {
+        new_v := bytes_to_value(buf[off:off + size])
+        ref_v: Value
+        if has_target {
+          ref_v = target
+        } else {
+          ref_v = bytes_to_value(rc.data[off:off + size])
+        }
+        if compare_values(snap.vtype, new_v, ref_v, op) {
+          append(&set.matches, Match{addr = rc.base + uintptr(off), value = new_v})
+        }
+        off += size
+      }
+    }
+    delete(buf)
+  }
+  return
+}
+
+// Subsequent refine: re-read each existing candidate and keep those that satisfy
+// the comparator against their previously-stored value (or a target).
+refine_matches :: proc(
+  handle: win.HANDLE,
+  prev: Match_Set,
+  op: Compare_Op,
+  target: Value,
+  has_target: bool,
+  allocator := context.allocator,
+) -> (
+  set: Match_Set,
+) {
+  set.vtype = prev.vtype
+  set.matches = make([dynamic]Match, allocator)
+  for m in prev.matches {
+    new_v, ok := read_value(handle, m.addr, prev.vtype)
+    if !ok {
+      continue
+    }
+    ref_v := m.value
+    if has_target {
+      ref_v = target
+    }
+    if compare_values(prev.vtype, new_v, ref_v, op) {
+      append(&set.matches, Match{addr = m.addr, value = new_v})
+    }
+  }
+  return
+}
+
+// ===========================================================================
+// Process discovery / module info (Win32 toolhelp)
+// ===========================================================================
 
 Process_Search_Result :: struct {
   process_id:   u32,
   process_name: string,
   window_title: string,
-}
-
-Scan_Result :: struct {
-  addresses:      [dynamic]^win.BYTE,
-  count:          uint,
-  searched_value: cstring,
-  searched_type:  typeid,
-}
-
-Initial_Scan_Type :: enum {
-  Equal,
-  Greater_Than,
-  Less_Than,
-  In_Range,
-  Unknown,
-}
-
-Scan_Type :: enum {
-  Equal,
-  Greater_Than,
-  Less_Than,
-  In_Range,
-  Unknown,
-  Decreased,
-  Increased,
-  Decreased_By,
-  Increased_By,
-  Unchanged_Value,
-  Changed_Value,
-}
-
-initial_scan :: proc(
-  $T: typeid,
-  process_handle: win.HANDLE,
-  start_address: ^win.BYTE,
-  end_address: ^win.BYTE,
-  scan_buffer: ^[4096]byte,
-  value_target: T,
-  allocator: runtime.Allocator = context.allocator,
-  writeable_only: bool = true,
-) -> (
-  result: Scan_Result,
-) {
-  results_count: uint = 0
-  result.searched_type = T
-  search_value_size: uint = size_of(T)
-  when T == string {
-    search_value_size = len(value_target)
-  }
-  current_region_address: ^win.BYTE
-  mem_info: win.MEMORY_BASIC_INFORMATION
-  mem_info_size: uint = size_of(mem_info)
-
-  result.searched_value = fmt.caprint(value_target, allocator = allocator)
-  result.addresses = make([dynamic]^win.BYTE, allocator)
-  result.count = 0
-
-  fmt.println("Performing initial scan...")
-  fmt.printfln("Searching for type: %v (size: %d bytes)", typeid_of(T), size_of(T))
-  fmt.printfln("Target value: %v", value_target)
-
-  for ; win.VirtualQueryEx(process_handle, current_region_address, &mem_info, mem_info_size) == mem_info_size;
-      current_region_address = mem.ptr_offset(current_region_address, mem_info.RegionSize) {
-
-    region_scan_end := mem.ptr_offset(current_region_address, mem_info.RegionSize)
-    debugptr := uintptr(0x7FF74E15B0A8)
-    debug_region: bool
-    if uintptr(region_scan_end) < debugptr && uintptr(region_scan_end) > debugptr {
-      fmt.printfln("addr: %X | debug: %X", region_scan_end, debugptr)
-      debug_region = true
-    }
-
-    memory_region_is_readable :=
-      mem_info.State == win.MEM_COMMIT &&
-      (mem_info.Protect & win.PAGE_GUARD == 0) &&
-      (mem_info.Protect & win.PAGE_NOACCESS == 0)
-
-    if !memory_region_is_readable {
-      fmt.printfln("Skipping memory region %#v because it is not read-able", current_region_address)
-      if debug_region {
-        fmt.println("i flubbed it")
-      }
-      continue
-    }
-
-    memory_region_is_writable :=
-      (mem_info.Protect & win.PAGE_READWRITE != 0) ||
-      (mem_info.Protect & win.PAGE_WRITECOPY != 0) ||
-      (mem_info.Protect & win.PAGE_EXECUTE_READWRITE != 0) ||
-      (mem_info.Protect & win.PAGE_EXECUTE_WRITECOPY != 0)
-
-    if writeable_only && !memory_region_is_writable {
-      fmt.printfln("Skipping memory region %#v because it is not write-able", current_region_address)
-      continue
-    }
-
-    region_offset: uint
-    size_read: uint
-    current_address := mem.ptr_offset(current_region_address, 4096)
-    bytes_to_read: uint = min(4096, uint(mem.ptr_sub(region_scan_end, current_region_address)))
-    read_ok := win.ReadProcessMemory(process_handle, current_address, raw_data(scan_buffer), bytes_to_read, &size_read)
-
-    for ; read_ok && mem.ptr_offset(current_address, bytes_to_read) < region_scan_end;
-        read_ok = win.ReadProcessMemory(
-          process_handle,
-          current_address,
-          raw_data(scan_buffer),
-          bytes_to_read,
-          &size_read,
-        ) {
-
-      fmt.printfln(
-        "Scanning memory region %#v+%X (%d bytes) (Region Size:%d)",
-        region_offset,
-        current_address,
-        bytes_to_read,
-        mem_info.RegionSize,
-      )
-
-      for offset: uint = 0; offset <= size_read - search_value_size; offset += 1 {
-        when T != string && T == [dynamic]u8 {
-          if offset % align_of(T) != 0 {
-            continue
-          }
-        }
-
-        when T == [dynamic]u8 {
-          value := scan_buffer[offset:offset + search_value_size]
-          if mem.compare(value, value_target[:]) == 0 {
-            addr := mem.ptr_offset(current_address, offset)
-            append(&result.addresses, addr)
-            results_count += 1
-          }
-        } else when T == string {
-          if debug_region {
-            fmt.println("DEBUG:", offset)
-          }
-          addr := mem.ptr_offset(current_address, offset)
-          if uintptr(addr) == debugptr {
-            fmt.printfln("addr: %X | debug: %X", addr, debugptr)
-            continue
-          }
-          value := scan_buffer[offset:offset + search_value_size]
-          if mem.compare(value, transmute([]u8)value_target) == 0 {
-            append(&result.addresses, addr)
-            results_count += 1
-          }
-
-        } else {
-          value: T
-          mem.copy(&value, &scan_buffer[offset], int(search_value_size))
-          addr := mem.ptr_offset(current_address, offset)
-          if value == value_target {
-            append(&result.addresses, addr)
-            results_count += 1
-          }
-        }
-      } // each byte
-
-      current_address = mem.ptr_offset(current_address, bytes_to_read)
-      bytes_to_read = min(4096, uint(mem.ptr_sub(current_address, region_scan_end)))
-    } // each page
-
-  } // each region
-
-  result.count = results_count
-  return result
 }
 
 get_process_module_info :: proc(process_id: u32) -> (base_address: ^win.BYTE, module_size: u32, ok: bool) {
@@ -227,7 +528,7 @@ find_process_id_by_name :: proc(name: string, allocator := context.allocator) ->
 
   results: [dynamic]Process_Search_Result
   for ok {
-    process_name, err := win.wstring_to_utf8(raw_data(process_entry.szExeFile[:]), -1)
+    process_name, err := win.wstring_to_utf8(win.wstring(raw_data(process_entry.szExeFile[:])), -1)
     if err != nil {
       fmt.println("Failed to convert process name to UTF-8:", err)
       continue
@@ -288,7 +589,7 @@ find_window_title_by_process_id :: proc(
     buf: [256]u16
     length := win.GetWindowTextW(info.hwnd, raw_data(&buf), 256)
     if length > 0 {
-      title, _ = win.wstring_to_utf8(raw_data(&buf), int(length), allocator)
+      title, _ = win.wstring_to_utf8(win.wstring(raw_data(&buf)), int(length), allocator)
       ok = true
       return
     }
