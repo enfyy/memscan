@@ -30,6 +30,12 @@ Session :: struct {
   targets:       [dynamic]Nearest_Entry, // last 'nearest' result, sorted by distance
   tc_recent:     [dynamic]TC_Recent, // objs target_closest picked recently (skip just-killed)
 
+  // Auto-farm mode (see auto_tick / cli_auto in cli.odin). When on, the watcher thread
+  // advances the focus to the next fresh mob named auto_name whenever m_pObjFocus clears.
+  auto_on:       bool,
+  auto_name:     string, // cloned target name; freed on toggle/close
+  auto_last:     i64, // time.now()._nsec of the last advance attempt (throttle)
+
   // Global hotkeys (see hotkey.odin). exec_mutex serializes command execution
   // between the REPL thread and the hotkey watcher thread.
   hotkeys:       [dynamic]Hotkey,
@@ -94,4 +100,5 @@ session_close :: proc(session: ^Session) {
   delete(session.targets)
   delete(session.hotkeys)
   delete(session.tc_recent)
+  delete(session.auto_name)
 }

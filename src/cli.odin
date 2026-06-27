@@ -137,6 +137,8 @@ cli_dispatch :: proc(session: ^Session, cmd: string, args: []string) -> (quit: b
     cli_find(session, args)
   case "target_closest", "tc", "get":
     cli_target_closest(session, args)
+  case "auto":
+    cli_auto(session, args)
   case "hotkey", "hk":
     cli_hotkey(session, args)
   case "deathscan":
@@ -182,7 +184,10 @@ cli_help :: proc() {
   target <focus|[i]> <rank>  write nearest[rank]'s obj ptr into the focus address
   find  <text>               search readable memory for a string (ASCII + UTF-16)
   target_closest <name>      select the nearest mover named <name> (Flyff; one-shot).
-                             repeat to toggle the two closest: #1 <-> #2
+                             repeat to advance through nearby mobs (skips just-killed)
+  auto <name>                hands-free farm: auto-advance focus to the next <name> mob
+                             whenever the target dies. toggle: 'auto <name>' again, or
+                             'auto off'. hold F2 and it keeps feeding targets.
   hotkey <command>           press a key when prompted to bind it to <command>; fires
                              globally even while memscan is backgrounded.
                              also: 'hotkey list', 'hotkey clear'
@@ -284,6 +289,7 @@ cli_detach :: proc(session: ^Session) {
     return
   }
   pid := session.proc_info.pid
+  session.auto_on = false // stop auto-farm when the process goes away
   win.CloseHandle(session.proc_info.handle)
   session_reset_scan(session)
   session.attached = false
@@ -1108,27 +1114,34 @@ tc_collect_cands :: proc(
   return cands
 }
 
-// One-shot: enumerate live objects, keep movers whose inline name matches <name>,
-// rank them by distance, and write one into m_pObjFocus — atomically, so the pick
-// can't go stale between ranking and selecting. Toggles between the two closest: if
-// the closest is already selected, pick the second-closest; otherwise pick the
-// closest. So repeated presses alternate #1 <-> #2. All anchors/offsets are baked
-// Flyff constants, so it needs no setup: `target_closest Mutant Yetti`.
-cli_target_closest :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 1 {
-    fmt.eprintln("usage: target_closest <name>")
-    return
-  }
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  if len(name) == 0 {
-    fmt.eprintln("usage: target_closest <name>")
-    return
-  }
+TC_Result :: enum {
+  Picked, // wrote a mob into m_pObjFocus; obj/d/sel/total are set
+  NoCandidates, // no selectable mover named <name> nearby
+  AllOnCooldown, // candidates exist but all recently targeted (only when require_fresh)
+  AnchorFail, // couldn't read the world/player anchors (not in-game / wrong build)
+  WriteFail, // the focus write failed (message already printed)
+}
 
+// Resolve the Flyff world/player anchors, enumerate selectable movers named <name>, pick
+// one by distance, and write it into m_pObjFocus — atomically, so the pick can't go stale
+// between ranking and selecting. Shared by manual `target_closest` and the auto-farm loop.
+// All the crash guards live in tc_collect_cands (vtable-in-module, type 5, HP>0, mapped
+// model), so this never writes a dead/model-less mob.
+//   require_fresh=false (manual): when every candidate is on the recently-targeted cooldown,
+//     fall back to the closest — the #1<->#2 / next-fresh cycle of repeated presses.
+//   require_fresh=true (auto): return AllOnCooldown instead, so a lone just-killed mob isn't
+//     re-selected while it's still a fresh-looking corpse.
+tc_select :: proc(
+  session: ^Session,
+  name: string,
+  require_fresh: bool,
+) -> (
+  res: TC_Result,
+  obj: uintptr,
+  d: f32,
+  sel: int,
+  total: int,
+) {
   handle := session.proc_info.handle
   base := session.proc_info.base
   pt := Value_Type.U64
@@ -1140,55 +1153,218 @@ cli_target_closest :: proc(session: ^Session, args: []string) {
   wv, wok := read_value(handle, base + FLYFF_WORLD_RVA, pt)
   pv, pok := read_value(handle, base + FLYFF_PLAYER_RVA, pt)
   if !wok || !pok {
-    fmt.eprintln("could not read world/player anchors (wrong build or not in-game?).")
-    return
+    return .AnchorFail, 0, 0, 0, 0
   }
   world := uintptr(value_as_u64(pt, wv))
   player := uintptr(value_as_u64(pt, pv))
   focus_addr := world + FLYFF_FOCUS_OFF
   player_pos, ppok := read_vec3(handle, player + FLYFF_POS_OFF)
   if !ppok {
-    fmt.eprintln("could not read player position.")
-    return
+    return .AnchorFail, 0, 0, 0, 0
   }
 
   // Collect selectable (alive + rendered) movers named <name>, nearest first.
   cands := tc_collect_cands(session, name, world, player_pos)
-  if len(cands) == 0 {
-    fmt.printfln("no '%s' found.", name)
-    return
+  total = len(cands)
+  if total == 0 {
+    return .NoCandidates, 0, 0, 0, 0
   }
 
   // Pick the nearest mob we haven't targeted in the last few seconds. A just-killed mob
   // can keep reading as alive (HP unchanged, model still valid) while it plays its death
   // animation, so picking the strict closest would re-select the corpse. Skipping recent
-  // picks advances to the next mob after each kill; fall back to the closest if every
-  // nearby mob is on cooldown.
+  // picks advances to the next mob after each kill.
   now := time.now()._nsec
   chosen := cands[0]
-  sel := 0
+  sel = 0
+  found := false
   for c, i in cands {
     if !tc_seen_recently(session, c.obj, now) {
       chosen = c
       sel = i
+      found = true
       break
     }
   }
+  if !found {
+    if require_fresh {
+      return .AllOnCooldown, 0, 0, 0, total // don't re-lock a fresh corpse (auto)
+    }
+    chosen = cands[0] // manual: fall back to the closest
+    sel = 0
+  }
   tc_mark_recent(session, chosen.obj, now)
 
-  log_target(session, chosen.obj, world, sel, len(cands))
-  if write_value(handle, focus_addr, pt, ptr_to_value(chosen.obj, session.ptr_size)) {
-    fmt.printfln(
-      "targeted '%s' #%d/%d obj=0x%X at d=%.1f.",
-      name,
-      sel + 1,
-      len(cands),
-      chosen.obj,
-      chosen.d,
-    )
-  } else {
+  log_target(session, chosen.obj, world, sel, total)
+  if !write_value(handle, focus_addr, pt, ptr_to_value(chosen.obj, session.ptr_size)) {
     fmt.eprintfln("write failed at focus 0x%X (error %d)", focus_addr, win.GetLastError())
+    return .WriteFail, chosen.obj, chosen.d, sel, total
   }
+  return .Picked, chosen.obj, chosen.d, sel, total
+}
+
+// One-shot: select the nearest selectable mover named <name> by writing it into
+// m_pObjFocus. Repeated presses advance through the nearby mobs (the recently-targeted
+// cooldown skips a just-killed corpse). All anchors/offsets are baked Flyff constants, so
+// it needs no setup: `target_closest Mutant Yetti`.
+cli_target_closest :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
+  if len(name) == 0 {
+    fmt.eprintln("usage: target_closest <name>")
+    return
+  }
+
+  res, obj, d, sel, total := tc_select(session, name, false)
+  switch res {
+  case .Picked:
+    fmt.printfln("targeted '%s' #%d/%d obj=0x%X at d=%.1f.", name, sel + 1, total, obj, d)
+  case .NoCandidates:
+    fmt.printfln("no '%s' found.", name)
+  case .AnchorFail:
+    fmt.eprintln("could not read world/player anchors (wrong build or not in-game?).")
+  case .AllOnCooldown:
+    fmt.printfln("no fresh '%s' available.", name) // unreachable with require_fresh=false
+  case .WriteFail: // tc_select already printed the specific error
+  }
+}
+
+AUTO_MIN_INTERVAL_NS :: i64(300_000_000) // ~300ms between advance attempts (caps idle rescans)
+
+// Read m_pObjFocus: world = [base+FLYFF_WORLD_RVA], then the CObj* at world+FLYFF_FOCUS_OFF.
+read_focus_ptr :: proc(session: ^Session) -> (focus: uintptr, ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  pt := Value_Type.U64
+  if session.ptr_size == 4 {
+    pt = .U32
+  }
+  wv, wok := read_value(handle, base + FLYFF_WORLD_RVA, pt)
+  if !wok {
+    return 0, false
+  }
+  world := uintptr(value_as_u64(pt, wv))
+  if world == 0 {
+    return 0, false
+  }
+  fv, fok := read_value(handle, world + FLYFF_FOCUS_OFF, pt)
+  if !fok {
+    return 0, false
+  }
+  return uintptr(value_as_u64(pt, fv)), true
+}
+
+// True if <obj> looks like a live object: its vtable points back into the game module.
+// Cheap insurance so a non-zero-but-freed focus (e.g. after zoning) still triggers an
+// advance; the primary auto trigger remains focus == 0 (game clears it on kill).
+focus_obj_live :: proc(session: ^Session, obj: uintptr) -> bool {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  pt := Value_Type.U64
+  if session.ptr_size == 4 {
+    pt = .U32
+  }
+  vt, ok := read_value(handle, obj, pt)
+  if !ok {
+    return false
+  }
+  vtable := uintptr(value_as_u64(pt, vt))
+  return vtable >= base && vtable < mod_end
+}
+
+// Auto-farm tick: called every ~20ms by the watcher thread while auto_on. When no live
+// target is selected (m_pObjFocus cleared on kill, or pointing at a freed object), advance
+// the focus to the next fresh mob named auto_name. F2-held then keeps attacking it.
+auto_tick :: proc(session: ^Session) {
+  if !session.auto_on || !session.attached {
+    return
+  }
+  now := time.now()._nsec
+  if now - session.auto_last < AUTO_MIN_INTERVAL_NS {
+    return
+  }
+  // Busy check: a live target is still selected -> nothing to do.
+  if focus, fok := read_focus_ptr(session); fok && focus != 0 && focus_obj_live(session, focus) {
+    return
+  }
+  // Focus cleared (kill) or focused obj freed -> advance to the next fresh mob.
+  res, obj, d, sel, total := tc_select(session, session.auto_name, true)
+  session.auto_last = now
+  if res == .Picked {
+    fmt.printf(
+      "\n[auto] '%s' -> #%d/%d obj=0x%X d=%.1f\n",
+      session.auto_name,
+      sel + 1,
+      total,
+      obj,
+      d,
+    )
+    fmt.print("memscan> ")
+  }
+  // NoCandidates / AllOnCooldown / AnchorFail / WriteFail: stay quiet (no idle spam).
+}
+
+// auto                 -> show status
+// auto off | auto stop -> turn auto-farm off
+// auto <name>          -> toggle on/off for <name> (same name toggles; a different name
+//                         while on switches target). Good to bind to a single hotkey.
+cli_auto :: proc(session: ^Session, args: []string) {
+  if len(args) == 0 {
+    if session.auto_on {
+      fmt.printfln("auto-farm ON: '%s'.", session.auto_name)
+    } else {
+      fmt.println("auto-farm OFF. usage: auto <name>  (toggle)  |  auto off")
+    }
+    return
+  }
+
+  if len(args) == 1 && (args[0] == "off" || args[0] == "stop") {
+    if session.auto_on {
+      session.auto_on = false
+      fmt.println("auto-farm OFF.")
+    } else {
+      fmt.println("auto-farm already off.")
+    }
+    return
+  }
+
+  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
+  if len(name) == 0 {
+    fmt.eprintln("usage: auto <name>")
+    return
+  }
+
+  if session.auto_on {
+    if strings.equal_fold(name, session.auto_name) {
+      session.auto_on = false // same name -> toggle off
+      fmt.println("auto-farm OFF.")
+      return
+    }
+    delete(session.auto_name) // different name -> switch target, stay on
+    session.auto_name = strings.clone(name)
+    session.auto_last = 0
+    fmt.printfln("auto-farm target -> '%s'.", name)
+    return
+  }
+
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  delete(session.auto_name)
+  session.auto_name = strings.clone(name)
+  session.auto_last = 0
+  session.auto_on = true
+  ensure_hotkey_thread(session)
+  fmt.printfln(
+    "auto-farm ON: '%s'. hold F2; advances to the next mob on each kill. 'auto %s' or 'auto off' to stop.",
+    name,
+    name,
+  )
 }
 
 // Read-only: list movers named <name> by distance with HP and model-pointer validity.
