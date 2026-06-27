@@ -1,11 +1,13 @@
 package main
 
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
 import win "core:sys/windows"
+import "core:thread"
 
 // ===========================================================================
 // Value types
@@ -282,7 +284,15 @@ region_is_writable :: proc(mbi: win.MEMORY_BASIC_INFORMATION) -> bool {
   )
 }
 
-collect_regions :: proc(handle: win.HANDLE, writable_only: bool, allocator := context.allocator) -> [dynamic]Region {
+// `private_only` keeps only MEM_PRIVATE (heap) regions — where the game's CObj
+// instances live — skipping mapped files / image sections. Used for object
+// enumeration so it stays complete (no stale region cache) yet fast.
+collect_regions :: proc(
+  handle: win.HANDLE,
+  writable_only: bool,
+  private_only := false,
+  allocator := context.allocator,
+) -> [dynamic]Region {
   regions := make([dynamic]Region, allocator)
   mbi: win.MEMORY_BASIC_INFORMATION
   mbi_size := uint(size_of(mbi))
@@ -291,7 +301,9 @@ collect_regions :: proc(handle: win.HANDLE, writable_only: bool, allocator := co
     base := uintptr(mbi.BaseAddress)
     size := uint(mbi.RegionSize)
     next := base + uintptr(size)
-    if region_is_readable(mbi) && (!writable_only || region_is_writable(mbi)) {
+    if region_is_readable(mbi) &&
+       (!writable_only || region_is_writable(mbi)) &&
+       (!private_only || mbi.Type == win.MEM_PRIVATE) {
       append(&regions, Region{base = base, size = size, protect = u32(mbi.Protect)})
     }
     if next <= addr {
@@ -345,6 +357,24 @@ scan_exact :: proc(
 ) -> (
   set: Match_Set,
 ) {
+  regions := collect_regions(handle, writable_only)
+  defer delete(regions)
+  return scan_exact_regions(handle, t, target, regions[:], nil, allocator)
+}
+
+// Exact-value scan over an explicit list of regions. When `hit_regions` is non-nil,
+// every region producing >=1 match is appended to it — used to build the
+// target_closest enumeration cache so later scans re-read only object-bearing heaps.
+scan_exact_regions :: proc(
+  handle: win.HANDLE,
+  t: Value_Type,
+  target: Value,
+  regions: []Region,
+  hit_regions: ^[dynamic]Region,
+  allocator := context.allocator,
+) -> (
+  set: Match_Set,
+) {
   set.vtype = t
   set.matches = make([dynamic]Match, allocator)
   size := value_size(t)
@@ -353,22 +383,146 @@ scan_exact :: proc(
   }
 
   tgt := target
-  regions := collect_regions(handle, writable_only)
-  defer delete(regions)
-
   for r in regions {
     buf := make([]byte, r.size)
     n, ok := read_into(handle, r.base, buf)
     if ok {
+      had := false
       off := 0
       for off + size <= int(n) {
         if mem.compare(buf[off:off + size], tgt[:size]) == 0 {
           append(&set.matches, Match{addr = r.base + uintptr(off), value = bytes_to_value(buf[off:off + size])})
+          had = true
         }
         off += size
       }
+      if had && hit_regions != nil {
+        append(hit_regions, r)
+      }
     }
     delete(buf)
+  }
+  return
+}
+
+// Per-worker state for scan_exact_parallel.
+Scan_Worker :: struct {
+  handle:  win.HANDLE,
+  size:    int,
+  tv32:    u32,
+  tv64:    u64,
+  target:  Value,
+  regions: []Region,
+  matches: [dynamic]Match,
+}
+
+scan_worker_proc :: proc(data: rawptr) {
+  w := cast(^Scan_Worker)data
+  w.matches = make([dynamic]Match)
+  buf: []byte
+  defer delete(buf)
+  for r in w.regions {
+    if len(buf) < int(r.size) {
+      delete(buf)
+      buf = make([]byte, r.size)
+    }
+    n, ok := read_into(w.handle, r.base, buf[:r.size])
+    if !ok {
+      continue
+    }
+    nn := int(n)
+    off := 0
+    switch w.size {
+    case 4:
+      // typed compare — far faster than mem.compare per offset; off stays 4-aligned
+      for off + 4 <= nn {
+        if (cast(^u32)(&buf[off]))^ == w.tv32 {
+          append(&w.matches, Match{addr = r.base + uintptr(off), value = bytes_to_value(buf[off:off + 4])})
+        }
+        off += 4
+      }
+    case 8:
+      for off + 8 <= nn {
+        if (cast(^u64)(&buf[off]))^ == w.tv64 {
+          append(&w.matches, Match{addr = r.base + uintptr(off), value = bytes_to_value(buf[off:off + 8])})
+        }
+        off += 8
+      }
+    case:
+      for off + w.size <= nn {
+        if mem.compare(buf[off:off + w.size], w.target[:w.size]) == 0 {
+          append(&w.matches, Match{addr = r.base + uintptr(off), value = bytes_to_value(buf[off:off + w.size])})
+        }
+        off += w.size
+      }
+    }
+  }
+}
+
+// Multithreaded exact-value scan over an explicit region list: regions are byte-balanced
+// across worker threads, each scanning with a typed compare. Used by target_closest so a
+// complete (uncached) scan stays fast. Matches are merged in arbitrary order.
+scan_exact_parallel :: proc(
+  handle: win.HANDLE,
+  t: Value_Type,
+  target: Value,
+  regions: []Region,
+  allocator := context.allocator,
+) -> (
+  set: Match_Set,
+) {
+  set.vtype = t
+  set.matches = make([dynamic]Match, allocator)
+  size := value_size(t)
+  if size == 0 {
+    return
+  }
+  NW :: 8
+
+  // distribute regions largest-first onto the least-loaded worker (balance by bytes)
+  rs := make([]Region, len(regions), context.temp_allocator)
+  copy(rs, regions)
+  slice.sort_by(rs, proc(a, b: Region) -> bool {return a.size > b.size})
+  wregions: [NW][dynamic]Region
+  for i in 0 ..< NW {
+    wregions[i] = make([dynamic]Region, context.temp_allocator)
+  }
+  loads: [NW]u64
+  for r in rs {
+    mi := 0
+    for i in 1 ..< NW {
+      if loads[i] < loads[mi] {
+        mi = i
+      }
+    }
+    append(&wregions[mi], r)
+    loads[mi] += u64(r.size)
+  }
+
+  workers: [NW]Scan_Worker
+  threads: [NW]^thread.Thread
+  tv32 := u32(value_as_u64(t, target))
+  tv64 := value_as_u64(t, target)
+  for i in 0 ..< NW {
+    workers[i] = Scan_Worker {
+      handle  = handle,
+      size    = size,
+      tv32    = tv32,
+      tv64    = tv64,
+      target  = target,
+      regions = wregions[i][:],
+    }
+    threads[i] = thread.create_and_start_with_data(&workers[i], scan_worker_proc)
+  }
+  for i in 0 ..< NW {
+    thread.join(threads[i])
+  }
+  for i in 0 ..< NW {
+    for m in workers[i].matches {
+      append(&set.matches, m)
+    }
+    delete(workers[i].matches)
+    thread.destroy(threads[i])
   }
   return
 }
@@ -535,6 +689,325 @@ filter_pointers :: proc(
 }
 
 // ===========================================================================
+// Positions / nearest-entity enumeration
+// ===========================================================================
+
+// Read a D3DXVECTOR3 (3 contiguous little-endian f32: x, y, z) at `addr`.
+read_vec3 :: proc(handle: win.HANDLE, addr: uintptr) -> (v: [3]f32, ok: bool) {
+  buf: [12]byte
+  n, rok := read_into(handle, addr, buf[:])
+  if !rok || n < 12 {
+    return {}, false
+  }
+  return transmute([3]f32)buf, true
+}
+
+// Horizontal distance between two points (ignores the vertical Y axis). Flyff
+// targeting/range is effectively ground-plane, so this is the friendlier metric.
+dist_horizontal :: proc(a, b: [3]f32) -> f32 {
+  dx := a[0] - b[0]
+  dz := a[2] - b[2]
+  return math.sqrt(dx * dx + dz * dz)
+}
+
+// Full 3D distance between two points; used as the sort key for `nearest`.
+dist_3d :: proc(a, b: [3]f32) -> f32 {
+  dx := a[0] - b[0]
+  dy := a[1] - b[1]
+  dz := a[2] - b[2]
+  return math.sqrt(dx * dx + dy * dy + dz * dz)
+}
+
+Nearest_Mode :: enum {
+  List, // walk the CObj m_pNext linked list from a known object pointer
+  Array, // read a static array of CObj* (e.g. m_amvrSelect / m_aobjCull)
+}
+
+Nearest_Entry :: struct {
+  obj_ptr: uintptr, // CObj* base
+  pos:     [3]f32,
+  dtype:   u32, // m_dwType (at pos_off+0x10): distinguishes movers/mobs from props/NPCs
+  dist:    f32, // 3D distance to player (sort key)
+  dist_h:  f32, // horizontal distance to player
+}
+
+// Read m_dwType, which sits 0x10 past m_vPos in CObj (m_vPos, m_pWorld, m_dwType).
+read_obj_type :: proc(handle: win.HANDLE, obj: uintptr, pos_off: i64) -> u32 {
+  if tv, ok := read_value(handle, uintptr(i64(obj) + pos_off + 0x10), .U32); ok {
+    return u32(value_as_u64(.U32, tv))
+  }
+  return 0
+}
+
+// Enumerate nearby entities and rank them by distance to `player_pos` (ascending).
+// In .List mode, `start` is a known CObj* and we follow `+next_off` up to `max_nodes`
+// nodes, validating each pointer against committed writable regions (with cycle
+// detection). In .Array mode, `start` is the array base and we read `count` pointer-
+// sized entries `stride` apart. Each entity's position is read at `obj + pos_off`.
+enumerate_nearest :: proc(
+  handle: win.HANDLE,
+  ptr_size: int,
+  mode: Nearest_Mode,
+  start: uintptr,
+  pos_off: i64,
+  player_pos: [3]f32,
+  next_off: i64,
+  max_nodes: int,
+  count: int,
+  stride: i64,
+  allocator := context.allocator,
+) -> (
+  out: [dynamic]Nearest_Entry,
+) {
+  out = make([dynamic]Nearest_Entry, allocator)
+
+  regions := collect_regions(handle, true)
+  defer delete(regions)
+  slice.sort_by(regions[:], proc(a, b: Region) -> bool {
+    return a.base < b.base
+  })
+
+  pt := Value_Type.U64
+  if ptr_size == 4 {
+    pt = .U32
+  }
+
+  objs := make([dynamic]uintptr, context.temp_allocator)
+  switch mode {
+  case .List:
+    cur := start
+    for _ in 0 ..< max_nodes {
+      if cur == 0 || !region_contains(regions[:], cur) {
+        break
+      }
+      seen := false
+      for o in objs {
+        if o == cur {
+          seen = true
+          break
+        }
+      }
+      if seen {
+        break // cycle
+      }
+      append(&objs, cur)
+      nv, nok := read_value(handle, uintptr(i64(cur) + next_off), pt)
+      if !nok {
+        break
+      }
+      cur = uintptr(value_as_u64(pt, nv))
+    }
+  case .Array:
+    for i in 0 ..< count {
+      slot := uintptr(i64(start) + i64(i) * stride)
+      sv, sok := read_value(handle, slot, pt)
+      if !sok {
+        continue
+      }
+      p := uintptr(value_as_u64(pt, sv))
+      if p == 0 || !region_contains(regions[:], p) {
+        continue
+      }
+      append(&objs, p)
+    }
+  }
+
+  for obj in objs {
+    pos, pok := read_vec3(handle, uintptr(i64(obj) + pos_off))
+    if !pok {
+      continue
+    }
+    append(
+      &out,
+      Nearest_Entry {
+        obj_ptr = obj,
+        pos = pos,
+        dtype = read_obj_type(handle, obj, pos_off),
+        dist = dist_3d(pos, player_pos),
+        dist_h = dist_horizontal(pos, player_pos),
+      },
+    )
+  }
+
+  slice.sort_by(out[:], proc(a, b: Nearest_Entry) -> bool {
+    return a.dist < b.dist
+  })
+  return
+}
+
+// Rank entities sourced from a scan match set. Each match address is treated as a
+// pointer-field inside a CObj (e.g. m_pWorld), so the object base is `addr-field_off`
+// and its position is read at `base+pos_off`. Objects whose base doesn't start with a
+// module-range pointer (a vtable) are skipped, which filters stray hits of the scanned
+// value that aren't real objects. Sorted ascending by 3D distance to `player_pos`.
+rank_object_matches :: proc(
+  handle: win.HANDLE,
+  ptr_size: int,
+  matches: []Match,
+  field_off: i64,
+  pos_off: i64,
+  player_pos: [3]f32,
+  module_base: uintptr,
+  module_size: u32,
+  allocator := context.allocator,
+) -> (
+  out: [dynamic]Nearest_Entry,
+) {
+  out = make([dynamic]Nearest_Entry, allocator)
+  pt := Value_Type.U64
+  if ptr_size == 4 {
+    pt = .U32
+  }
+  mod_end := module_base + uintptr(module_size)
+  for m in matches {
+    obj := uintptr(i64(m.addr) - field_off)
+    vt, vok := read_value(handle, obj, pt)
+    if !vok {
+      continue
+    }
+    p := uintptr(value_as_u64(pt, vt))
+    if p < module_base || p >= mod_end {
+      continue // no module-range vtable at base -> not a CObj, skip
+    }
+    pos, pok := read_vec3(handle, uintptr(i64(obj) + pos_off))
+    if !pok {
+      continue
+    }
+    append(
+      &out,
+      Nearest_Entry {
+        obj_ptr = obj,
+        pos = pos,
+        dtype = read_obj_type(handle, obj, pos_off),
+        dist = dist_3d(pos, player_pos),
+        dist_h = dist_horizontal(pos, player_pos),
+      },
+    )
+  }
+  slice.sort_by(out[:], proc(a, b: Nearest_Entry) -> bool {
+    return a.dist < b.dist
+  })
+  return
+}
+
+// Search committed readable memory for an exact byte pattern; returns match
+// addresses. Used by 'find' to locate strings (ASCII or UTF-16LE) in the target.
+scan_bytes :: proc(
+  handle: win.HANDLE,
+  pattern: []byte,
+  allocator := context.allocator,
+) -> (
+  out: [dynamic]uintptr,
+) {
+  out = make([dynamic]uintptr, allocator)
+  if len(pattern) == 0 {
+    return
+  }
+  regions := collect_regions(handle, false)
+  defer delete(regions)
+  first := pattern[0]
+  for r in regions {
+    buf := make([]byte, r.size)
+    n, ok := read_into(handle, r.base, buf)
+    if ok {
+      limit := int(n) - len(pattern)
+      i := 0
+      for i <= limit {
+        if buf[i] == first && mem.compare(buf[i:i + len(pattern)], pattern) == 0 {
+          append(&out, r.base + uintptr(i))
+          i += len(pattern)
+        } else {
+          i += 1
+        }
+      }
+    }
+    delete(buf)
+  }
+  return
+}
+
+// Read a NUL-terminated ASCII string (max `max` bytes). Returns ok only if it is
+// non-empty and entirely printable ASCII — so callers can probe an address and
+// reject non-string memory.
+read_cstring :: proc(
+  handle: win.HANDLE,
+  addr: uintptr,
+  max := 48,
+  allocator := context.temp_allocator,
+) -> (
+  s: string,
+  ok: bool,
+) {
+  buf := make([]byte, max, allocator)
+  n, rok := read_into(handle, addr, buf)
+  if !rok || n == 0 {
+    return "", false
+  }
+  end := 0
+  for end < int(n) && buf[end] != 0 {
+    if buf[end] < 0x20 || buf[end] > 0x7E {
+      return "", false // non-printable -> not a name
+    }
+    end += 1
+  }
+  if end == 0 {
+    return "", false
+  }
+  return string(buf[:end]), true
+}
+
+// Read an object's name at obj+name_off, auto-detecting whether the field is a
+// pointer-to-string or an inline char buffer.
+read_obj_name :: proc(
+  handle: win.HANDLE,
+  ptr_size: int,
+  obj: uintptr,
+  name_off: i64,
+) -> (
+  string,
+  bool,
+) {
+  pt := Value_Type.U64
+  if ptr_size == 4 {
+    pt = .U32
+  }
+  field := uintptr(i64(obj) + name_off)
+  if v, ok := read_value(handle, field, pt); ok {
+    p := uintptr(value_as_u64(pt, v))
+    if p != 0 {
+      if s, sok := read_cstring(handle, p); sok {
+        return s, true
+      }
+    }
+  }
+  return read_cstring(handle, field) // inline buffer fallback
+}
+
+// ---------------------------------------------------------------------------
+// Flyff (modded Neuz.exe) layout, found at runtime. Slots are module-base-relative
+// RVAs (base is fixed at 0x930000 but we add the live base so a rebase still works).
+// ---------------------------------------------------------------------------
+FLYFF_WORLD_RVA :: 0x5837CC // static global CWorld* ; m_pObjFocus = [base+RVA] + 0x20
+FLYFF_PLAYER_RVA :: 0x571DE8 // static global player CMover*
+FLYFF_FOCUS_OFF :: 0x20 // m_pObjFocus offset inside CWorld
+FLYFF_FIELD_OFF :: 0x16C // CObj.m_pWorld (every object holds it; our enumeration anchor)
+FLYFF_POS_OFF :: 0x160 // CObj.m_vPos (3x f32)
+FLYFF_TYPE_REL :: 0x10 // m_dwType, relative to m_vPos (so POS_OFF+0x10)
+FLYFF_NAME_OFF :: 0x1DB8 // CMover inline name char buffer
+FLYFF_MOVER_TYPE :: 5 // m_dwType for movers (players, pets, NPCs, monsters)
+FLYFF_HP_OFF :: 0x281C // CMover current HP (LONG); 0 => dead/despawning (don't target)
+FLYFF_MODEL_OFF :: 0x178 // CObj.m_pModel; NULL => not rendered/selectable (crashes on select)
+
+// Encode a pointer as `size` little-endian bytes for write_value/scan targets.
+ptr_to_value :: proc(p: uintptr, size: int) -> (out: Value) {
+  u := u64(p)
+  for i in 0 ..< size {
+    out[i] = byte(u >> uint(8 * i))
+  }
+  return
+}
+
+// ===========================================================================
 // Process discovery / module info (Win32 toolhelp)
 // ===========================================================================
 
@@ -591,24 +1064,27 @@ find_process_id_by_name :: proc(name: string, allocator := context.allocator) ->
   results: [dynamic]Process_Search_Result
   for ok {
     process_name, err := win.wstring_to_utf8(win.wstring(raw_data(process_entry.szExeFile[:])), -1)
-    if err != nil {
-      fmt.println("Failed to convert process name to UTF-8:", err)
-      continue
-    }
-    lower_process_name := strings.to_lower(process_name, context.temp_allocator)
-
-    if strings.contains(lower_process_name, lower_name) {
-      found := Process_Search_Result {
-        process_id   = process_entry.th32ProcessID,
-        process_name = process_name,
+    if err == nil {
+      lower_process_name := strings.to_lower(process_name, context.temp_allocator)
+      window_title, wok := find_window_title_by_process_id(process_entry.th32ProcessID)
+      if !wok {
+        window_title = ""
       }
-      window_title, ok := find_window_title_by_process_id(process_entry.th32ProcessID)
-      if ok {
-        found.window_title = window_title
-      } else {
-        found.window_title = ""
+      lower_title := strings.to_lower(window_title, context.temp_allocator)
+      // Match on either the process name OR its window title, so a character name
+      // like "BAFACO" picks the right Neuz.exe. Empty filter matches everything.
+      if lower_name == "" ||
+         strings.contains(lower_process_name, lower_name) ||
+         strings.contains(lower_title, lower_name) {
+        append(
+          &results,
+          Process_Search_Result {
+            process_id = process_entry.th32ProcessID,
+            process_name = process_name,
+            window_title = window_title,
+          },
+        )
       }
-      append(&results, found)
     }
 
     ok = win.Process32NextW(snapshot_handle, &process_entry)

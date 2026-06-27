@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
+import "core:sync"
 import win "core:sys/windows"
 
 Attached_Process :: struct {
@@ -26,6 +27,16 @@ Session :: struct {
   snapshot:      Mem_Snapshot,
   has_matches:   bool,
   matches:       Match_Set,
+  targets:       [dynamic]Nearest_Entry, // last 'nearest' result, sorted by distance
+  tc_recent:     [dynamic]TC_Recent, // objs target_closest picked recently (skip just-killed)
+
+  // Global hotkeys (see hotkey.odin). exec_mutex serializes command execution
+  // between the REPL thread and the hotkey watcher thread.
+  hotkeys:       [dynamic]Hotkey,
+  exec_mutex:    sync.Mutex,
+  hk_thread:     win.HANDLE,
+  hk_running:    bool,
+  hk_stop:       bool,
 }
 
 main :: proc() {
@@ -60,11 +71,27 @@ session_reset_scan :: proc(session: ^Session) {
   session.has_matches = false
   session.snapshot = {}
   session.matches = {}
+  delete(session.targets)
+  session.targets = nil
+  delete(session.tc_recent)
+  session.tc_recent = nil
 }
 
 session_close :: proc(session: ^Session) {
+  // Stop the hotkey watcher before closing the process handle it may be using.
+  if session.hk_running {
+    sync.mutex_lock(&session.exec_mutex)
+    session.hk_stop = true
+    sync.mutex_unlock(&session.exec_mutex)
+    win.WaitForSingleObject(session.hk_thread, 1000)
+    win.CloseHandle(session.hk_thread)
+    session.hk_running = false
+  }
   if session.attached {
     win.CloseHandle(session.proc_info.handle)
   }
   free_all(virtual.arena_allocator(&session.scan_arena))
+  delete(session.targets)
+  delete(session.hotkeys)
+  delete(session.tc_recent)
 }
