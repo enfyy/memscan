@@ -1,4 +1,5 @@
-package main
+package flyff
+import "../engine"
 
 import "core:fmt"
 import win "core:sys/windows"
@@ -112,11 +113,11 @@ notify_server_target :: proc(session: ^Session, obj: uintptr) -> bool {
   if session.ptr_size != 4 {
     return false // 32-bit Flyff client only
   }
-  idv, idok := read_value(session.proc_info.handle, obj + uintptr(session.layout.objid_off), .U32)
+  idv, idok := engine.read_value(session.proc_info.handle, obj + uintptr(session.layout.objid_off), .U32)
   if !idok {
     return false
   }
-  objid := u32(value_as_u64(.U32, idv))
+  objid := u32(engine.value_as_u64(.U32, idv))
   if objid == 0 {
     return false
   }

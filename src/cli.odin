@@ -1,4 +1,6 @@
 package main
+import "flyff"
+import "engine"
 
 import "core:fmt"
 import "core:os"
@@ -9,7 +11,7 @@ import "core:sync"
 import win "core:sys/windows"
 import "core:time"
 
-run_cli :: proc(session: ^Session) {
+run_cli :: proc(session: ^flyff.Session) {
   fmt.println("memscan - type 'help' for commands, 'quit' to exit.")
   line_buf: [1024]byte
   for {
@@ -36,7 +38,7 @@ run_cli :: proc(session: ^Session) {
 // Run one input line (possibly several commands chained with ';' or '&&', which run
 // sequentially without short-circuiting). Shared by the REPL and the hotkey watcher;
 // callers must hold session.exec_mutex. Returns true if a 'quit' command ran.
-cli_execute_line :: proc(session: ^Session, line: string) -> (quit: bool) {
+cli_execute_line :: proc(session: ^flyff.Session, line: string) -> (quit: bool) {
   normalized, _ := strings.replace_all(line, "&&", ";", context.temp_allocator)
   segments := strings.split(normalized, ";", context.temp_allocator)
   for seg in segments {
@@ -79,7 +81,7 @@ cli_read_line :: proc(buf: []byte) -> (line: string, ok: bool) {
   return string(buf[:i]), true
 }
 
-cli_dispatch :: proc(session: ^Session, cmd: string, args: []string) -> (quit: bool) {
+cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (quit: bool) {
   switch cmd {
   case "help", "?":
     cli_help()
@@ -110,10 +112,10 @@ cli_dispatch :: proc(session: ^Session, cmd: string, args: []string) -> (quit: b
   case "pointers", "ptr":
     cli_pointers(session)
   case "clearmatches", "cm":
-    session_clear_matches(session)
+    flyff.session_clear_matches(session)
     fmt.println("matches cleared (snapshot kept).")
   case "reset":
-    session_reset_scan(session)
+    flyff.session_reset_scan(session)
     fmt.println("scan state reset.")
   case "read", "r":
     cli_read(session, args)
@@ -136,31 +138,31 @@ cli_dispatch :: proc(session: ^Session, cmd: string, args: []string) -> (quit: b
   case "find":
     cli_find(session, args)
   case "target_closest", "tc", "get":
-    cli_target_closest(session, args)
+    flyff.cli_target_closest(session, args)
   case "auto":
-    cli_auto(session, args)
+    flyff.cli_auto(session, args)
   case "refocus":
-    cli_refocus(session, args)
+    flyff.cli_refocus(session, args)
   case "calibrate", "cal":
-    cli_calibrate(session, args)
+    flyff.cli_calibrate(session, args)
   case "calibrate_house", "calh":
-    cli_calibrate_house(session, args)
+    flyff.cli_calibrate_house(session, args)
   case "offsets", "layout":
-    cli_offsets(session, args)
+    flyff.cli_offsets(session, args)
   case "set":
-    cli_set(session, args)
+    flyff.cli_set(session, args)
   case "findpos":
-    cli_findpos(session, args)
+    flyff.cli_findpos(session, args)
   case "findfocus":
-    cli_findfocus(session, args)
+    flyff.cli_findfocus(session, args)
   case "findhp":
-    cli_findhp(session, args)
+    flyff.cli_findhp(session, args)
   case "hpwatch":
-    cli_hpwatch(session, args)
+    flyff.cli_hpwatch(session, args)
   case "findpacket":
-    cli_findpacket(session, args)
+    flyff.cli_findpacket(session, args)
   case "packetwatch":
-    cli_packetwatch(session, args)
+    flyff.cli_packetwatch(session, args)
   case "disasm", "u":
     cli_disasm(session, args)
   case "func":
@@ -170,19 +172,19 @@ cli_dispatch :: proc(session: ^Session, cmd: string, args: []string) -> (quit: b
   case "codescan":
     cli_codescan(session, args)
   case "idscan":
-    cli_idscan(session, args)
+    flyff.cli_idscan(session, args)
   case "srvsync":
-    cli_srvsync(session, args)
+    flyff.cli_srvsync(session, args)
   case "srvtest":
-    cli_srvtest(session, args)
+    flyff.cli_srvtest(session, args)
   case "hotkey", "hk":
-    cli_hotkey(session, args)
+    flyff.cli_hotkey(session, args)
   case "deathscan":
-    cli_deathscan(session, args)
+    flyff.cli_deathscan(session, args)
   case "objscan":
-    cli_objscan(session, args)
+    flyff.cli_objscan(session, args)
   case "mobs":
-    cli_mobs(session, args)
+    flyff.cli_mobs(session, args)
   case:
     fmt.eprintfln("unknown command: %s (try 'help')", cmd)
   }
@@ -261,14 +263,14 @@ cli_ps :: proc(args: []string) {
   if len(args) > 0 {
     filter = args[0]
   }
-  results := find_process_id_by_name(filter, context.temp_allocator)
+  results := engine.find_process_id_by_name(filter, context.temp_allocator)
   fmt.printfln("%d process(es):", len(results))
   for r in results {
     fmt.printfln("  pid=%-6d  %-28s  %s", r.process_id, r.process_name, r.window_title)
   }
 }
 
-cli_attach :: proc(session: ^Session, args: []string) {
+cli_attach :: proc(session: ^flyff.Session, args: []string) {
   if len(args) < 1 {
     fmt.eprintln("usage: attach <name|pid>")
     return
@@ -280,7 +282,7 @@ cli_attach :: proc(session: ^Session, args: []string) {
     v, _ := strconv.parse_u64(args[0])
     pid = u32(v)
   } else {
-    results := find_process_id_by_name(args[0], context.temp_allocator)
+    results := engine.find_process_id_by_name(args[0], context.temp_allocator)
     if len(results) == 0 {
       fmt.eprintfln("no process matching '%s'", args[0])
       return
@@ -303,7 +305,7 @@ cli_attach :: proc(session: ^Session, args: []string) {
     return
   }
 
-  base, size, mok := get_process_module_info(pid)
+  base, size, mok := engine.get_process_module_info(pid)
   if !mok {
     fmt.eprintfln("warning: could not read main module info for pid %d", pid)
   }
@@ -312,13 +314,13 @@ cli_attach :: proc(session: ^Session, args: []string) {
   win.IsWow64Process(handle, &is_wow)
 
   if session.attached {
-    remote_free_shim(session) // release the old process's cached shim page before re-attaching
+    flyff.remote_free_shim(session) // release the old process's cached shim page before re-attaching
     win.CloseHandle(session.proc_info.handle)
   }
-  session_reset_scan(session)
+  flyff.session_reset_scan(session)
 
   session.attached = true
-  session.proc_info = Attached_Process {
+  session.proc_info = flyff.Attached_Process {
     pid         = pid,
     name        = strings.clone(name),
     handle      = handle,
@@ -344,16 +346,16 @@ cli_attach :: proc(session: ^Session, args: []string) {
 
   // Load the persisted Flyff layout (flyff.cfg next to memscan.exe) fresh over defaults, so a
   // patched build just needs 'calibrate' once. Absent file -> built-in defaults.
-  session.layout = flyff_layout_default()
-  cfg := flyff_cfg_path()
-  if flyff_load_cfg(&session.layout, cfg) {
+  session.layout = flyff.flyff_layout_default()
+  cfg := flyff.flyff_cfg_path()
+  if flyff.flyff_load_cfg(&session.layout, cfg) {
     fmt.printfln("layout: loaded %s", cfg)
   } else {
     fmt.println("layout: built-in defaults (run 'calibrate' if the game was patched).")
   }
 }
 
-cli_detach :: proc(session: ^Session) {
+cli_detach :: proc(session: ^flyff.Session) {
   if !session.attached {
     fmt.println("not attached.")
     return
@@ -362,15 +364,15 @@ cli_detach :: proc(session: ^Session) {
   session.auto_on = false // stop auto-farm when the process goes away
   session.refocus_on = false
   session.srvsync_on = false
-  remote_free_shim(session)
+  flyff.remote_free_shim(session)
   win.CloseHandle(session.proc_info.handle)
-  session_reset_scan(session)
+  flyff.session_reset_scan(session)
   session.attached = false
   session.proc_info = {}
   fmt.printfln("detached from pid %d.", pid)
 }
 
-cli_info :: proc(session: ^Session) {
+cli_info :: proc(session: ^flyff.Session) {
   if !session.attached {
     fmt.println("not attached.")
     return
@@ -381,25 +383,25 @@ cli_info :: proc(session: ^Session) {
   fmt.printfln("module base  : 0x%X", p.base)
   fmt.printfln("module size  : %d", p.module_size)
   fmt.printfln("bitness      : %s (ptr_size=%d)", p.is_wow64 ? "32-bit (WOW64)" : "64-bit", session.ptr_size)
-  fmt.printfln("default type : %s", value_type_name(session.vtype))
+  fmt.printfln("default type : %s", engine.value_type_name(session.vtype))
   fmt.printfln("has snapshot : %v", session.has_snapshot)
   fmt.printfln("matches      : %v", session.has_matches ? len(session.matches.matches) : 0)
 }
 
-cli_vtype :: proc(session: ^Session, args: []string) {
+cli_vtype :: proc(session: ^flyff.Session, args: []string) {
   if len(args) < 1 {
-    fmt.printfln("current type: %s", value_type_name(session.vtype))
+    fmt.printfln("current type: %s", engine.value_type_name(session.vtype))
     return
   }
   if t, ok := parse_vtype(args[0]); ok {
     session.vtype = t
-    fmt.printfln("type = %s", value_type_name(t))
+    fmt.printfln("type = %s", engine.value_type_name(t))
   } else {
     fmt.eprintfln("unknown type '%s' (u8 i8 u16 i16 u32 i32 u64 i64 f32 f64)", args[0])
   }
 }
 
-cli_ptrsize :: proc(session: ^Session, args: []string) {
+cli_ptrsize :: proc(session: ^flyff.Session, args: []string) {
   if len(args) < 1 {
     fmt.printfln("ptr_size = %d", session.ptr_size)
     return
@@ -415,7 +417,7 @@ cli_ptrsize :: proc(session: ^Session, args: []string) {
   fmt.printfln("ptr_size = %d", session.ptr_size)
 }
 
-cli_scan :: proc(session: ^Session, args: []string) {
+cli_scan :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -432,21 +434,21 @@ cli_scan :: proc(session: ^Session, args: []string) {
       val_str = args[1]
     }
   }
-  target, ok := parse_value(t, val_str)
+  target, ok := engine.parse_value(t, val_str)
   if !ok {
-    fmt.eprintfln("invalid %s value: %s", value_type_name(t), val_str)
+    fmt.eprintfln("invalid %s value: %s", engine.value_type_name(t), val_str)
     return
   }
 
-  session_reset_scan(session)
-  set := scan_exact(session.proc_info.handle, t, target, session.writable_only, session_scan_allocator(session))
+  flyff.session_reset_scan(session)
+  set := engine.scan_exact(session.proc_info.handle, t, target, session.writable_only, flyff.session_scan_allocator(session))
   session.matches = set
   session.has_matches = true
   session.vtype = t
-  fmt.printfln("scan(%s == %s): %d match(es)", value_type_name(t), val_str, len(set.matches))
+  fmt.printfln("scan(%s == %s): %d match(es)", engine.value_type_name(t), val_str, len(set.matches))
 }
 
-cli_snapshot :: proc(session: ^Session, args: []string) {
+cli_snapshot :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -458,19 +460,19 @@ cli_snapshot :: proc(session: ^Session, args: []string) {
     }
   }
   // Keep any existing match set alive (old snapshot, if any, is left in the arena).
-  snap := take_snapshot(session.proc_info.handle, t, session.writable_only, session_scan_allocator(session))
+  snap := engine.take_snapshot(session.proc_info.handle, t, session.writable_only, flyff.session_scan_allocator(session))
   session.snapshot = snap
   session.has_snapshot = true
   session.vtype = t
   fmt.printfln(
     "snapshot(%s): %d region(s), %.1f MB. Change the value, then 'next changed'.",
-    value_type_name(t),
+    engine.value_type_name(t),
     len(snap.regions),
-    f64(snapshot_total_bytes(snap)) / (1024 * 1024),
+    f64(engine.snapshot_total_bytes(snap)) / (1024 * 1024),
   )
 }
 
-cli_next :: proc(session: ^Session, args: []string) {
+cli_next :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -485,14 +487,14 @@ cli_next :: proc(session: ^Session, args: []string) {
     return
   }
 
-  target: Value
+  target: engine.Value
   has_target := false
   if needs_val {
     if len(args) < 2 {
       fmt.eprintfln("comparator '%s' needs a value", args[0])
       return
     }
-    tv, vok := parse_value(session.vtype, args[1])
+    tv, vok := engine.parse_value(session.vtype, args[1])
     if !vok {
       fmt.eprintfln("invalid value: %s", args[1])
       return
@@ -501,12 +503,12 @@ cli_next :: proc(session: ^Session, args: []string) {
     has_target = true
   }
 
-  alloc := session_scan_allocator(session)
-  new_set: Match_Set
+  alloc := flyff.session_scan_allocator(session)
+  new_set: engine.Match_Set
   if session.has_matches {
-    new_set = refine_matches(session.proc_info.handle, session.matches, op, target, has_target, alloc)
+    new_set = engine.refine_matches(session.proc_info.handle, session.matches, op, target, has_target, alloc)
   } else if session.has_snapshot {
-    new_set = refine_from_snapshot(session.proc_info.handle, session.snapshot, op, target, has_target, alloc)
+    new_set = engine.refine_from_snapshot(session.proc_info.handle, session.snapshot, op, target, has_target, alloc)
   } else {
     fmt.eprintln("nothing to refine - run 'scan' or 'snapshot' first.")
     return
@@ -516,7 +518,7 @@ cli_next :: proc(session: ^Session, args: []string) {
   fmt.printfln("next(%s): %d match(es)", args[0], len(new_set.matches))
 }
 
-cli_list :: proc(session: ^Session, args: []string) {
+cli_list :: proc(session: ^flyff.Session, args: []string) {
   if !session.has_matches {
     fmt.eprintln("no matches - run 'scan' or 'snapshot'+'next' first.")
     return
@@ -533,11 +535,11 @@ cli_list :: proc(session: ^Session, args: []string) {
   fmt.printfln("%d match(es), showing %d:", count, limit)
   for i in 0 ..< limit {
     e := m.matches[i]
-    fmt.printfln("  [%d] 0x%X = %s", i, e.addr, format_value(m.vtype, e.value))
+    fmt.printfln("  [%d] 0x%X = %s", i, e.addr, engine.format_value(m.vtype, e.value))
   }
 }
 
-cli_pointers :: proc(session: ^Session) {
+cli_pointers :: proc(session: ^flyff.Session) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -547,12 +549,12 @@ cli_pointers :: proc(session: ^Session) {
     return
   }
   before := len(session.matches.matches)
-  set := filter_pointers(session.proc_info.handle, session.matches, session.ptr_size, session_scan_allocator(session))
+  set := engine.filter_pointers(session.proc_info.handle, session.matches, session.ptr_size, flyff.session_scan_allocator(session))
   session.matches = set
   fmt.printfln("pointers: %d -> %d match(es)", before, len(set.matches))
 }
 
-cli_count :: proc(session: ^Session) {
+cli_count :: proc(session: ^flyff.Session) {
   if !session.has_matches {
     fmt.println("0 matches.")
     return
@@ -560,7 +562,7 @@ cli_count :: proc(session: ^Session) {
   fmt.printfln("%d match(es)", len(session.matches.matches))
 }
 
-cli_read :: proc(session: ^Session, args: []string) {
+cli_read :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -569,7 +571,7 @@ cli_read :: proc(session: ^Session, args: []string) {
     fmt.eprintln("usage: read <addr> [type]")
     return
   }
-  addr, ok := parse_addr(args[0])
+  addr, ok := engine.parse_addr(args[0])
   if !ok {
     fmt.eprintfln("invalid address: %s", args[0])
     return
@@ -580,15 +582,15 @@ cli_read :: proc(session: ^Session, args: []string) {
       t = tt
     }
   }
-  v, rok := read_value(session.proc_info.handle, addr, t)
+  v, rok := engine.read_value(session.proc_info.handle, addr, t)
   if !rok {
     fmt.eprintfln("read failed at 0x%X", addr)
     return
   }
-  fmt.printfln("0x%X = %s", addr, format_value(t, v))
+  fmt.printfln("0x%X = %s", addr, engine.format_value(t, v))
 }
 
-cli_write :: proc(session: ^Session, args: []string) {
+cli_write :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -597,7 +599,7 @@ cli_write :: proc(session: ^Session, args: []string) {
     fmt.eprintln("usage: write <addr> <value> [type]")
     return
   }
-  addr, ok := parse_addr(args[0])
+  addr, ok := engine.parse_addr(args[0])
   if !ok {
     fmt.eprintfln("invalid address: %s", args[0])
     return
@@ -608,19 +610,19 @@ cli_write :: proc(session: ^Session, args: []string) {
       t = tt
     }
   }
-  val, vok := parse_value(t, args[1])
+  val, vok := engine.parse_value(t, args[1])
   if !vok {
-    fmt.eprintfln("invalid %s value: %s", value_type_name(t), args[1])
+    fmt.eprintfln("invalid %s value: %s", engine.value_type_name(t), args[1])
     return
   }
-  if write_value(session.proc_info.handle, addr, t, val) {
-    fmt.printfln("wrote 0x%X = %s", addr, format_value(t, val))
+  if engine.write_value(session.proc_info.handle, addr, t, val) {
+    fmt.printfln("wrote 0x%X = %s", addr, engine.format_value(t, val))
   } else {
     fmt.eprintfln("write failed at 0x%X (error %d)", addr, win.GetLastError())
   }
 }
 
-cli_peek :: proc(session: ^Session, args: []string) {
+cli_peek :: proc(session: ^flyff.Session, args: []string) {
   if !session.has_matches {
     fmt.eprintln("no matches.")
     return
@@ -636,15 +638,15 @@ cli_peek :: proc(session: ^Session, args: []string) {
     return
   }
   m := session.matches.matches[idx]
-  v, rok := read_value(session.proc_info.handle, m.addr, session.matches.vtype)
+  v, rok := engine.read_value(session.proc_info.handle, m.addr, session.matches.vtype)
   if !rok {
     fmt.eprintfln("read failed at 0x%X", m.addr)
     return
   }
-  fmt.printfln("[%d] 0x%X = %s", idx, m.addr, format_value(session.matches.vtype, v))
+  fmt.printfln("[%d] 0x%X = %s", idx, m.addr, engine.format_value(session.matches.vtype, v))
 }
 
-cli_poke :: proc(session: ^Session, args: []string) {
+cli_poke :: proc(session: ^flyff.Session, args: []string) {
   if !session.has_matches {
     fmt.eprintln("no matches.")
     return
@@ -668,20 +670,20 @@ cli_poke :: proc(session: ^Session, args: []string) {
     return
   }
   t := session.matches.vtype
-  val, vok := parse_value(t, val_str)
+  val, vok := engine.parse_value(t, val_str)
   if !vok {
-    fmt.eprintfln("invalid %s value: %s", value_type_name(t), val_str)
+    fmt.eprintfln("invalid %s value: %s", engine.value_type_name(t), val_str)
     return
   }
   addr := session.matches.matches[idx].addr
-  if write_value(session.proc_info.handle, addr, t, val) {
-    fmt.printfln("poked [%d] 0x%X = %s", idx, addr, format_value(t, val))
+  if engine.write_value(session.proc_info.handle, addr, t, val) {
+    fmt.printfln("poked [%d] 0x%X = %s", idx, addr, engine.format_value(t, val))
   } else {
     fmt.eprintfln("write failed at 0x%X (error %d)", addr, win.GetLastError())
   }
 }
 
-cli_deref :: proc(session: ^Session, args: []string) {
+cli_deref :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -690,32 +692,32 @@ cli_deref :: proc(session: ^Session, args: []string) {
     fmt.eprintln("usage: deref <addr> [offset ...]")
     return
   }
-  base, ok := parse_addr(args[0])
+  base, ok := engine.parse_addr(args[0])
   if !ok {
     fmt.eprintfln("invalid address: %s", args[0])
     return
   }
   offsets := make([dynamic]i64, context.temp_allocator)
   for i in 1 ..< len(args) {
-    off, ook := parse_offset(args[i])
+    off, ook := engine.parse_offset(args[i])
     if !ook {
       fmt.eprintfln("invalid offset: %s", args[i])
       return
     }
     append(&offsets, off)
   }
-  addr, dok := deref_chain(session.proc_info.handle, base, offsets[:], session.ptr_size)
+  addr, dok := engine.deref_chain(session.proc_info.handle, base, offsets[:], session.ptr_size)
   if !dok {
     fmt.eprintfln("deref failed (stopped at 0x%X)", addr)
     return
   }
   fmt.printfln("-> 0x%X", addr)
-  if v, rok := read_value(session.proc_info.handle, addr, session.vtype); rok {
-    fmt.printfln("   [%s] = %s", value_type_name(session.vtype), format_value(session.vtype, v))
+  if v, rok := engine.read_value(session.proc_info.handle, addr, session.vtype); rok {
+    fmt.printfln("   [%s] = %s", engine.value_type_name(session.vtype), engine.format_value(session.vtype, v))
   }
 }
 
-cli_dump :: proc(session: ^Session, args: []string) {
+cli_dump :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -736,7 +738,7 @@ cli_dump :: proc(session: ^Session, args: []string) {
     }
   }
   buf := make([]byte, length, context.temp_allocator)
-  n, rok := read_into(session.proc_info.handle, addr, buf)
+  n, rok := engine.read_into(session.proc_info.handle, addr, buf)
   if !rok || n == 0 {
     fmt.eprintfln("read failed at 0x%X", addr)
     return
@@ -777,7 +779,7 @@ cli_dump :: proc(session: ^Session, args: []string) {
   }
 }
 
-cli_dist :: proc(session: ^Session, args: []string) {
+cli_dist :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -792,18 +794,18 @@ cli_dist :: proc(session: ^Session, args: []string) {
     fmt.eprintln("invalid address/index")
     return
   }
-  va, vaok := read_vec3(session.proc_info.handle, a)
-  vb, vbok := read_vec3(session.proc_info.handle, b)
+  va, vaok := engine.read_vec3(session.proc_info.handle, a)
+  vb, vbok := engine.read_vec3(session.proc_info.handle, b)
   if !vaok || !vbok {
     fmt.eprintln("read failed")
     return
   }
   fmt.printfln("A 0x%X = (%.3f, %.3f, %.3f)", a, va[0], va[1], va[2])
   fmt.printfln("B 0x%X = (%.3f, %.3f, %.3f)", b, vb[0], vb[1], vb[2])
-  fmt.printfln("d(x,z) = %.3f   d(3d) = %.3f", dist_horizontal(va, vb), dist_3d(va, vb))
+  fmt.printfln("d(x,z) = %.3f   d(3d) = %.3f", engine.dist_horizontal(va, vb), engine.dist_3d(va, vb))
 }
 
-cli_nearest :: proc(session: ^Session, args: []string) {
+cli_nearest :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -817,7 +819,7 @@ cli_nearest :: proc(session: ^Session, args: []string) {
   }
   handle := session.proc_info.handle
   rest := args[1:]
-  entries: [dynamic]Nearest_Entry
+  entries: [dynamic]engine.Nearest_Entry
 
   switch args[0] {
   case "list":
@@ -826,8 +828,8 @@ cli_nearest :: proc(session: ^Session, args: []string) {
       return
     }
     start, sok := resolve_operand(session, rest[0])
-    next_off, nok := parse_offset(rest[1])
-    pos_off, pok := parse_offset(rest[2])
+    next_off, nok := engine.parse_offset(rest[1])
+    pos_off, pok := engine.parse_offset(rest[2])
     player_pos, plok := resolve_player_pos(session, rest[3])
     if !sok || !nok || !pok || !plok {
       fmt.eprintln("invalid argument")
@@ -839,7 +841,7 @@ cli_nearest :: proc(session: ^Session, args: []string) {
         max_nodes = v
       }
     }
-    entries = enumerate_nearest(
+    entries = engine.enumerate_nearest(
       handle,
       session.ptr_size,
       .List,
@@ -858,14 +860,14 @@ cli_nearest :: proc(session: ^Session, args: []string) {
     }
     base, bok := resolve_operand(session, rest[0])
     count, cok := strconv.parse_int(rest[1])
-    stride, stok := parse_offset(rest[2])
-    pos_off, pok := parse_offset(rest[3])
+    stride, stok := engine.parse_offset(rest[2])
+    pos_off, pok := engine.parse_offset(rest[3])
     player_pos, plok := resolve_player_pos(session, rest[4])
     if !bok || !cok || !stok || !pok || !plok {
       fmt.eprintln("invalid argument")
       return
     }
-    entries = enumerate_nearest(
+    entries = engine.enumerate_nearest(
       handle,
       session.ptr_size,
       .Array,
@@ -886,14 +888,14 @@ cli_nearest :: proc(session: ^Session, args: []string) {
       fmt.eprintln("usage: nearest matches <field_off> <pos_off> <player|[j]>")
       return
     }
-    field_off, fok := parse_offset(rest[0])
-    pos_off, pok := parse_offset(rest[1])
+    field_off, fok := engine.parse_offset(rest[0])
+    pos_off, pok := engine.parse_offset(rest[1])
     player_pos, plok := resolve_player_pos(session, rest[2])
     if !fok || !pok || !plok {
       fmt.eprintln("invalid argument")
       return
     }
-    entries = rank_object_matches(
+    entries = engine.rank_object_matches(
       handle,
       session.ptr_size,
       session.matches.matches[:],
@@ -929,7 +931,7 @@ cli_nearest :: proc(session: ^Session, args: []string) {
   }
 }
 
-cli_target :: proc(session: ^Session, args: []string) {
+cli_target :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -953,7 +955,7 @@ cli_target :: proc(session: ^Session, args: []string) {
     return
   }
   obj := session.targets[rank].obj_ptr
-  t := Value_Type.U64
+  t := engine.Value_Type.U64
   if session.ptr_size == 4 {
     t = .U32
   }
@@ -962,25 +964,25 @@ cli_target :: proc(session: ^Session, args: []string) {
   // so verify the object still starts with a module-range vtable before writing.
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
-  vt, vok := read_value(session.proc_info.handle, obj, t)
-  vtable := uintptr(value_as_u64(t, vt))
+  vt, vok := engine.read_value(session.proc_info.handle, obj, t)
+  vtable := uintptr(engine.value_as_u64(t, vt))
   if !vok || vtable < base || vtable >= mod_end {
     fmt.eprintfln("refusing: obj 0x%X is no longer a live object - re-run 'nearest' for fresh pointers.", obj)
     return
   }
-  val: Value
+  val: engine.Value
   u := u64(obj)
-  for i in 0 ..< value_size(t) {
+  for i in 0 ..< engine.value_size(t) {
     val[i] = byte(u >> uint(8 * i))
   }
-  if write_value(session.proc_info.handle, focus, t, val) {
+  if engine.write_value(session.proc_info.handle, focus, t, val) {
     fmt.printfln("selected rank %d obj=0x%X (type=%d) -> focus 0x%X", rank, obj, session.targets[rank].dtype, focus)
   } else {
     fmt.eprintfln("write failed at 0x%X (error %d)", focus, win.GetLastError())
   }
 }
 
-cli_find :: proc(session: ^Session, args: []string) {
+cli_find :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -1000,8 +1002,8 @@ cli_find :: proc(session: ^Session, args: []string) {
   for i in 0 ..< len(text) {
     wide[i * 2] = text[i]
   }
-  ha := scan_bytes(session.proc_info.handle, asc, context.temp_allocator)
-  hw := scan_bytes(session.proc_info.handle, wide, context.temp_allocator)
+  ha := engine.scan_bytes(session.proc_info.handle, asc, context.temp_allocator)
+  hw := engine.scan_bytes(session.proc_info.handle, wide, context.temp_allocator)
   fmt.printfln("find %q: %d ascii, %d utf-16 hit(s)", text, len(ha), len(hw))
   for h, i in ha {
     if i >= 200 {
@@ -1017,527 +1019,7 @@ cli_find :: proc(session: ^Session, args: []string) {
   }
 }
 
-TC_Cand :: struct {
-  obj: uintptr,
-  d:   f32,
-}
-
-// A mob target_closest recently selected. We skip these for TC_RECENT_NS so a just-killed
-// mob (which keeps reading as alive while it plays its death/despawn animation) isn't
-// immediately re-selected. See the crash/death notes: there's no reliable in-memory "dead"
-// flag we can read, so we avoid re-picking what we just picked instead.
-TC_Recent :: struct {
-  obj: uintptr,
-  t:   i64, // time.now()._nsec when picked
-}
-TC_RECENT_NS :: i64(6_000_000_000) // ~6s, a bit longer than the corpse despawn delay
-
-tc_seen_recently :: proc(session: ^Session, obj: uintptr, now: i64) -> bool {
-  for r in session.tc_recent {
-    if r.obj == obj && now - r.t < TC_RECENT_NS {
-      return true
-    }
-  }
-  return false
-}
-
-tc_mark_recent :: proc(session: ^Session, obj: uintptr, now: i64) {
-  i := 0
-  for i < len(session.tc_recent) {
-    r := session.tc_recent[i]
-    if r.obj == obj || now - r.t >= TC_RECENT_NS {
-      unordered_remove(&session.tc_recent, i) // drop the old entry for obj + any expired
-    } else {
-      i += 1
-    }
-  }
-  append(&session.tc_recent, TC_Recent{obj = obj, t = now})
-}
-
-// Debug: append everything we know about the object we're about to select to
-// tc_targets.log (in the cwd), flushed before the focus write. The GAME crashes on a
-// bad selection, not memscan, so memscan survives and the LAST entry in the log is
-// whatever we targeted right before the crash. Remove once the crash is understood.
-log_target :: proc(session: ^Session, obj: uintptr, world: uintptr, sel, total: int) {
-  handle := session.proc_info.handle
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-  rdp :: proc(handle: win.HANDLE, addr: uintptr, pt: Value_Type) -> uintptr {
-    v, ok := read_value(handle, addr, pt)
-    return ok ? uintptr(value_as_u64(pt, v)) : 0
-  }
-  rdi :: proc(handle: win.HANDLE, addr: uintptr) -> i32 {
-    v, ok := read_value(handle, addr, .U32)
-    return ok ? i32(u32(value_as_u64(.U32, v))) : -1
-  }
-  dumprow :: proc(sb: ^strings.Builder, handle: win.HANDLE, addr: uintptr, off: uintptr, n: int) {
-    b := make([]byte, n, context.temp_allocator)
-    rn, ok := read_into(handle, addr + off, b)
-    fmt.sbprintf(sb, "  +0x%04X:", off)
-    if ok {
-      for i in 0 ..< int(rn) {
-        fmt.sbprintf(sb, " %02X", b[i])
-      }
-    } else {
-      fmt.sbprint(sb, " <read failed>")
-    }
-    fmt.sbprint(sb, "\n")
-  }
-
-  name, _ := read_obj_name(handle, session.ptr_size, obj, session.layout.name_off)
-  pos, _ := read_vec3(handle, obj + uintptr(session.layout.pos_off))
-  mpw := rdp(handle, obj + uintptr(session.layout.field_off), pt)
-  prev := rdp(handle, world + uintptr(session.layout.focus_off), pt)
-
-  sb := strings.builder_make(context.temp_allocator)
-  fmt.sbprintfln(&sb, "--- target obj=0x%X '%s' #%d/%d (prevFocus=0x%X) ---", obj, name, sel + 1, total, prev)
-  fmt.sbprintfln(
-    &sb,
-    "  type=%d vtable=0x%X mpWorld=0x%X(want 0x%X%s) hp=%d max=%d pos=%.1f,%.1f,%.1f",
-    read_obj_type(handle, obj, session.layout.pos_off),
-    rdp(handle, obj, pt),
-    mpw,
-    world,
-    mpw == world ? "" : " MISMATCH",
-    rdi(handle, obj + uintptr(session.layout.hp_off)),
-    rdi(handle, obj + 0x814),
-    pos[0],
-    pos[1],
-    pos[2],
-  )
-  dumprow(&sb, handle, obj, 0x0, 0x30) // vtable + early pointers
-  dumprow(&sb, handle, obj, 0x160, 0x20) // pos/world/type/index/model
-  dumprow(&sb, handle, obj, 0x800, 0x20) // maxHP region
-  dumprow(&sb, handle, obj, 0x2800, 0x140) // currentHP (+0x281C) + despawn-timer region
-
-  fd, err := os.open("tc_targets.log", os.O_WRONLY | os.O_CREATE | os.O_APPEND)
-  if err == os.ERROR_NONE {
-    os.write_string(fd, strings.to_string(sb))
-    os.close(fd)
-  }
-}
-
-// True if <obj> is a safe, correct focus target: a live object (vtable in module), a mover
-// (type 5), name-matches <name>, has currentHP > 0, and a mapped m_pModel. Selecting a
-// model-less / freed object crashes the client (it derefs the focused object's model to
-// draw the selection), so this is used BOTH as the enumeration filter AND as the re-check
-// done immediately before the focus write - objects can be freed/reallocated in between.
-obj_is_selectable :: proc(session: ^Session, obj: uintptr, name: string) -> bool {
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-  vt, vok := read_value(handle, obj, pt)
-  if !vok {
-    return false
-  }
-  vtable := uintptr(value_as_u64(pt, vt))
-  if vtable < base || vtable >= mod_end {
-    return false // not a live object
-  }
-  if read_obj_type(handle, obj, session.layout.pos_off) != session.layout.mover_type {
-    return false // movers only
-  }
-  nm, nok := read_obj_name(handle, session.ptr_size, obj, session.layout.name_off)
-  if !nok || !strings.equal_fold(nm, name) {
-    return false
-  }
-  // skip dying-but-not-despawned mobs (currentHP <= 0); a failed read leaves it eligible
-  if hpv, hok := read_value(handle, obj + uintptr(session.layout.hp_off), .U32); hok {
-    if i32(u32(value_as_u64(.U32, hpv))) <= 0 {
-      return false
-    }
-  }
-  // require a live, mapped model - selecting a model-less mob crashes the client
-  model: uintptr = 0
-  if mv, mok := read_value(handle, obj + uintptr(session.layout.model_off), pt); mok {
-    model = uintptr(value_as_u64(pt, mv))
-  }
-  if model < 0x10000 {
-    return false
-  }
-  if _, mok2 := read_value(handle, model, pt); !mok2 {
-    return false
-  }
-  return true
-}
-
-// Scan for objects and return the selectable movers named <name>, nearest first. Enumerates
-// ALL writable regions fresh every call - complete regardless of spawns/zoning (the old
-// region cache went stale and missed most of a big spawn). Each world-ptr hit is gated by
-// obj_is_selectable (live object, mover, name, HP, model).
-tc_collect_cands :: proc(
-  session: ^Session,
-  name: string,
-  world: uintptr,
-  player_pos: [3]f32,
-) -> [dynamic]TC_Cand {
-  handle := session.proc_info.handle
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-  wval := ptr_to_value(world, session.ptr_size)
-  regions := collect_regions(handle, true) // all writable - complete, no stale cache
-  defer delete(regions)
-  set := scan_exact_parallel(handle, pt, wval, regions[:], context.temp_allocator) // multithreaded
-
-  cands := make([dynamic]TC_Cand, context.temp_allocator)
-  for m in set.matches {
-    obj := uintptr(i64(m.addr) - session.layout.field_off)
-    if !obj_is_selectable(session, obj, name) {
-      continue
-    }
-    pos, posok := read_vec3(handle, obj + uintptr(session.layout.pos_off))
-    if !posok {
-      continue
-    }
-    append(&cands, TC_Cand{obj = obj, d = dist_3d(pos, player_pos)})
-  }
-  slice.sort_by(cands[:], proc(a, b: TC_Cand) -> bool {return a.d < b.d})
-  return cands
-}
-
-TC_Result :: enum {
-  Picked, // wrote a mob into m_pObjFocus; obj/d/sel/total are set
-  NoCandidates, // no selectable mover named <name> nearby
-  AllOnCooldown, // candidates exist but all recently targeted (only when require_fresh)
-  WentStale, // chosen obj was freed/reallocated between enumeration and the write
-  AnchorFail, // couldn't read the world/player anchors (not in-game / wrong build)
-  WriteFail, // the focus write failed (message already printed)
-}
-
-// Resolve the Flyff world/player anchors, enumerate selectable movers named <name>, pick
-// one by distance, and write it into m_pObjFocus - atomically, so the pick can't go stale
-// between ranking and selecting. Shared by manual `target_closest` and the auto-farm loop.
-// All the crash guards live in tc_collect_cands (vtable-in-module, type 5, HP>0, mapped
-// model), so this never writes a dead/model-less mob.
-//   require_fresh=false (manual): when every candidate is on the recently-targeted cooldown,
-//     fall back to the closest - the #1<->#2 / next-fresh cycle of repeated presses.
-//   require_fresh=true (auto): return AllOnCooldown instead, so a lone just-killed mob isn't
-//     re-selected while it's still a fresh-looking corpse.
-tc_select :: proc(
-  session: ^Session,
-  name: string,
-  require_fresh: bool,
-) -> (
-  res: TC_Result,
-  obj: uintptr,
-  d: f32,
-  sel: int,
-  total: int,
-) {
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-
-  // Resolve world + player from the static anchors.
-  wv, wok := read_value(handle, base + session.layout.world_rva, pt)
-  pv, pok := read_value(handle, base + session.layout.player_rva, pt)
-  if !wok || !pok {
-    return .AnchorFail, 0, 0, 0, 0
-  }
-  world := uintptr(value_as_u64(pt, wv))
-  player := uintptr(value_as_u64(pt, pv))
-  focus_addr := world + uintptr(session.layout.focus_off)
-  player_pos, ppok := read_vec3(handle, player + uintptr(session.layout.pos_off))
-  if !ppok {
-    return .AnchorFail, 0, 0, 0, 0
-  }
-
-  // Collect selectable (alive + rendered) movers named <name>, nearest first.
-  cands := tc_collect_cands(session, name, world, player_pos)
-  total = len(cands)
-  if total == 0 {
-    return .NoCandidates, 0, 0, 0, 0
-  }
-
-  // Pick the nearest mob we haven't targeted in the last few seconds. A just-killed mob
-  // can keep reading as alive (HP unchanged, model still valid) while it plays its death
-  // animation, so picking the strict closest would re-select the corpse. Skipping recent
-  // picks advances to the next mob after each kill.
-  now := time.now()._nsec
-  chosen := cands[0]
-  sel = 0
-  found := false
-  for c, i in cands {
-    if !tc_seen_recently(session, c.obj, now) {
-      chosen = c
-      sel = i
-      found = true
-      break
-    }
-  }
-  if !found {
-    if require_fresh {
-      return .AllOnCooldown, 0, 0, 0, total // don't re-lock a fresh corpse (auto)
-    }
-    chosen = cands[0] // manual: fall back to the closest
-    sel = 0
-  }
-  // Re-validate immediately before the write. The object can be freed/reallocated between
-  // enumeration and now; writing a stale pointer whose m_pModel has gone NULL crashes the
-  // client. This shrinks the TOCTOU window from ~ms (the sort/pick above) to ~µs.
-  if !obj_is_selectable(session, chosen.obj, name) {
-    return .WentStale, 0, 0, 0, total
-  }
-  tc_mark_recent(session, chosen.obj, now)
-
-  when ODIN_DEBUG {
-    log_target(session, chosen.obj, world, sel, total)
-  }
-  if !write_value(handle, focus_addr, pt, ptr_to_value(chosen.obj, session.ptr_size)) {
-    fmt.eprintfln("write failed at focus 0x%X (error %d)", focus_addr, win.GetLastError())
-    return .WriteFail, chosen.obj, chosen.d, sel, total
-  }
-  // Server sync: also make the client emit its own SendSetTarget so the server registers the
-  // same target (stops the after-N-kills DC). Inert unless 'srvsync on' and Phase-0 configured.
-  if session.srvsync_on {
-    notify_server_target(session, chosen.obj)
-  }
-  return .Picked, chosen.obj, chosen.d, sel, total
-}
-
-// One-shot: select the nearest selectable mover named <name> by writing it into
-// m_pObjFocus. Repeated presses advance through the nearby mobs (the recently-targeted
-// cooldown skips a just-killed corpse). All anchors/offsets are baked Flyff constants, so
-// it needs no setup: `target_closest Mutant Yetti`.
-cli_target_closest :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  if len(name) == 0 {
-    fmt.eprintln("usage: target_closest <name>")
-    return
-  }
-
-  res, obj, d, sel, total := tc_select(session, name, false)
-  switch res {
-  case .Picked:
-    fmt.printfln("targeted '%s' #%d/%d obj=0x%X at d=%.1f.", name, sel + 1, total, obj, d)
-  case .NoCandidates:
-    fmt.printfln("no '%s' found.", name)
-  case .AnchorFail:
-    fmt.eprintln("could not read world/player anchors (wrong build or not in-game?).")
-  case .AllOnCooldown:
-    fmt.printfln("no fresh '%s' available.", name) // unreachable with require_fresh=false
-  case .WentStale:
-    fmt.printfln("'%s' just died/despawned - try again.", name)
-  case .WriteFail: // tc_select already printed the specific error
-  }
-}
-
-AUTO_MIN_INTERVAL_NS :: i64(300_000_000) // ~300ms between advance attempts (caps idle rescans)
-
-// Read m_pObjFocus: world = [base+world_rva], then the CObj* at world+focus_off.
-read_focus_ptr :: proc(session: ^Session) -> (focus: uintptr, ok: bool) {
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-  wv, wok := read_value(handle, base + session.layout.world_rva, pt)
-  if !wok {
-    return 0, false
-  }
-  world := uintptr(value_as_u64(pt, wv))
-  if world == 0 {
-    return 0, false
-  }
-  fv, fok := read_value(handle, world + uintptr(session.layout.focus_off), pt)
-  if !fok {
-    return 0, false
-  }
-  return uintptr(value_as_u64(pt, fv)), true
-}
-
-// True if <obj> looks like a live object: its vtable points back into the game module.
-// Cheap insurance so a non-zero-but-freed focus (e.g. after zoning) still triggers an
-// advance; the primary auto trigger remains focus == 0 (game clears it on kill).
-focus_obj_live :: proc(session: ^Session, obj: uintptr) -> bool {
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-  vt, ok := read_value(handle, obj, pt)
-  if !ok {
-    return false
-  }
-  vtable := uintptr(value_as_u64(pt, vt))
-  return vtable >= base && vtable < mod_end
-}
-
-// Auto-farm tick: called every ~20ms by the watcher thread while auto_on. When no live
-// target is selected (m_pObjFocus cleared on kill, or pointing at a freed object), advance
-// the focus to the next fresh mob named auto_name. F2-held then keeps attacking it.
-auto_tick :: proc(session: ^Session) {
-  if !session.auto_on || !session.attached {
-    return
-  }
-  now := time.now()._nsec
-  if now - session.auto_last < AUTO_MIN_INTERVAL_NS {
-    return
-  }
-  // Busy check: a live target is still selected -> nothing to do.
-  if focus, fok := read_focus_ptr(session); fok && focus != 0 && focus_obj_live(session, focus) {
-    return
-  }
-  // Focus cleared (kill) or focused obj freed -> advance to the next fresh mob.
-  res, obj, d, sel, total := tc_select(session, session.auto_name, true)
-  session.auto_last = now
-  if res == .Picked {
-    fmt.printf(
-      "\n[auto] '%s' -> #%d/%d obj=0x%X d=%.1f\n",
-      session.auto_name,
-      sel + 1,
-      total,
-      obj,
-      d,
-    )
-    fmt.print("memscan> ")
-  }
-  // NoCandidates / AllOnCooldown / AnchorFail / WriteFail: stay quiet (no idle spam).
-}
-
-// auto                 -> show status
-// auto off | auto stop -> turn auto-farm off
-// auto <name>          -> toggle on/off for <name> (same name toggles; a different name
-//                         while on switches target). Good to bind to a single hotkey.
-cli_auto :: proc(session: ^Session, args: []string) {
-  if len(args) == 0 {
-    if session.auto_on {
-      fmt.printfln("auto-farm ON: '%s'.", session.auto_name)
-    } else {
-      fmt.println("auto-farm OFF. usage: auto <name>  (toggle)  |  auto off")
-    }
-    return
-  }
-
-  if len(args) == 1 && (args[0] == "off" || args[0] == "stop") {
-    if session.auto_on {
-      session.auto_on = false
-      fmt.println("auto-farm OFF.")
-    } else {
-      fmt.println("auto-farm already off.")
-    }
-    return
-  }
-
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  if len(name) == 0 {
-    fmt.eprintln("usage: auto <name>")
-    return
-  }
-
-  if session.auto_on {
-    if strings.equal_fold(name, session.auto_name) {
-      session.auto_on = false // same name -> toggle off
-      fmt.println("auto-farm OFF.")
-      return
-    }
-    delete(session.auto_name) // different name -> switch target, stay on
-    session.auto_name = strings.clone(name)
-    session.auto_last = 0
-    fmt.printfln("auto-farm target -> '%s'.", name)
-    return
-  }
-
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  delete(session.auto_name)
-  session.auto_name = strings.clone(name)
-  session.auto_last = 0
-  session.auto_on = true
-  ensure_hotkey_thread(session)
-  fmt.printfln(
-    "auto-farm ON: '%s'. hold F2; advances to the next mob on each kill. 'auto %s' or 'auto off' to stop.",
-    name,
-    name,
-  )
-}
-
-REFOCUS_INTERVAL_NS :: i64(200_000_000) // ~200ms between consistent write-backs
-
-// Detection experiment: every ~200ms, read m_pObjFocus and write the SAME bytes back. This
-// generates external WriteProcessMemory traffic to the focus field whose value always equals
-// what the client itself set (via your clicks) - focus == the client's input "shadow". If the
-// anti-cheat disconnects under this, it detects the raw cross-process write; if it does NOT,
-// the ~5-min DC is the focus-vs-input mismatch and only *inconsistent* writes are the tell.
-refocus_tick :: proc(session: ^Session) {
-  if !session.refocus_on || !session.attached {
-    return
-  }
-  now := time.now()._nsec
-  if now - session.refocus_last < REFOCUS_INTERVAL_NS {
-    return
-  }
-  session.refocus_last = now
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-  wv, wok := read_value(handle, base + session.layout.world_rva, pt)
-  if !wok {
-    return
-  }
-  world := uintptr(value_as_u64(pt, wv))
-  if world == 0 {
-    return
-  }
-  focus_addr := world + uintptr(session.layout.focus_off)
-  fv, fok := read_value(handle, focus_addr, pt)
-  if !fok {
-    return
-  }
-  write_value(handle, focus_addr, pt, fv) // write the exact same bytes back (no value change)
-}
-
-// refocus | refocus off  -> toggle the consistent-write experiment (see refocus_tick).
-cli_refocus :: proc(session: ^Session, args: []string) {
-  if session.refocus_on || (len(args) == 1 && (args[0] == "off" || args[0] == "stop")) {
-    session.refocus_on = false
-    fmt.println("refocus OFF.")
-    return
-  }
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  session.auto_on = false // mutually exclusive experiment
-  session.refocus_last = 0
-  session.refocus_on = true
-  ensure_hotkey_thread(session)
-  fmt.println(
-    "refocus ON: writing the current focus value back every ~200ms. Play normally (click your own targets) and see if you still DC at ~5 min. 'refocus off' to stop.",
-  )
-}
-
-// Read-only code recon (net-package-targeting.md Phase 0). Two forms:
-//   codescan <u32>        find a 4-byte immediate in executable pages (e.g. 0xff0023, the
-//                         SETTARGET packet id embedded in SendSetTarget)
-//   codescan call <addr>  find direct CALL sites targeting <addr> (to read the preceding
-//                         `mov ecx, imm32` = &g_DPlay)
-// Each hit prints as absolute + Neuz.exe+RVA with a 20-byte window from 4 bytes before the
-// hit, so the opcode / prologue / `mov ecx` is visible.
-cli_codescan :: proc(session: ^Session, args: []string) {
+cli_codescan :: proc(session: ^flyff.Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -1554,12 +1036,12 @@ cli_codescan :: proc(session: ^Session, args: []string) {
       fmt.eprintln("usage: codescan call <addr>")
       return
     }
-    dest, dok := parse_addr(args[1])
+    dest, dok := engine.parse_addr(args[1])
     if !dok {
       fmt.eprintfln("invalid address: %s", args[1])
       return
     }
-    hits = codescan_calls(handle, dest, context.temp_allocator)
+    hits = engine.codescan_calls(handle, dest, context.temp_allocator)
     fmt.printfln("codescan call 0x%X: %d site(s)", dest, len(hits))
   } else if args[0] == "xref" {
     // Find code that references a base-relative global (e.g. the world at world_rva). Resolves
@@ -1568,21 +1050,21 @@ cli_codescan :: proc(session: ^Session, args: []string) {
       fmt.eprintln("usage: codescan xref <rva>   (e.g. codescan xref 0x5888DC for the world global)")
       return
     }
-    rva, rok := parse_addr(args[1])
+    rva, rok := engine.parse_addr(args[1])
     if !rok {
       fmt.eprintfln("invalid rva: %s", args[1])
       return
     }
     target := base + rva
-    hits = codescan_u32(handle, u32(target), context.temp_allocator)
+    hits = engine.codescan_u32(handle, u32(target), context.temp_allocator)
     fmt.printfln("codescan xref Neuz.exe+0x%X (abs 0x%X): %d hit(s)", rva, target, len(hits))
   } else {
-    v, vok := parse_addr(args[0])
+    v, vok := engine.parse_addr(args[0])
     if !vok {
       fmt.eprintfln("invalid value: %s", args[0])
       return
     }
-    hits = codescan_u32(handle, u32(v), context.temp_allocator)
+    hits = engine.codescan_u32(handle, u32(v), context.temp_allocator)
     fmt.printfln("codescan 0x%X: %d hit(s)", u32(v), len(hits))
   }
   shown := 0
@@ -1592,7 +1074,7 @@ cli_codescan :: proc(session: ^Session, args: []string) {
       break
     }
     wb: [20]byte
-    rn, _ := read_into(handle, h - 4, wb[:])
+    rn, _ := engine.read_into(handle, h - 4, wb[:])
     sb := strings.builder_make(context.temp_allocator)
     for i in 0 ..< int(rn) {
       if i == 4 {
@@ -1610,561 +1092,7 @@ cli_codescan :: proc(session: ^Session, args: []string) {
 // a plausible id range [1, 0x00FFFFFF] (so pointers/vtables are excluded). m_objid is the field
 // used as idTarget; it should be the offset where every mob has a small, unique value.
 // Usage: idscan <name>
-cli_idscan :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 1 {
-    fmt.eprintln("usage: idscan <name>")
-    return
-  }
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  LEN :: 0x4200
-
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-  wv, wok := read_value(handle, base + session.layout.world_rva, pt)
-  if !wok {
-    fmt.eprintln("could not read world anchor.")
-    return
-  }
-  world := uintptr(value_as_u64(pt, wv))
-  wval := ptr_to_value(world, session.ptr_size)
-  all := collect_regions(handle, true)
-  defer delete(all)
-  set := scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
-
-  bufs := make([dynamic][]byte, context.temp_allocator)
-  objs := make([dynamic]uintptr, context.temp_allocator)
-  for m in set.matches {
-    obj := uintptr(i64(m.addr) - session.layout.field_off)
-    vt, vok := read_value(handle, obj, pt)
-    if !vok {
-      continue
-    }
-    vtable := uintptr(value_as_u64(pt, vt))
-    if vtable < base || vtable >= mod_end {
-      continue
-    }
-    if read_obj_type(handle, obj, session.layout.pos_off) != session.layout.mover_type {
-      continue
-    }
-    nm, nok := read_obj_name(handle, session.ptr_size, obj, session.layout.name_off)
-    if !nok || !strings.contains(nm, name) {
-      continue
-    }
-    b := make([]byte, LEN, context.temp_allocator)
-    read_into(handle, obj, b)
-    append(&bufs, b)
-    append(&objs, obj)
-  }
-  n := len(bufs)
-  fmt.printfln("idscan '%s': %d movers; distinct in-range 4-byte fields:", name, n)
-  if n < 2 {
-    fmt.println("need >=2 movers named that; get more on screen and retry.")
-    return
-  }
-
-  u32at :: proc(b: []byte, off: int) -> u32 {
-    return u32(b[off]) | u32(b[off + 1]) << 8 | u32(b[off + 2]) << 16 | u32(b[off + 3]) << 24
-  }
-
-  // Re-read the SAME objects after a pause. m_objid is unique per mob AND never changes, so it is
-  // both UNIQUE and STABLE; positions vary (mobs move) and drop out. We also test each value as a
-  // pointer: real pointer fields (m_pModel etc.) resolve into committed memory, a plain objid does
-  // not, so the ptr fraction separates objid from pointer fields regardless of its magnitude.
-  fmt.println("sampling ~2.5s (let the mobs move / fight a little)...")
-  win.Sleep(2500)
-  bufs2 := make([][]byte, n, context.temp_allocator)
-  dead := make([]bool, n, context.temp_allocator)
-  for obj, i in objs {
-    b := make([]byte, LEN, context.temp_allocator)
-    read_into(handle, obj, b)
-    bufs2[i] = b
-    vt, vok := read_value(handle, obj, pt)
-    if !vok || !in_module_range(uintptr(value_as_u64(pt, vt)), base, mod_end) {
-      dead[i] = true // freed/despawned during the window
-    }
-  }
-  regions := collect_regions(handle, false)
-  defer delete(regions)
-  slice.sort_by(regions[:], proc(a, b: Region) -> bool {return a.base < b.base})
-
-  shown := 0
-  off := 0
-  for off <= LEN - 4 {
-    uniq := 0
-    for i in 0 ..< n {
-      v := u32at(bufs[i], off)
-      if v == 0 {
-        continue
-      }
-      dup := false
-      for j in 0 ..< i {
-        if u32at(bufs[j], off) == v {
-          dup = true
-          break
-        }
-      }
-      if !dup {
-        uniq += 1
-      }
-    }
-    if uniq * 10 >= n * 8 {
-      alive, stable, ptrs := 0, 0, 0
-      for i in 0 ..< n {
-        if dead[i] {
-          continue
-        }
-        alive += 1
-        if u32at(bufs[i], off) == u32at(bufs2[i], off) {
-          stable += 1
-        }
-        if region_contains(regions[:], uintptr(u32at(bufs[i], off))) {
-          ptrs += 1
-        }
-      }
-      if alive > 0 && stable * 10 >= alive * 9 && ptrs * 10 <= alive * 3 && shown < 24 {
-        sb := strings.builder_make(context.temp_allocator)
-        fmt.sbprintf(&sb, "  +0x%X uniq=%d ptr=%d/%d :", off, uniq, ptrs, alive)
-        for i in 0 ..< min(n, 8) {
-          fmt.sbprintf(&sb, " %d", u32at(bufs[i], off))
-        }
-        fmt.println(strings.to_string(sb))
-        shown += 1
-      }
-    }
-    off += 4
-  }
-  if shown == 0 {
-    fmt.println("  (no unique+stable field found; objid may be past +0x1000 - tell me and I'll widen it)")
-  } else {
-    fmt.println("(m_objid = unique + stable + LOW ptr. pointer fields show ptr ~= alive; objid ~0.)")
-  }
-}
-
-// srvsync           -> status
-// srvsync on|off    -> toggle: after each focus select, also fire the client's own
-//                      SendSetTarget(objid, 2) so the server registers our target.
-cli_srvsync :: proc(session: ^Session, args: []string) {
-  if len(args) == 0 {
-    fmt.printfln("srvsync %s.", session.srvsync_on ? "ON" : "OFF")
-    return
-  }
-  if args[0] == "off" || args[0] == "stop" {
-    session.srvsync_on = false
-    fmt.println("srvsync OFF.")
-    return
-  }
-  if args[0] == "on" {
-    if !srvsync_ready(session) {
-      return
-    }
-    session.srvsync_on = true
-    fmt.println("srvsync ON: each select now also sends the client's own SendSetTarget(objid, 2).")
-    return
-  }
-  fmt.eprintln("usage: srvsync [on|off]")
-}
-
-// srvtest -> fire exactly ONE SendSetTarget at the currently-focused mob and report the result.
-// The minimal PoC: select a mob (target_closest / a click), then 'srvtest' and watch whether the
-// session survives past the usual ~5-min kill-count DC.
-cli_srvtest :: proc(session: ^Session, args: []string) {
-  if !srvsync_ready(session) {
-    return
-  }
-  focus, fok := read_focus_ptr(session)
-  if !fok || focus == 0 {
-    fmt.eprintln("no mob focused - select one first (e.g. 'target_closest <name>' or click it).")
-    return
-  }
-  idv, idok := read_value(session.proc_info.handle, focus + uintptr(session.layout.objid_off), .U32)
-  objid := idok ? u32(value_as_u64(.U32, idv)) : 0
-  ok := notify_server_target(session, focus)
-  fmt.printfln("srvtest: SendSetTarget(objid=%d, 2) for obj=0x%X -> %s", objid, focus, ok ? "sent" : "FAILED")
-}
-
-// Shared precondition check for srvsync/srvtest: attached, 32-bit client, Phase-0 constants baked.
-srvsync_ready :: proc(session: ^Session) -> bool {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return false
-  }
-  if session.layout.sendsettarget_rva == 0 || session.layout.objid_off == 0 {
-    fmt.eprintln(
-      "not configured: sendsettarget_rva / objid_off are still 0. 'set sendsettarget_rva 0x190AA0' and 'set objid_off 0x2F0' (SoM values; re-find via disasm after a patch).",
-    )
-    return false
-  }
-  if session.ptr_size != 4 {
-    fmt.eprintln("srvsync targets the 32-bit Flyff client; attach the WOW64 Neuz.exe.")
-    return false
-  }
-  return true
-}
-
-// Read-only: list movers named <name> by distance with HP and model-pointer validity.
-// Never writes focus. Handy to see what target_closest will/won't consider selectable.
-cli_mobs :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 1 {
-    fmt.eprintln("usage: mobs <name>")
-    return
-  }
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-  wv, wok := read_value(handle, base + session.layout.world_rva, pt)
-  pv, pok := read_value(handle, base + session.layout.player_rva, pt)
-  if !wok || !pok {
-    fmt.eprintln("could not read world/player anchors.")
-    return
-  }
-  world := uintptr(value_as_u64(pt, wv))
-  player := uintptr(value_as_u64(pt, pv))
-  player_pos, _ := read_vec3(handle, player + uintptr(session.layout.pos_off))
-  wval := ptr_to_value(world, session.ptr_size)
-  all := collect_regions(handle, true)
-  defer delete(all)
-  set := scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
-
-  Row :: struct {
-    obj:      uintptr,
-    d:        f32,
-    hp:       i32,
-    model:    uintptr,
-    model_ok: bool,
-  }
-  rows := make([dynamic]Row, context.temp_allocator)
-  for m in set.matches {
-    obj := uintptr(i64(m.addr) - session.layout.field_off)
-    vt, vok := read_value(handle, obj, pt)
-    if !vok {
-      continue
-    }
-    vtable := uintptr(value_as_u64(pt, vt))
-    if vtable < base || vtable >= mod_end {
-      continue
-    }
-    if read_obj_type(handle, obj, session.layout.pos_off) != session.layout.mover_type {
-      continue
-    }
-    nm, nok := read_obj_name(handle, session.ptr_size, obj, session.layout.name_off)
-    if !nok || !strings.contains(nm, name) {
-      continue
-    }
-    pos, posok := read_vec3(handle, obj + uintptr(session.layout.pos_off))
-    if !posok {
-      continue
-    }
-    hp: i32 = -1
-    if hv, hok := read_value(handle, obj + uintptr(session.layout.hp_off), .U32); hok {
-      hp = i32(u32(value_as_u64(.U32, hv)))
-    }
-    model: uintptr = 0
-    if mv, mok := read_value(handle, obj + uintptr(session.layout.model_off), pt); mok {
-      model = uintptr(value_as_u64(pt, mv))
-    }
-    model_ok := false
-    if model >= 0x10000 {
-      if _, r := read_value(handle, model, pt); r {
-        model_ok = true
-      }
-    }
-    append(&rows, Row{obj = obj, d = dist_3d(pos, player_pos), hp = hp, model = model, model_ok = model_ok})
-  }
-  slice.sort_by(rows[:], proc(a, b: Row) -> bool {return a.d < b.d})
-  ok_count := 0
-  for r in rows {
-    if r.model_ok {
-      ok_count += 1
-    }
-  }
-  fmt.printfln("%d '%s' movers (%d selectable), by distance:", len(rows), name, ok_count)
-  for r, i in rows {
-    if i >= 30 {
-      break
-    }
-    fmt.printfln(
-      "  #%d d=%.1f obj=0x%X hp=%d model=0x%X %s",
-      i + 1,
-      r.d,
-      r.obj,
-      r.hp,
-      r.model,
-      r.model_ok ? "OK" : "BAD",
-    )
-  }
-}
-
-// Read-only recon: enumerate movers named <name> (same way target_closest does, but
-// it NEVER writes focus), snapshot LEN bytes of each, wait ~2.5s, re-read, and report
-// the field offsets that DECREMENT for some movers while staying 0 for the rest - i.e.
-// a per-corpse death/despawn countdown. Used to find the "don't target" flag without
-// touching the game. Usage: deathscan <name>
-cli_deathscan :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 1 {
-    fmt.eprintln("usage: deathscan <name>")
-    return
-  }
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  LEN :: 0x4000
-
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-  wv, wok := read_value(handle, base + session.layout.world_rva, pt)
-  if !wok {
-    fmt.eprintln("could not read world anchor.")
-    return
-  }
-  world := uintptr(value_as_u64(pt, wv))
-  wval := ptr_to_value(world, session.ptr_size)
-
-  all := collect_regions(handle, true)
-  defer delete(all)
-  set := scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
-  objs := make([dynamic]uintptr, context.temp_allocator)
-  for m in set.matches {
-    obj := uintptr(i64(m.addr) - session.layout.field_off)
-    vt, vok := read_value(handle, obj, pt)
-    if !vok {
-      continue
-    }
-    vtable := uintptr(value_as_u64(pt, vt))
-    if vtable < base || vtable >= mod_end {
-      continue
-    }
-    if read_obj_type(handle, obj, session.layout.pos_off) != session.layout.mover_type {
-      continue
-    }
-    nm, nok := read_obj_name(handle, session.ptr_size, obj, session.layout.name_off)
-    if !nok || !strings.contains(nm, name) {
-      continue
-    }
-    append(&objs, obj)
-  }
-  n := len(objs)
-  fmt.printfln("deathscan '%s': %d movers; sampling...", name, n)
-  if n < 3 {
-    fmt.println("need >=3 movers (some alive, some fresh corpses). kill a few and retry.")
-    return
-  }
-
-  read_snap :: proc(handle: win.HANDLE, objs: [dynamic]uintptr) -> [][]byte {
-    bufs := make([][]byte, len(objs), context.temp_allocator)
-    for o, i in objs {
-      b := make([]byte, LEN, context.temp_allocator)
-      read_into(handle, o, b)
-      bufs[i] = b
-    }
-    return bufs
-  }
-  u32at :: proc(b: []byte, off: int) -> i64 {
-    if off + 4 > len(b) {
-      return -1
-    }
-    return i64(u32(b[off]) | u32(b[off + 1]) << 8 | u32(b[off + 2]) << 16 | u32(b[off + 3]) << 24)
-  }
-
-  worldv := i64(u32(world))
-  SNAPS :: 6
-  snaps := make([][][]byte, SNAPS, context.temp_allocator)
-  for s in 0 ..< SNAPS {
-    snaps[s] = read_snap(handle, objs)
-    if s < SNAPS - 1 {
-      win.Sleep(1000)
-    }
-  }
-
-  // A despawn countdown is 0 for every live mover and, for a fresh corpse, strictly
-  // counts DOWN over the ~5s window (then the object frees). Require: per-mover values
-  // monotonically non-increasing with at least one drop, 0 for the rest, no oscillators.
-  fmt.println("=== fields counting monotonically DOWN for some movers (despawn timer) ===")
-  off := 0
-  for off <= LEN - 4 {
-    mono, allz, oth := 0, 0, 0
-    for i in 0 ..< n {
-      cnt, prev, first := 0, i64(0), true
-      ismono, anydec, allzero, startpos := true, false, true, false
-      for s in 0 ..< SNAPS {
-        if u32at(snaps[s][i], int(session.layout.field_off)) != worldv {
-          continue // skip snapshots where this slot isn't a live object
-        }
-        v := u32at(snaps[s][i], off)
-        cnt += 1
-        if v != 0 {allzero = false}
-        if v < 0 || v >= 100000 {ismono = false}
-        if first {
-          prev, startpos, first = v, v > 0, false
-        } else {
-          if v > prev {ismono = false}
-          if v < prev {anydec = true}
-          prev = v
-        }
-      }
-      if cnt < 2 {
-        continue
-      }
-      if allzero {
-        allz += 1
-      } else if ismono && anydec && startpos {
-        mono += 1
-      } else {
-        oth += 1
-      }
-    }
-    if mono >= 1 && oth <= 2 && allz >= (n * 6) / 10 {
-      fmt.printfln("  +0x%X: mono=%d zero=%d other=%d", off, mono, allz, oth)
-      shown := 0
-      for i in 0 ..< n {
-        sb := strings.builder_make(context.temp_allocator)
-        valid, nonzero := 0, false
-        for s in 0 ..< SNAPS {
-          if u32at(snaps[s][i], int(session.layout.field_off)) != worldv {
-            continue
-          }
-          v := u32at(snaps[s][i], off)
-          if v != 0 {nonzero = true}
-          fmt.sbprintf(&sb, "%d ", v)
-          valid += 1
-        }
-        if nonzero && valid >= 2 {
-          fmt.printfln("      obj=0x%X: %s", objs[i], strings.to_string(sb))
-          shown += 1
-          if shown >= 10 {
-            break
-          }
-        }
-      }
-    }
-    off += 4
-  }
-  fmt.println("(done)")
-}
-
-// Read-only recon: enumerate movers named <name> and report every field offset where
-// at least 2 of them hold <value> - used to locate a known stat (e.g. a full mob's HP)
-// by its value. Usage: objscan <value> <name>
-cli_objscan :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 2 {
-    fmt.eprintln("usage: objscan <value> <name>")
-    return
-  }
-  val, valok := strconv.parse_i64(args[0])
-  if !valok {
-    fmt.eprintln("bad value.")
-    return
-  }
-  name := strings.trim(strings.join(args[1:], " ", context.temp_allocator), "'\"")
-  LEN :: 0x4000
-
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
-  pt := Value_Type.U64
-  if session.ptr_size == 4 {
-    pt = .U32
-  }
-  wv, wok := read_value(handle, base + session.layout.world_rva, pt)
-  if !wok {
-    fmt.eprintln("could not read world anchor.")
-    return
-  }
-  world := uintptr(value_as_u64(pt, wv))
-  wval := ptr_to_value(world, session.ptr_size)
-  all := collect_regions(handle, true)
-  defer delete(all)
-  set := scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
-  bufs := make([dynamic][]byte, context.temp_allocator)
-  for m in set.matches {
-    obj := uintptr(i64(m.addr) - session.layout.field_off)
-    vt, vok := read_value(handle, obj, pt)
-    if !vok {
-      continue
-    }
-    vtable := uintptr(value_as_u64(pt, vt))
-    if vtable < base || vtable >= mod_end {
-      continue
-    }
-    if read_obj_type(handle, obj, session.layout.pos_off) != session.layout.mover_type {
-      continue
-    }
-    nm, nok := read_obj_name(handle, session.ptr_size, obj, session.layout.name_off)
-    if !nok || !strings.contains(nm, name) {
-      continue
-    }
-    b := make([]byte, LEN, context.temp_allocator)
-    read_into(handle, obj, b)
-    append(&bufs, b)
-  }
-  fmt.printfln("objscan %d in '%s': %d movers", val, name, len(bufs))
-  target := u32(val)
-  off := 0
-  for off <= LEN - 4 {
-    c := 0
-    for b in bufs {
-      if off + 4 <= len(b) {
-        v := u32(b[off]) | u32(b[off + 1]) << 8 | u32(b[off + 2]) << 16 | u32(b[off + 3]) << 24
-        if v == target {
-          c += 1
-        }
-      }
-    }
-    if c >= 2 {
-      // also show how many movers have it in [1, val] (HP-like) vs == 0
-      hp_like, zero := 0, 0
-      for b in bufs {
-        if off + 4 <= len(b) {
-          v := i64(u32(b[off]) | u32(b[off + 1]) << 8 | u32(b[off + 2]) << 16 | u32(b[off + 3]) << 24)
-          if v == 0 {
-            zero += 1
-          } else if v > 0 && v <= val {
-            hp_like += 1
-          }
-        }
-      }
-      fmt.printfln("  +0x%X: %d ==%d  (%d in 1..%d, %d ==0)", off, c, val, hp_like, val, zero)
-    }
-    off += 4
-  }
-  fmt.println("(done)")
-}
-
-// ---------------------------------------------------------------------------
-// Parsing helpers
-// ---------------------------------------------------------------------------
-
-// Resolve a command operand to an absolute address. `[i]` refers to match #i (like
-// 'peek'); anything else is parsed as an address (decimal or 0x-hex).
-resolve_operand :: proc(session: ^Session, s: string) -> (addr: uintptr, ok: bool) {
+resolve_operand :: proc(session: ^flyff.Session, s: string) -> (addr: uintptr, ok: bool) {
   if strings.has_prefix(s, "[") && strings.has_suffix(s, "]") {
     idx, iok := strconv.parse_int(s[1:len(s) - 1])
     if !iok || !session.has_matches || idx < 0 || idx >= len(session.matches.matches) {
@@ -2178,18 +1106,18 @@ resolve_operand :: proc(session: ^Session, s: string) -> (addr: uintptr, ok: boo
     if !session.attached {
       return 0, false
     }
-    v, vok := parse_addr(s[1:])
+    v, vok := engine.parse_addr(s[1:])
     if !vok {
       return 0, false
     }
     return session.proc_info.base + uintptr(v), true
   }
-  return parse_addr(s)
+  return engine.parse_addr(s)
 }
 
 // Resolve a player-position operand: a literal "x,y,z" (comma-separated, no spaces -
 // handy with the in-game /position readout), or an address/[i] whose 3 f32 are read live.
-resolve_player_pos :: proc(session: ^Session, s: string) -> (pos: [3]f32, ok: bool) {
+resolve_player_pos :: proc(session: ^flyff.Session, s: string) -> (pos: [3]f32, ok: bool) {
   if strings.contains(s, ",") {
     parts := strings.split(s, ",", context.temp_allocator)
     if len(parts) != 3 {
@@ -2208,7 +1136,7 @@ resolve_player_pos :: proc(session: ^Session, s: string) -> (pos: [3]f32, ok: bo
   if !aok {
     return {}, false
   }
-  return read_vec3(session.proc_info.handle, addr)
+  return engine.read_vec3(session.proc_info.handle, addr)
 }
 
 is_all_digits :: proc(s: string) -> bool {
@@ -2223,7 +1151,7 @@ is_all_digits :: proc(s: string) -> bool {
   return true
 }
 
-parse_vtype :: proc(s: string) -> (Value_Type, bool) {
+parse_vtype :: proc(s: string) -> (engine.Value_Type, bool) {
   switch s {
   case "u8":
     return .U8, true
@@ -2249,7 +1177,7 @@ parse_vtype :: proc(s: string) -> (Value_Type, bool) {
   return .U32, false
 }
 
-parse_op :: proc(s: string) -> (op: Compare_Op, needs_value: bool, ok: bool) {
+parse_op :: proc(s: string) -> (op: engine.Compare_Op, needs_value: bool, ok: bool) {
   switch s {
   case "eq", "==":
     return .Eq, true, true
@@ -2271,41 +1199,3 @@ parse_op :: proc(s: string) -> (op: Compare_Op, needs_value: bool, ok: bool) {
   return .Eq, false, false
 }
 
-parse_addr :: proc(s: string) -> (uintptr, bool) {
-  if strings.has_prefix(s, "0x") || strings.has_prefix(s, "0X") {
-    v, ok := strconv.parse_u64_of_base(s[2:], 16)
-    return uintptr(v), ok
-  }
-  if v, ok := strconv.parse_u64_of_base(s, 10); ok {
-    return uintptr(v), true
-  }
-  v, ok := strconv.parse_u64_of_base(s, 16)
-  return uintptr(v), ok
-}
-
-parse_offset :: proc(s: string) -> (i64, bool) {
-  ss := s
-  if strings.has_prefix(ss, "+") {
-    ss = ss[1:]
-  }
-  neg := false
-  if strings.has_prefix(ss, "-") {
-    neg = true
-    ss = ss[1:]
-  }
-  v: u64
-  ok: bool
-  if strings.has_prefix(ss, "0x") || strings.has_prefix(ss, "0X") {
-    v, ok = strconv.parse_u64_of_base(ss[2:], 16)
-  } else {
-    v, ok = strconv.parse_u64_of_base(ss, 10)
-  }
-  if !ok {
-    return 0, false
-  }
-  r := i64(v)
-  if neg {
-    r = -r
-  }
-  return r, true
-}

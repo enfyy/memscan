@@ -1,4 +1,4 @@
-package main
+package flyff
 
 import "base:runtime"
 import "core:fmt"
@@ -36,7 +36,9 @@ hotkey_watch_loop :: proc(session: ^Session) {
       down := hotkey_key_down(hk.vk)
       if down && !hk.was_down {
         fmt.printf("\n[%s] %s\n", hk.name, hk.command)
-        cli_execute_line(session, hk.command)
+        if session.exec_line != nil {
+          session.exec_line(session, hk.command)
+        }
         fmt.print("memscan> ")
       }
       hk.was_down = down

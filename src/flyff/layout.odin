@@ -1,4 +1,5 @@
-package main
+package flyff
+import "../engine"
 
 import "core:fmt"
 import "core:mem"
@@ -95,7 +96,7 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     }
     key := strings.trim_space(line[:eq])
     val := strings.trim_space(line[eq + 1:])
-    v, vok := parse_addr(val)
+    v, vok := engine.parse_addr(val)
     if !vok {
       continue
     }
@@ -160,7 +161,7 @@ cli_set :: proc(session: ^Session, args: []string) {
     fmt.eprintln("usage: set <field> <value>   (field names: see 'offsets')")
     return
   }
-  v, vok := parse_addr(args[1])
+  v, vok := engine.parse_addr(args[1])
   if !vok {
     fmt.eprintfln("invalid value: %s", args[1])
     return
@@ -197,7 +198,7 @@ cli_findpos :: proc(session: ^Session, args: []string) {
       eps = f32(e)
     }
   }
-  hits := scan_vec3(session.proc_info.handle, pos, eps, context.temp_allocator)
+  hits := engine.scan_vec3(session.proc_info.handle, pos, eps, context.temp_allocator)
   fmt.printfln("findpos (%.1f, %.1f, %.1f) eps %.2f: %d hit(s)", pos[0], pos[1], pos[2], eps, len(hits))
   for h, i in hits {
     if i >= 40 {
@@ -278,11 +279,11 @@ run_calibrate :: proc(session: ^Session, pos: [3]f32, name: string, has_hp: bool
   size := session.proc_info.module_size
   mod_end := base + uintptr(size)
   ps := session.ptr_size
-  pt := ps == 4 ? Value_Type.U32 : Value_Type.U64
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
   L := session.layout
 
   // 1. Candidate m_vPos addresses at the player's position.
-  cands := scan_vec3(handle, pos, eps, context.temp_allocator)
+  cands := engine.scan_vec3(handle, pos, eps, context.temp_allocator)
   if len(cands) == 0 {
     fmt.eprintln("no memory matches that position. Type the EXACT values /position shows, then retry.")
     return
@@ -310,8 +311,8 @@ run_calibrate :: proc(session: ^Session, pos: [3]f32, name: string, has_hp: bool
       if !in_module_range(read_ptr_at(handle, obj, pt), base, mod_end) {
         continue // no module vtable at obj -> wrong pos_off / not an object
       }
-      ty, tok := read_value(handle, obj + uintptr(po) + 0x10, .U32)
-      if !tok || u32(value_as_u64(.U32, ty)) != L.mover_type {
+      ty, tok := engine.read_value(handle, obj + uintptr(po) + 0x10, .U32)
+      if !tok || u32(engine.value_as_u64(.U32, ty)) != L.mover_type {
         continue
       }
       noff, nok := find_name_offset(handle, obj, name, 0x4000)
@@ -356,7 +357,7 @@ run_calibrate :: proc(session: ^Session, pos: [3]f32, name: string, has_hp: bool
     if W == 0 || in_module_range(W, base, mod_end) {
       continue // 0, or a module/const field - not a heap object pointer
     }
-    hits := scan_image_for_ptr(handle, base, size, W, ps, context.temp_allocator)
+    hits := engine.scan_image_for_ptr(handle, base, size, W, ps, context.temp_allocator)
     if len(hits) > 0 {
       field_off = fo
       world = W
@@ -367,14 +368,14 @@ run_calibrate :: proc(session: ^Session, pos: [3]f32, name: string, has_hp: bool
   }
 
   // 4. player_rva: the static global holding the player object.
-  pr := scan_image_for_ptr(handle, base, size, player, ps, context.temp_allocator)
+  pr := engine.scan_image_for_ptr(handle, base, size, player, ps, context.temp_allocator)
   player_rva := len(pr) > 0 ? pr[0] - base : L.player_rva
 
   // 5. hp_off: confirm the current one, else search the object for the HP value.
   hp_off := L.hp_off
   if has_hp {
-    cur, cok := read_value(handle, player + uintptr(L.hp_off), .U32)
-    if cok && i64(u32(value_as_u64(.U32, cur))) == hp {
+    cur, cok := engine.read_value(handle, player + uintptr(L.hp_off), .U32)
+    if cok && i64(u32(engine.value_as_u64(.U32, cur))) == hp {
       hp_off = L.hp_off
     } else if ho, hok := find_u32_offset(handle, player, u32(hp), 0x4000, L.hp_off); hok {
       hp_off = ho
@@ -433,7 +434,7 @@ cli_findfocus :: proc(session: ^Session, args: []string) {
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
   ps := session.ptr_size
-  pt := ps == 4 ? Value_Type.U32 : Value_Type.U64
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
   L := session.layout
 
   world := read_ptr_at(handle, base + L.world_rva, pt)
@@ -442,7 +443,7 @@ cli_findfocus :: proc(session: ^Session, args: []string) {
     fmt.eprintln("world not resolved - run calibrate / calibrate_house first.")
     return
   }
-  player_pos, _ := read_vec3(handle, player + uintptr(L.pos_off))
+  player_pos, _ := engine.read_vec3(handle, player + uintptr(L.pos_off))
 
   Cand :: struct {
     off:  i64,
@@ -459,12 +460,12 @@ cli_findfocus :: proc(session: ^Session, args: []string) {
     if !in_module_range(read_ptr_at(handle, W, pt), base, mod_end) {
       continue // target of this slot has no module vtable - not a live object
     }
-    if read_obj_type(handle, W, L.pos_off) != L.mover_type {
+    if engine.read_obj_type(handle, W, L.pos_off) != L.mover_type {
       continue
     }
-    nm, _ := read_obj_name(handle, ps, W, L.name_off)
-    pos, _ := read_vec3(handle, W + uintptr(L.pos_off))
-    append(&cands, Cand{o, W, nm, dist_3d(pos, player_pos)})
+    nm, _ := engine.read_obj_name(handle, ps, W, L.name_off)
+    pos, _ := engine.read_vec3(handle, W + uintptr(L.pos_off))
+    append(&cands, Cand{o, W, nm, engine.dist_3d(pos, player_pos)})
   }
 
   if len(cands) == 0 {
@@ -517,34 +518,34 @@ cli_findhp :: proc(session: ^Session, args: []string) {
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
   ps := session.ptr_size
-  pt := ps == 4 ? Value_Type.U32 : Value_Type.U64
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
   L := session.layout
-  wv, wok := read_value(handle, base + L.world_rva, pt)
+  wv, wok := engine.read_value(handle, base + L.world_rva, pt)
   if !wok {
     fmt.eprintln("could not read world anchor - run calibrate first.")
     return
   }
-  world := uintptr(value_as_u64(pt, wv))
-  wval := ptr_to_value(world, ps)
-  all := collect_regions(handle, true)
+  world := uintptr(engine.value_as_u64(pt, wv))
+  wval := engine.ptr_to_value(world, ps)
+  all := engine.collect_regions(handle, true)
   defer delete(all)
-  set := scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
+  set := engine.scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
   bufs := make([dynamic][]byte, context.temp_allocator)
   for m in set.matches {
     obj := uintptr(i64(m.addr) - L.field_off)
-    vt, vok := read_value(handle, obj, pt)
-    if !vok || !in_module_range(uintptr(value_as_u64(pt, vt)), base, mod_end) {
+    vt, vok := engine.read_value(handle, obj, pt)
+    if !vok || !in_module_range(uintptr(engine.value_as_u64(pt, vt)), base, mod_end) {
       continue
     }
-    if read_obj_type(handle, obj, L.pos_off) != L.mover_type {
+    if engine.read_obj_type(handle, obj, L.pos_off) != L.mover_type {
       continue
     }
-    nm, nok := read_obj_name(handle, ps, obj, L.name_off)
+    nm, nok := engine.read_obj_name(handle, ps, obj, L.name_off)
     if !nok || !strings.contains(nm, name) {
       continue
     }
     b := make([]byte, LEN, context.temp_allocator)
-    read_into(handle, obj, b)
+    engine.read_into(handle, obj, b)
     append(&bufs, b)
   }
   n := len(bufs)
@@ -700,7 +701,7 @@ cli_hpwatch :: proc(session: ^Session, args: []string) {
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
   ps := session.ptr_size
-  pt := ps == 4 ? Value_Type.U32 : Value_Type.U64
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
   L := session.layout
   world := read_ptr_at(handle, base + L.world_rva, pt)
   if world == 0 {
@@ -714,7 +715,7 @@ cli_hpwatch :: proc(session: ^Session, args: []string) {
   }
   LEN :: 0x8000
   s1 := make([]byte, LEN, context.temp_allocator)
-  n1, _ := read_into(handle, focus, s1)
+  n1, _ := engine.read_into(handle, focus, s1)
   fmt.println("HIT the targeted mob NOW - watching ~3s...")
   win.Sleep(3000)
   if !in_module_range(read_ptr_at(handle, focus, pt), base, mod_end) {
@@ -722,7 +723,7 @@ cli_hpwatch :: proc(session: ^Session, args: []string) {
     return
   }
   s2 := make([]byte, LEN, context.temp_allocator)
-  n2, _ := read_into(handle, focus, s2)
+  n2, _ := engine.read_into(handle, focus, s2)
   lim := min(int(n1), int(n2))
 
   Drop :: struct {
@@ -772,12 +773,12 @@ cli_findpacket :: proc(session: ^Session, args: []string) {
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
   ps := session.ptr_size
-  pt := ps == 4 ? Value_Type.U32 : Value_Type.U64
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
   L := session.layout
 
   objid: u32 = 0
   if len(args) >= 1 {
-    if v, ok := parse_addr(args[0]); ok {
+    if v, ok := engine.parse_addr(args[0]); ok {
       objid = u32(v)
     }
   }
@@ -792,12 +793,12 @@ cli_findpacket :: proc(session: ^Session, args: []string) {
       fmt.eprintln("no live mob targeted. Click a monster in-game (keep it selected), then run findpacket.")
       return
     }
-    idv, idok := read_value(handle, focus + uintptr(L.objid_off), .U32)
+    idv, idok := engine.read_value(handle, focus + uintptr(L.objid_off), .U32)
     if !idok {
       fmt.eprintln("couldn't read objid from the target.")
       return
     }
-    objid = u32(value_as_u64(.U32, idv))
+    objid = u32(engine.value_as_u64(.U32, idv))
   }
   if objid == 0 {
     fmt.eprintln("objid is 0 - target a mob first.")
@@ -806,12 +807,12 @@ cli_findpacket :: proc(session: ^Session, args: []string) {
 
   fmt.printfln("targeted objid = %d (0x%X); scanning memory for [objid][02] packets...", objid, objid)
   pat := [4]byte{byte(objid), byte(objid >> 8), byte(objid >> 16), byte(objid >> 24)}
-  hits := scan_bytes(handle, pat[:], context.temp_allocator)
+  hits := engine.scan_bytes(handle, pat[:], context.temp_allocator)
 
   shown := 0
   for h in hits {
     wb: [16]byte
-    rn, _ := read_into(handle, h - 4, wb[:])
+    rn, _ := engine.read_into(handle, h - 4, wb[:])
     if int(rn) < 9 {
       continue
     }
@@ -849,7 +850,7 @@ cli_packetwatch :: proc(session: ^Session, args: []string) {
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
   ps := session.ptr_size
-  pt := ps == 4 ? Value_Type.U32 : Value_Type.U64
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
   L := session.layout
   if L.objid_off == 0 {
     fmt.eprintln("objid_off not set. Run 'set objid_off 0x22F8' first.")
@@ -860,7 +861,7 @@ cli_packetwatch :: proc(session: ^Session, args: []string) {
     fmt.eprintln("world not resolved - run calibrate first.")
     return
   }
-  snap := take_snapshot(handle, .U32, true, context.temp_allocator)
+  snap := engine.take_snapshot(handle, .U32, true, context.temp_allocator)
   fmt.printfln(
     "baseline captured (%d regions). Now CLICK A DIFFERENT MOB in-game to send a fresh SETTARGET... (~3s)",
     len(snap.regions),
@@ -871,19 +872,19 @@ cli_packetwatch :: proc(session: ^Session, args: []string) {
     fmt.eprintln("no mob targeted after the click - retry and make sure you click a mob.")
     return
   }
-  idv, idok := read_value(handle, focus + uintptr(L.objid_off), .U32)
+  idv, idok := engine.read_value(handle, focus + uintptr(L.objid_off), .U32)
   if !idok {
     fmt.eprintln("couldn't read the new objid.")
     return
   }
-  objid := u32(value_as_u64(.U32, idv))
+  objid := u32(engine.value_as_u64(.U32, idv))
   idb := [4]byte{byte(objid), byte(objid >> 8), byte(objid >> 16), byte(objid >> 24)}
   fmt.printfln("new target objid = %d (0x%X); scanning for freshly-written [objid][02]...", objid, objid)
 
   found := 0
   outer: for rc in snap.regions {
     cur := make([]byte, len(rc.data), context.temp_allocator)
-    n, ok := read_into(handle, rc.base, cur)
+    n, ok := engine.read_into(handle, rc.base, cur)
     if !ok {
       continue
     }
@@ -928,9 +929,9 @@ cli_packetwatch :: proc(session: ^Session, args: []string) {
 // calibrate helpers (file-scope to avoid shadowing under -vet-shadowing)
 // ---------------------------------------------------------------------------
 
-read_ptr_at :: proc(handle: win.HANDLE, addr: uintptr, pt: Value_Type) -> uintptr {
-  v, ok := read_value(handle, addr, pt)
-  return ok ? uintptr(value_as_u64(pt, v)) : 0
+read_ptr_at :: proc(handle: win.HANDLE, addr: uintptr, pt: engine.Value_Type) -> uintptr {
+  v, ok := engine.read_value(handle, addr, pt)
+  return ok ? uintptr(engine.value_as_u64(pt, v)) : 0
 }
 
 in_module_range :: proc(p, base, mod_end: uintptr) -> bool {
@@ -949,7 +950,7 @@ report_off :: proc(field: string, old, new: i64) {
 // or UTF-16LE string. Returns the byte offset. Used to locate the inline name buffer.
 find_name_offset :: proc(handle: win.HANDLE, obj: uintptr, name: string, span: int) -> (off: i64, ok: bool) {
   buf := make([]byte, span, context.temp_allocator)
-  n, rok := read_into(handle, obj, buf)
+  n, rok := engine.read_into(handle, obj, buf)
   if !rok {
     return 0, false
   }
@@ -995,7 +996,7 @@ find_name_offset :: proc(handle: win.HANDLE, obj: uintptr, name: string, span: i
 // `prefer` (so a known-good default wins ties). 4-aligned. Used to pin hp_off.
 find_u32_offset :: proc(handle: win.HANDLE, obj: uintptr, val: u32, span: int, prefer: i64) -> (off: i64, ok: bool) {
   buf := make([]byte, span, context.temp_allocator)
-  n, rok := read_into(handle, obj, buf)
+  n, rok := engine.read_into(handle, obj, buf)
   if !rok {
     return 0, false
   }
@@ -1019,12 +1020,12 @@ find_u32_offset :: proc(handle: win.HANDLE, obj: uintptr, val: u32, span: int, p
 // True if world+focus_off currently points to a live mover (i.e. a target is selected there).
 focus_slot_live :: proc(session: ^Session, world: uintptr, focus_off: i64) -> bool {
   handle := session.proc_info.handle
-  pt := session.ptr_size == 4 ? Value_Type.U32 : Value_Type.U64
+  pt := session.ptr_size == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
   p := read_ptr_at(handle, world + uintptr(focus_off), pt)
   if p == 0 || !focus_obj_live(session, p) {
     return false
   }
-  return read_obj_type(handle, p, session.layout.pos_off) == session.layout.mover_type
+  return engine.read_obj_type(handle, p, session.layout.pos_off) == session.layout.mover_type
 }
 
 parse_vec3_literal :: proc(s: string) -> (pos: [3]f32, ok: bool) {
