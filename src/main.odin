@@ -22,6 +22,10 @@ Session :: struct {
   vtype:         Value_Type,
   ptr_size:      int,
   writable_only: bool,
+
+  // Live Flyff memory layout (RVAs + offsets). Seeded from flyff_layout_default(), overwritten
+  // by flyff.cfg on attach, re-derived by `calibrate`. See core.odin Flyff_Layout / layout.odin.
+  layout:        Flyff_Layout,
   scan_arena:    virtual.Arena,
   has_snapshot:  bool,
   snapshot:      Mem_Snapshot,
@@ -35,6 +39,17 @@ Session :: struct {
   auto_on:       bool,
   auto_name:     string, // cloned target name; freed on toggle/close
   auto_last:     i64, // time.now()._nsec of the last advance attempt (throttle)
+
+  // Detection experiment (see refocus_tick in cli.odin): write the current m_pObjFocus value
+  // back to itself periodically - a consistent external write that matches the client's input.
+  refocus_on:    bool,
+  refocus_last:  i64,
+
+  // Server target-sync (see notify_server_target / cli_srvsync). When on, each focus select
+  // also fires the client's own SendSetTarget(objid, 2) so the server's m_idSetTarget matches
+  // what we attack - the anti-DC fix. Cleared on detach/close.
+  srvsync_on:    bool,
+  srv_shim:      uintptr, // cached RWX shim page in the target (remote_send_settarget); 0 = none
 
   // Global hotkeys (see hotkey.odin). exec_mutex serializes command execution
   // between the REPL thread and the hotkey watcher thread.
@@ -50,6 +65,7 @@ main :: proc() {
   session.vtype = .U32
   session.ptr_size = 8
   session.writable_only = true
+  session.layout = flyff_layout_default()
 
   if err := virtual.arena_init_growing(&session.scan_arena); err != .None {
     fmt.eprintln("failed to initialise scan arena")
@@ -94,6 +110,7 @@ session_close :: proc(session: ^Session) {
     session.hk_running = false
   }
   if session.attached {
+    remote_free_shim(session)
     win.CloseHandle(session.proc_info.handle)
   }
   free_all(virtual.arena_allocator(&session.scan_arena))

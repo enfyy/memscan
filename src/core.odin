@@ -284,8 +284,8 @@ region_is_writable :: proc(mbi: win.MEMORY_BASIC_INFORMATION) -> bool {
   )
 }
 
-// `private_only` keeps only MEM_PRIVATE (heap) regions — where the game's CObj
-// instances live — skipping mapped files / image sections. Used for object
+// `private_only` keeps only MEM_PRIVATE (heap) regions - where the game's CObj
+// instances live - skipping mapped files / image sections. Used for object
 // enumeration so it stays complete (no stale region cache) yet fast.
 collect_regions :: proc(
   handle: win.HANDLE,
@@ -363,7 +363,7 @@ scan_exact :: proc(
 }
 
 // Exact-value scan over an explicit list of regions. When `hit_regions` is non-nil,
-// every region producing >=1 match is appended to it — used to build the
+// every region producing >=1 match is appended to it - used to build the
 // target_closest enumeration cache so later scans re-read only object-bearing heaps.
 scan_exact_regions :: proc(
   handle: win.HANDLE,
@@ -434,7 +434,7 @@ scan_worker_proc :: proc(data: rawptr) {
     off := 0
     switch w.size {
     case 4:
-      // typed compare — far faster than mem.compare per offset; off stays 4-aligned
+      // typed compare - far faster than mem.compare per offset; off stays 4-aligned
       for off + 4 <= nn {
         if (cast(^u32)(&buf[off]))^ == w.tv32 {
           append(&w.matches, Match{addr = r.base + uintptr(off), value = bytes_to_value(buf[off:off + 4])})
@@ -926,8 +926,170 @@ scan_bytes :: proc(
   return
 }
 
+// Scan the target's EXECUTABLE image pages (protect has an execute bit) for a 4-byte
+// immediate, unaligned (code constants aren't 4-aligned). Returns hit addresses. Used to
+// locate a function by a distinctive constant it embeds - e.g. the SETTARGET packet id
+// 0x00ff0023 inside SendSetTarget. Read-only.
+codescan_u32 :: proc(
+  handle: win.HANDLE,
+  needle: u32,
+  allocator := context.allocator,
+) -> (
+  out: [dynamic]uintptr,
+) {
+  out = make([dynamic]uintptr, allocator)
+  p0 := byte(needle)
+  p1 := byte(needle >> 8)
+  p2 := byte(needle >> 16)
+  p3 := byte(needle >> 24)
+  regions := collect_regions(handle, false)
+  defer delete(regions)
+  for r in regions {
+    if r.protect & 0xF0 == 0 {
+      continue // PAGE_EXECUTE* are the high nibble (0x10..0x80); skip non-exec pages
+    }
+    buf := make([]byte, r.size)
+    n, ok := read_into(handle, r.base, buf)
+    if ok {
+      limit := int(n) - 4
+      i := 0
+      for i <= limit {
+        if buf[i] == p0 && buf[i + 1] == p1 && buf[i + 2] == p2 && buf[i + 3] == p3 {
+          append(&out, r.base + uintptr(i))
+        }
+        i += 1
+      }
+    }
+    delete(buf)
+  }
+  return
+}
+
+// Scan executable pages for a direct near CALL (E8 rel32) whose computed target equals
+// `dest` (a call at address A targets A+5+rel32). Returns the call-site addresses. Used to
+// find callers of a known function so we can read the `mov ecx, imm32` (=&g_DPlay) preceding
+// a g_DPlay.SendXxx call. Read-only.
+codescan_calls :: proc(
+  handle: win.HANDLE,
+  dest: uintptr,
+  allocator := context.allocator,
+) -> (
+  out: [dynamic]uintptr,
+) {
+  out = make([dynamic]uintptr, allocator)
+  regions := collect_regions(handle, false)
+  defer delete(regions)
+  for r in regions {
+    if r.protect & 0xF0 == 0 {
+      continue
+    }
+    buf := make([]byte, r.size)
+    n, ok := read_into(handle, r.base, buf)
+    if ok {
+      limit := int(n) - 5
+      i := 0
+      for i <= limit {
+        if buf[i] == 0xE8 {
+          rel := i32(u32(buf[i + 1]) | u32(buf[i + 2]) << 8 | u32(buf[i + 3]) << 16 | u32(buf[i + 4]) << 24)
+          site := r.base + uintptr(i)
+          target := uintptr(i64(site) + 5 + i64(rel))
+          if target == dest {
+            append(&out, site)
+          }
+        }
+        i += 1
+      }
+    }
+    delete(buf)
+  }
+  return
+}
+
+// Scan writable heap memory for 3 contiguous little-endian f32 within `eps` of target
+// x/y/z. Returns the address of the first float (a candidate m_vPos). Used by calibrate /
+// findpos to locate an object by its known world position. Floats are 4-aligned in the
+// struct, so candidates are stepped by 4.
+scan_vec3 :: proc(
+  handle: win.HANDLE,
+  target: [3]f32,
+  eps: f32,
+  allocator := context.allocator,
+) -> (
+  out: [dynamic]uintptr,
+) {
+  out = make([dynamic]uintptr, allocator)
+  regions := collect_regions(handle, true)
+  defer delete(regions)
+  for r in regions {
+    buf := make([]byte, r.size)
+    n, ok := read_into(handle, r.base, buf)
+    if ok {
+      off := 0
+      for off + 12 <= int(n) {
+        x := transmute(f32)(u32(buf[off]) | u32(buf[off + 1]) << 8 | u32(buf[off + 2]) << 16 | u32(buf[off + 3]) << 24)
+        y := transmute(f32)(u32(buf[off + 4]) | u32(buf[off + 5]) << 8 | u32(buf[off + 6]) << 16 | u32(buf[off + 7]) << 24)
+        z := transmute(f32)(u32(buf[off + 8]) | u32(buf[off + 9]) << 8 | u32(buf[off + 10]) << 16 | u32(buf[off + 11]) << 24)
+        if math.abs(x - target[0]) <= eps && math.abs(y - target[1]) <= eps && math.abs(z - target[2]) <= eps {
+          append(&out, r.base + uintptr(off))
+        }
+        off += 4
+      }
+    }
+    delete(buf)
+  }
+  return
+}
+
+// Scan the module image range [base, base+size) for a pointer-aligned slot whose value
+// equals `needle`. Used by calibrate to turn a known heap object (world / player) into the
+// static global RVA that holds it. Returns absolute slot addresses.
+scan_image_for_ptr :: proc(
+  handle: win.HANDLE,
+  base: uintptr,
+  size: u32,
+  needle: uintptr,
+  ptr_size: int,
+  allocator := context.allocator,
+) -> (
+  out: [dynamic]uintptr,
+) {
+  out = make([dynamic]uintptr, allocator)
+  mod_end := base + uintptr(size)
+  regions := collect_regions(handle, false)
+  defer delete(regions)
+  for r in regions {
+    rs := max(r.base, base)
+    re := min(r.base + uintptr(r.size), mod_end)
+    if rs >= re {
+      continue
+    }
+    length := int(re - rs)
+    buf := make([]byte, length)
+    n, ok := read_into(handle, rs, buf)
+    if ok {
+      off := 0
+      for off + ptr_size <= int(n) {
+        v: uintptr
+        if ptr_size == 4 {
+          v = uintptr(u32(buf[off]) | u32(buf[off + 1]) << 8 | u32(buf[off + 2]) << 16 | u32(buf[off + 3]) << 24)
+        } else {
+          lo := u64(u32(buf[off]) | u32(buf[off + 1]) << 8 | u32(buf[off + 2]) << 16 | u32(buf[off + 3]) << 24)
+          hi := u64(u32(buf[off + 4]) | u32(buf[off + 5]) << 8 | u32(buf[off + 6]) << 16 | u32(buf[off + 7]) << 24)
+          v = uintptr(lo | hi << 32)
+        }
+        if v == needle {
+          append(&out, rs + uintptr(off))
+        }
+        off += ptr_size
+      }
+    }
+    delete(buf)
+  }
+  return
+}
+
 // Read a NUL-terminated ASCII string (max `max` bytes). Returns ok only if it is
-// non-empty and entirely printable ASCII — so callers can probe an address and
+// non-empty and entirely printable ASCII - so callers can probe an address and
 // reject non-string memory.
 read_cstring :: proc(
   handle: win.HANDLE,
@@ -984,8 +1146,10 @@ read_obj_name :: proc(
 }
 
 // ---------------------------------------------------------------------------
-// Flyff (modded Neuz.exe) layout, found at runtime. Slots are module-base-relative
-// RVAs (base is fixed at 0x930000 but we add the live base so a rebase still works).
+// Flyff (modded Neuz.exe) layout. These are the factory DEFAULTS only: at runtime the live
+// values live in Session.layout (a Flyff_Layout), seeded from these and then overridden by
+// flyff.cfg / `calibrate`. A game patch shifts them - re-run `calibrate` (no rebuild). RVAs
+// are module-base-relative; the live base is always added so a rebase still works.
 // ---------------------------------------------------------------------------
 FLYFF_WORLD_RVA :: 0x5837CC // static global CWorld* ; m_pObjFocus = [base+RVA] + 0x20
 FLYFF_PLAYER_RVA :: 0x571DE8 // static global player CMover*
@@ -997,6 +1161,50 @@ FLYFF_NAME_OFF :: 0x1DB8 // CMover inline name char buffer
 FLYFF_MOVER_TYPE :: 5 // m_dwType for movers (players, pets, NPCs, monsters)
 FLYFF_HP_OFF :: 0x281C // CMover current HP (LONG); 0 => dead/despawning (don't target)
 FLYFF_MODEL_OFF :: 0x178 // CObj.m_pModel; NULL => not rendered/selectable (crashes on select)
+
+// Server target-sync (PACKETTYPE_SETTARGET via the client's own SendSetTarget). All three
+// are located at runtime in the live modded Neuz.exe - see net-package-targeting.md Phase 0
+// (codescan for the code addresses, idscan for the offset). 0 means "not yet found": while
+// any is 0, `srvsync`/`srvtest` refuse to run and notify_server_target is a no-op.
+FLYFF_SENDSETTARGET_RVA :: 0x0 // entry of CDPClient::SendSetTarget (thiscall(OBJID, BYTE))
+FLYFF_GDPLAY_RVA :: 0x0 // &g_DPlay (global CDPClient) - the thiscall `this`
+FLYFF_OBJID_OFF :: 0x0 // CObj.m_objid (GetId) - value sent as idTarget
+
+// Live, patch-tunable Flyff layout. Held in Session.layout; seeded by flyff_layout_default(),
+// overwritten by flyff.cfg on attach, re-derived by `calibrate`, and persisted back to the cfg.
+// Offsets are i64 (cast to uintptr at address sites); RVAs are uintptr; read_obj_type still
+// assumes m_dwType sits at pos_off+0x10 (TYPE_REL).
+Flyff_Layout :: struct {
+  world_rva:         uintptr,
+  player_rva:        uintptr,
+  focus_off:         i64,
+  pos_off:           i64,
+  field_off:         i64,
+  name_off:          i64,
+  hp_off:            i64,
+  model_off:         i64,
+  mover_type:        u32,
+  objid_off:         i64,
+  sendsettarget_rva: uintptr,
+  gdplay_rva:        uintptr,
+}
+
+flyff_layout_default :: proc() -> Flyff_Layout {
+  return Flyff_Layout {
+    world_rva         = FLYFF_WORLD_RVA,
+    player_rva        = FLYFF_PLAYER_RVA,
+    focus_off         = FLYFF_FOCUS_OFF,
+    pos_off           = FLYFF_POS_OFF,
+    field_off         = FLYFF_FIELD_OFF,
+    name_off          = FLYFF_NAME_OFF,
+    hp_off            = FLYFF_HP_OFF,
+    model_off         = FLYFF_MODEL_OFF,
+    mover_type        = FLYFF_MOVER_TYPE,
+    objid_off         = FLYFF_OBJID_OFF,
+    sendsettarget_rva = FLYFF_SENDSETTARGET_RVA,
+    gdplay_rva        = FLYFF_GDPLAY_RVA,
+  }
+}
 
 // Encode a pointer as `size` little-endian bytes for write_value/scan targets.
 ptr_to_value :: proc(p: uintptr, size: int) -> (out: Value) {
