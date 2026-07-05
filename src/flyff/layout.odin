@@ -48,6 +48,16 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.mover_type = u32(v)
   case "objid_off":
     layout.objid_off = i64(v)
+  case "owner_off":
+    layout.owner_off = i64(v)
+  case "pet_id_off":
+    layout.pet_id_off = i64(v)
+  case "pet_index":
+    layout.pet_index = u32(v)
+  case "mob_flag_off":
+    layout.mob_flag_off = i64(v)
+  case "mob_flag_val":
+    layout.mob_flag_val = u32(v)
   case "sendsettarget_rva":
     layout.sendsettarget_rva = uintptr(v)
   case "gdplay_rva":
@@ -72,6 +82,11 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "model_off=0x%X", layout.model_off)
   fmt.sbprintfln(&b, "mover_type=%d", layout.mover_type)
   fmt.sbprintfln(&b, "objid_off=0x%X", layout.objid_off)
+  fmt.sbprintfln(&b, "owner_off=0x%X", layout.owner_off)
+  fmt.sbprintfln(&b, "pet_id_off=0x%X", layout.pet_id_off)
+  fmt.sbprintfln(&b, "pet_index=%d", layout.pet_index)
+  fmt.sbprintfln(&b, "mob_flag_off=0x%X", layout.mob_flag_off)
+  fmt.sbprintfln(&b, "mob_flag_val=0x%X", layout.mob_flag_val)
   fmt.sbprintfln(&b, "sendsettarget_rva=0x%X", layout.sendsettarget_rva)
   fmt.sbprintfln(&b, "gdplay_rva=0x%X", layout.gdplay_rva)
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
@@ -106,17 +121,98 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// offsets / set / findpos commands
+// status / offsets / set / findpos commands
 // ---------------------------------------------------------------------------
 
-// offsets              -> show the live layout
-// offsets save [path]  -> write it to flyff.cfg (or <path>)
+// status / doctor -> health-check of the live setup: what's configured, what's missing, what each
+// thing means, and the command to fix it. Groups the layout by role (core / srvsync / pet exclusion)
+// and does light live probes (attached, 32-bit, world/player resolve). Supersedes the raw dump.
+cli_status :: proc(session: ^Session) {
+  L := session.layout
+  fmt.println("=== memscan status ===")
+
+  if !session.attached {
+    fmt.println("process : NOT attached")
+    fmt.println("  the layout only becomes live once you attach (that's when flyff.cfg loads).")
+    fmt.println("  fix     : attach <Neuz|pid>   then run 'status' again")
+    return
+  }
+
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  pt := session.ptr_size == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  fmt.printfln("process : %s (pid %d), %s", session.proc_info.name, session.proc_info.pid, session.ptr_size == 4 ? "32-bit WOW64" : "64-bit")
+  if session.ptr_size != 4 {
+    fmt.println("  WARNING : Flyff automation targets the 32-bit Neuz.exe - this process is 64-bit.")
+  }
+
+  // --- Core layout (calibrate) ---
+  world := read_ptr_at(handle, base + L.world_rva, pt)
+  player := read_ptr_at(handle, base + L.player_rva, pt)
+  player_vt_ok := player != 0 && in_module_range(read_ptr_at(handle, player, pt), base, mod_end)
+  fmt.println("")
+  fmt.println("CORE LAYOUT (from 'calibrate') - needed to see & select targets:")
+  fmt.printfln("  world_rva=0x%X player_rva=0x%X focus_off=0x%X pos_off=0x%X", L.world_rva, L.player_rva, L.focus_off, L.pos_off)
+  fmt.printfln("  field_off=0x%X name_off=0x%X model_off=0x%X hp_off=0x%X", L.field_off, L.name_off, L.model_off, L.hp_off)
+  if world != 0 && player_vt_ok {
+    fmt.println("  [OK] anchors resolve to live objects - 'mobs' / 'target_closest' / 'auto' should work.")
+  } else {
+    fmt.println("  [BROKEN] world/player anchor doesn't resolve - enumeration will fail or crash.")
+    fmt.println("    fix: are you fully in-game? then select a mob and run:")
+    fmt.println("         calibrate <x,y,z> <name> <hp>   (x,y,z from /position)")
+  }
+
+  // --- srvsync / anti-DC ---
+  srv_cfg := L.objid_off != 0 && L.sendsettarget_rva != 0 && session.ptr_size == 4
+  fmt.println("")
+  fmt.println("SRVSYNC / anti-disconnect (from 'calibrate' or 'findsettarget'):")
+  fmt.printfln("  objid_off=0x%X  sendsettarget_rva=0x%X", L.objid_off, L.sendsettarget_rva)
+  if srv_cfg {
+    fmt.printfln("  [OK] configured; srvsync is %s. Each select is mirrored to the server, so you", session.srvsync_on ? "ON" : "OFF")
+    fmt.println("       won't disconnect after farming a while.")
+    if !session.srvsync_on {
+      fmt.println("       note: it's OFF right now - 'srvsync on' to enable (it defaults on at attach).")
+    }
+  } else {
+    fmt.println("  [MISSING] srvsync is INERT -> you WILL disconnect after farming a while.")
+    fmt.println("    fix: findsettarget    (or just re-run 'calibrate' - it derives these too)")
+  }
+
+  // --- Pet / non-monster exclusion for no-name auto ---
+  own_pet := L.pet_index != 0 || L.owner_off != 0 || L.pet_id_off != 0
+  fmt.println("")
+  fmt.println("EXCLUSIONS for no-name 'auto' (any-monster mode) - OPTIONAL:")
+  fmt.printfln("  pet_index=%d owner_off=0x%X pet_id_off=0x%X mob_flag_off=0x%X mob_flag_val=0x%X", L.pet_index, L.owner_off, L.pet_id_off, L.mob_flag_off, L.mob_flag_val)
+  if L.mob_flag_off != 0 {
+    fmt.println("  [OK] any-monster 'auto' skips ALL pets, other players, and NPCs.")
+  } else if own_pet {
+    fmt.println("  [PARTIAL] skips YOUR pet only; other players' pets / NPCs can still be picked.")
+    fmt.println("    optional: findmobflag <pet-name>   (stand where 2+ monster species are visible)")
+  } else {
+    fmt.println("  [OFF] no-name 'auto' can target your own pet / other pets / NPCs.")
+    fmt.println("    optional: findowner <pet-name> (skip your pet), findmobflag <pet-name> (skip all).")
+    fmt.println("    only matters if you use 'auto' with NO name; farming by name is unaffected.")
+  }
+
+  fmt.println("")
+  fmt.println("edit any field with 'set <field> <value>' (auto-saves flyff.cfg).")
+}
+
+// offsets              -> show the health-check ('status')
+// offsets save [path]  -> write the layout to flyff.cfg (or <path>)
 // offsets load [path]  -> read it back
 // offsets reset        -> restore built-in defaults (in memory; 'offsets save' to persist)
 cli_offsets :: proc(session: ^Session, args: []string) {
   if len(args) >= 1 {
     switch args[0] {
     case "save":
+      if !session.attached {
+        fmt.eprintln(
+          "attach first - the live layout is the built-in defaults until you attach (which loads flyff.cfg); saving now would overwrite flyff.cfg with defaults.",
+        )
+        return
+      }
       path := len(args) >= 2 ? args[1] : flyff_cfg_path()
       if flyff_save_cfg(session.layout, path) {
         fmt.printfln("saved layout -> %s", path)
@@ -138,25 +234,17 @@ cli_offsets :: proc(session: ^Session, args: []string) {
       return
     }
   }
-  L := session.layout
-  fmt.println("current Flyff layout (RVAs are module-base-relative):")
-  fmt.printfln("  world_rva         = 0x%X", L.world_rva)
-  fmt.printfln("  player_rva        = 0x%X", L.player_rva)
-  fmt.printfln("  focus_off         = 0x%X", L.focus_off)
-  fmt.printfln("  pos_off           = 0x%X", L.pos_off)
-  fmt.printfln("  field_off         = 0x%X", L.field_off)
-  fmt.printfln("  name_off          = 0x%X", L.name_off)
-  fmt.printfln("  hp_off            = 0x%X", L.hp_off)
-  fmt.printfln("  model_off         = 0x%X", L.model_off)
-  fmt.printfln("  mover_type        = %d", L.mover_type)
-  fmt.printfln("  objid_off         = 0x%X%s", L.objid_off, L.objid_off == 0 ? "   (unset)" : "")
-  fmt.printfln("  sendsettarget_rva = 0x%X%s", L.sendsettarget_rva, L.sendsettarget_rva == 0 ? "   (unset)" : "")
-  fmt.printfln("  gdplay_rva        = 0x%X%s", L.gdplay_rva, L.gdplay_rva == 0 ? "   (unset)" : "")
-  fmt.println("edit one with 'set <field> <value>' (auto-saved); 'calibrate' re-derives them.")
+  cli_status(session)
 }
 
 // set <field> <value> -> set one layout field and auto-save flyff.cfg.
 cli_set :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln(
+      "attach first - the live layout is the built-in defaults until you attach (which loads flyff.cfg). Setting now would auto-save those defaults over your flyff.cfg.",
+    )
+    return
+  }
   if len(args) < 2 {
     fmt.eprintln("usage: set <field> <value>   (field names: see 'offsets')")
     return
@@ -214,11 +302,13 @@ cli_findpos :: proc(session: ^Session, args: []string) {
 // ---------------------------------------------------------------------------
 
 // calibrate <x,y,z> <name> [hp]
-// Re-derive the layout after a patch from facts you can read in-game: <x,y,z> your character
+// One-command layout setup/recovery from facts you can read in-game: <x,y,z> your character
 // position (type /position), <name> your character name, [hp] your current HP (optional; pins
-// hp_off). Finds pos_off/field_off/model_off/name_off + world_rva/player_rva (+hp_off), then
-// saves flyff.cfg. Packet-layer fields (objid_off/sendsettarget_rva/gdplay_rva) are separate -
-// see codescan/idscan + 'set'.
+// hp_off). Finds pos_off/field_off/model_off/name_off + world_rva/player_rva (+hp_off); on the
+// 32-bit client also re-derives the srvsync offsets (sendsettarget_rva + objid_off); and if a mob
+// is SELECTED when you run it, also pins focus_off (folds in findfocus). Saves flyff.cfg. So the
+// full core setup is: select a mob, then `calibrate <pos> <name> [hp]`. (Pet exclusion -
+// pet_index/mob_flag - still needs `findowner`/`findmobflag` since those require a summoned pet.)
 cli_calibrate :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
@@ -400,16 +490,40 @@ run_calibrate :: proc(session: ^Session, pos: [3]f32, name: string, has_hp: bool
   report_off("hp_off", L.hp_off, N.hp_off)
   report_off("world_rva", i64(L.world_rva), i64(N.world_rva))
   report_off("player_rva", i64(L.player_rva), i64(N.player_rva))
-  focus_live := world_ok && focus_slot_live(session, world, N.focus_off)
-  fmt.printfln(
-    "  focus_off         0x%X   (kept; %s)",
-    N.focus_off,
-    focus_live ? "validated - a live target is in that slot" : "no target selected, unverified - select a mob and check 'mobs'",
-  )
+  // focus_off: if a mob is selected right now, derive it (folds in findfocus) so a single calibrate
+  // covers it too; otherwise keep the (very stable) current value.
+  if world_ok {
+    fcands := scan_focus_cands(session, world, player)
+    if foff, fok := focus_pick(fcands[:], N.focus_off); fok {
+      report_off("focus_off", N.focus_off, foff)
+      N.focus_off = foff
+    } else if len(fcands) > 1 {
+      fmt.printfln("  focus_off         0x%X   (kept; %d targets in view - select ONE mob and re-run to pin it)", N.focus_off, len(fcands))
+    } else {
+      fmt.printfln("  focus_off         0x%X   (kept; no target selected - select a mob and re-run to pin it)", N.focus_off)
+    }
+  } else {
+    fmt.printfln("  focus_off         0x%X   (kept; world unresolved)", N.focus_off)
+  }
   if !world_ok {
     fmt.println(
       "  NOTE: couldn't find the world pointer in any static global - world_rva/field_off kept as-is; 'mobs' may fail. Are you fully in-game (not at a loading screen)?",
     )
+  }
+
+  // 7. srvsync packet offsets (32-bit client): re-derive sendsettarget_rva + objid_off from the
+  //    SendSetTarget signature so a post-patch calibrate fixes them too. Only overwrite on a
+  //    confident single hit; otherwise keep what's configured and point at findsettarget.
+  if session.ptr_size == 4 {
+    st := rank_settarget_cands(session)
+    if settarget_confident(st[:]) {
+      N.sendsettarget_rva = st[0].target - base
+      N.objid_off = st[0].disp
+      report_off("sendsettarget_rva", i64(L.sendsettarget_rva), i64(N.sendsettarget_rva))
+      report_off("objid_off", L.objid_off, N.objid_off)
+    } else if N.sendsettarget_rva == 0 || N.objid_off == 0 {
+      fmt.println("  srvsync offsets NOT auto-derived (no confident SendSetTarget signature) - run 'findsettarget'.")
+    }
   }
 
   session.layout = N
@@ -422,36 +536,25 @@ run_calibrate :: proc(session: ^Session, pos: [3]f32, name: string, has_hp: bool
   fmt.println("confirm with 'mobs <a nearby mob name>', then use 'target_closest' / 'auto' as usual.")
 }
 
-// findfocus -> derive focus_off (m_pObjFocus in CWorld). CLICK a monster in-game first, then run
-// this: it scans the world object for a slot pointing to a live mover that isn't you - the selected
-// target. Auto-sets & saves focus_off on a single clear hit; otherwise lists candidates to 'set'.
-cli_findfocus :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
+// Candidate for focus_off: a CWorld slot pointing at a live non-player mover (the selected target).
+Focus_Cand :: struct {
+  off:  i64,
+  obj:  uintptr,
+  name: string,
+  d:    f32,
+}
+
+// Scan the CWorld object (first 0x400 bytes) for slots pointing at a live non-player mover - i.e.
+// whatever target is selected in-game right now. Shared by findfocus and calibrate.
+scan_focus_cands :: proc(session: ^Session, world, player: uintptr) -> [dynamic]Focus_Cand {
   handle := session.proc_info.handle
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
   ps := session.ptr_size
   pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
   L := session.layout
-
-  world := read_ptr_at(handle, base + L.world_rva, pt)
-  player := read_ptr_at(handle, base + L.player_rva, pt)
-  if world == 0 {
-    fmt.eprintln("world not resolved - run calibrate / calibrate_house first.")
-    return
-  }
   player_pos, _ := engine.read_vec3(handle, player + uintptr(L.pos_off))
-
-  Cand :: struct {
-    off:  i64,
-    obj:  uintptr,
-    name: string,
-    d:    f32,
-  }
-  cands := make([dynamic]Cand, context.temp_allocator)
+  cands := make([dynamic]Focus_Cand, context.temp_allocator)
   for o := i64(0); o <= 0x400; o += i64(ps) {
     W := read_ptr_at(handle, world + uintptr(o), pt)
     if W == 0 || W == player {
@@ -465,9 +568,48 @@ cli_findfocus :: proc(session: ^Session, args: []string) {
     }
     nm, _ := engine.read_obj_name(handle, ps, W, L.name_off)
     pos, _ := engine.read_vec3(handle, W + uintptr(L.pos_off))
-    append(&cands, Cand{o, W, nm, engine.dist_3d(pos, player_pos)})
+    append(&cands, Focus_Cand{o, W, nm, engine.dist_3d(pos, player_pos)})
   }
+  return cands
+}
 
+// Choose focus_off from the candidates: the sole hit, or (if several targets are in view) the slot
+// already at `cur` if it still qualifies. ok=false => none selected or ambiguous.
+focus_pick :: proc(cands: []Focus_Cand, cur: i64) -> (off: i64, ok: bool) {
+  if len(cands) == 0 {
+    return 0, false
+  }
+  if len(cands) == 1 {
+    return cands[0].off, true
+  }
+  for c in cands {
+    if c.off == cur {
+      return c.off, true
+    }
+  }
+  return 0, false
+}
+
+// findfocus -> derive focus_off (m_pObjFocus in CWorld). CLICK a monster in-game first, then run it:
+// it finds the world slot pointing at the selected target and auto-saves focus_off on a single clear
+// hit, else lists candidates. calibrate now does this too when a mob is selected, so you usually
+// don't need findfocus separately.
+cli_findfocus :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  ps := session.ptr_size
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  world := read_ptr_at(handle, base + session.layout.world_rva, pt)
+  player := read_ptr_at(handle, base + session.layout.player_rva, pt)
+  if world == 0 {
+    fmt.eprintln("world not resolved - run calibrate / calibrate_house first.")
+    return
+  }
+  cands := scan_focus_cands(session, world, player)
   if len(cands) == 0 {
     fmt.eprintln("no selected target found in the world object. Click a monster in-game, then re-run findfocus.")
     return
@@ -476,24 +618,13 @@ cli_findfocus :: proc(session: ^Session, args: []string) {
   for c in cands {
     fmt.printfln("  +0x%X -> obj=0x%X '%s' d=%.1f", c.off, c.obj, c.name, c.d)
   }
-  // Single hit -> that's it. Otherwise, prefer the slot already at focus_off if it's among them.
-  chosen := -1
-  if len(cands) == 1 {
-    chosen = 0
-  } else {
-    for c, i in cands {
-      if c.off == L.focus_off {
-        chosen = i
-        break
-      }
-    }
-  }
-  if chosen < 0 {
+  off, ok := focus_pick(cands[:], session.layout.focus_off)
+  if !ok {
     fmt.println("multiple candidates - pick the one pointing at the monster you clicked and run 'set focus_off 0x..'.")
     return
   }
-  session.layout.focus_off = cands[chosen].off
-  fmt.printfln("focus_off = 0x%X (points at '%s')", cands[chosen].off, cands[chosen].name)
+  session.layout.focus_off = off
+  fmt.printfln("focus_off = 0x%X", off)
   if flyff_save_cfg(session.layout, flyff_cfg_path()) {
     fmt.println("saved to flyff.cfg.")
   }
@@ -1015,17 +1146,6 @@ find_u32_offset :: proc(handle: win.HANDLE, obj: uintptr, val: u32, span: int, p
     return 0, false
   }
   return best, true
-}
-
-// True if world+focus_off currently points to a live mover (i.e. a target is selected there).
-focus_slot_live :: proc(session: ^Session, world: uintptr, focus_off: i64) -> bool {
-  handle := session.proc_info.handle
-  pt := session.ptr_size == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
-  p := read_ptr_at(handle, world + uintptr(focus_off), pt)
-  if p == 0 || !focus_obj_live(session, p) {
-    return false
-  }
-  return engine.read_obj_type(handle, p, session.layout.pos_off) == session.layout.mover_type
 }
 
 parse_vec3_literal :: proc(s: string) -> (pos: [3]f32, ok: bool) {

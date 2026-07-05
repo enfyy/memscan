@@ -110,12 +110,25 @@ log_target :: proc(session: ^Session, obj: uintptr, world: uintptr, sel, total: 
   }
 }
 
+// True if <name> case-insensitively equals any entry in <names>. An empty <names> list is
+// handled by the caller (means "match any"), so this returns false on empty.
+name_matches :: proc(name: string, names: []string) -> bool {
+  for n in names {
+    if strings.equal_fold(name, n) {
+      return true
+    }
+  }
+  return false
+}
+
 // True if <obj> is a safe, correct focus target: a live object (vtable in module), a mover
-// (type 5), name-matches <name>, has currentHP > 0, and a mapped m_pModel. Selecting a
-// model-less / freed object crashes the client (it derefs the focused object's model to
-// draw the selection), so this is used BOTH as the enumeration filter AND as the re-check
-// done immediately before the focus write - objects can be freed/reallocated in between.
-obj_is_selectable :: proc(session: ^Session, obj: uintptr, name: string) -> bool {
+// (type 5), name-matches one of <names> (or ANY mover when <names> is empty), has currentHP > 0,
+// and a mapped m_pModel. Selecting a model-less / freed object crashes the client (it derefs the
+// focused object's model to draw the selection), so this is used BOTH as the enumeration filter
+// AND as the re-check done immediately before the focus write - objects can be freed/reallocated
+// in between. NOTE: an empty <names> matches any mover including NPCs/other players; the caller
+// (tc_collect_cands) excludes the player object, but not peaceful NPCs.
+obj_is_selectable :: proc(session: ^Session, obj: uintptr, names: []string) -> bool {
   handle := session.proc_info.handle
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
@@ -134,9 +147,12 @@ obj_is_selectable :: proc(session: ^Session, obj: uintptr, name: string) -> bool
   if engine.read_obj_type(handle, obj, session.layout.pos_off) != session.layout.mover_type {
     return false // movers only
   }
-  nm, nok := engine.read_obj_name(handle, session.ptr_size, obj, session.layout.name_off)
-  if !nok || !strings.equal_fold(nm, name) {
-    return false
+  // Name gate: an empty list matches any mover (auto with no name); otherwise require a match.
+  if len(names) > 0 {
+    nm, nok := engine.read_obj_name(handle, session.ptr_size, obj, session.layout.name_off)
+    if !nok || !name_matches(nm, names) {
+      return false
+    }
   }
   // skip dying-but-not-despawned mobs (currentHP <= 0); a failed read leaves it eligible
   if hpv, hok := engine.read_value(handle, obj + uintptr(session.layout.hp_off), .U32); hok {
@@ -158,14 +174,22 @@ obj_is_selectable :: proc(session: ^Session, obj: uintptr, name: string) -> bool
   return true
 }
 
-// Scan for objects and return the selectable movers named <name>, nearest first. Enumerates
-// ALL writable regions fresh every call - complete regardless of spawns/zoning (the old
-// region cache went stale and missed most of a big spawn). Each world-ptr hit is gated by
-// obj_is_selectable (live object, mover, name, HP, model).
+// Scan for objects and return the selectable movers matching <names> (or any mover when
+// <names> is empty), nearest first. Enumerates ALL writable regions fresh every call - complete
+// regardless of spawns/zoning (the old region cache went stale and missed most of a big spawn).
+// Each world-ptr hit is gated by obj_is_selectable (live object, mover, name, HP, model). The
+// <player> object is always skipped; your pet/mount/summon is skipped too, via whichever link is
+// configured: pet_index (mover's m_dwIndex == your pet's species id - the reliable one, stable
+// across re-summons), owner_off (mover back-references you: m_idOwner==owner_id or m_pMaster==player),
+// and/or pet_id (mover's m_objid == the pet objid your player object holds). Pass owner_id=0 /
+// pet_id=0 to disable those; pet_index is read from the layout.
 tc_collect_cands :: proc(
   session: ^Session,
-  name: string,
+  names: []string,
   world: uintptr,
+  player: uintptr,
+  owner_id: u32,
+  pet_id: u32,
   player_pos: [3]f32,
 ) -> [dynamic]TC_Cand {
   handle := session.proc_info.handle
@@ -173,6 +197,15 @@ tc_collect_cands :: proc(
   if session.ptr_size == 4 {
     pt = .U32
   }
+  owner_off := session.layout.owner_off
+  objid_off := session.layout.objid_off
+  pet_index := session.layout.pet_index
+  index_off := session.layout.pos_off + 0x14 // m_dwIndex (species id), relative to m_vPos
+  // Monster-only gate: only in any-monster mode (empty names), require the mob-category field. This
+  // excludes ALL pets/players/NPCs, not just your own pet. Inert until findmobflag sets it.
+  mob_gate := len(names) == 0 && session.layout.mob_flag_off != 0
+  mob_flag_off := session.layout.mob_flag_off
+  mob_flag_val := session.layout.mob_flag_val
   wval := engine.ptr_to_value(world, session.ptr_size)
   regions := engine.collect_regions(handle, true) // all writable - complete, no stale cache
   defer delete(regions)
@@ -181,7 +214,40 @@ tc_collect_cands :: proc(
   cands := make([dynamic]TC_Cand, context.temp_allocator)
   for m in set.matches {
     obj := uintptr(i64(m.addr) - session.layout.field_off)
-    if !obj_is_selectable(session, obj, name) {
+    if obj == player {
+      continue // never target yourself (matters in any-monster mode where the name gate is off)
+    }
+    if owner_off != 0 {
+      if ov, ook := engine.read_value(handle, obj + uintptr(owner_off), .U32); ook {
+        v := u32(engine.value_as_u64(.U32, ov))
+        // Your pet/mount/summon references you via m_idOwner (your objid) or m_pMaster (a pointer
+        // to your player object); wild monsters hold 0 here. Match either encoding.
+        if (owner_id != 0 && v == owner_id) || v == u32(player) {
+          continue
+        }
+      }
+    }
+    if pet_id != 0 && objid_off != 0 {
+      if idv, idok := engine.read_value(handle, obj + uintptr(objid_off), .U32); idok {
+        if u32(engine.value_as_u64(.U32, idv)) == pet_id {
+          continue // this mover's objid is the pet objid your player object points at
+        }
+      }
+    }
+    if pet_index != 0 {
+      if xv, xok := engine.read_value(handle, obj + uintptr(index_off), .U32); xok {
+        if u32(engine.value_as_u64(.U32, xv)) == pet_index {
+          continue // same mover-prop species id as your pet (stable across re-summons)
+        }
+      }
+    }
+    if mob_gate {
+      fv, fok := engine.read_value(handle, obj + uintptr(mob_flag_off), .U32)
+      if !fok || u32(engine.value_as_u64(.U32, fv)) != mob_flag_val {
+        continue // not an attackable monster (pet / other player / NPC) - any-monster mode only
+      }
+    }
+    if !obj_is_selectable(session, obj, names) {
       continue
     }
     pos, posok := engine.read_vec3(handle, obj + uintptr(session.layout.pos_off))
@@ -214,7 +280,7 @@ TC_Result :: enum {
 //     re-selected while it's still a fresh-looking corpse.
 tc_select :: proc(
   session: ^Session,
-  name: string,
+  names: []string,
   require_fresh: bool,
 ) -> (
   res: TC_Result,
@@ -244,8 +310,25 @@ tc_select :: proc(
     return .AnchorFail, 0, 0, 0, 0
   }
 
-  // Collect selectable (alive + rendered) movers named <name>, nearest first.
-  cands := tc_collect_cands(session, name, world, player_pos)
+  // Your pet references you via m_idOwner (== your objid); read your objid so tc_collect_cands can
+  // skip owned movers via the owner_off link. Needs owner_off + objid_off; else stays 0.
+  owner_id: u32 = 0
+  if session.layout.owner_off != 0 && session.layout.objid_off != 0 {
+    if oiv, oiok := engine.read_value(handle, player + uintptr(session.layout.objid_off), .U32); oiok {
+      owner_id = u32(engine.value_as_u64(.U32, oiv))
+    }
+  }
+  // Reverse link: your player object holds your pet's objid at pet_id_off. Read it so
+  // tc_collect_cands can skip the mover whose m_objid matches. Needs pet_id_off + objid_off.
+  pet_id: u32 = 0
+  if session.layout.pet_id_off != 0 && session.layout.objid_off != 0 {
+    if piv, piok := engine.read_value(handle, player + uintptr(session.layout.pet_id_off), .U32); piok {
+      pet_id = u32(engine.value_as_u64(.U32, piv))
+    }
+  }
+
+  // Collect selectable (alive + rendered) movers matching <names> (or any mover), nearest first.
+  cands := tc_collect_cands(session, names, world, player, owner_id, pet_id, player_pos)
   total = len(cands)
   if total == 0 {
     return .NoCandidates, 0, 0, 0, 0
@@ -277,7 +360,7 @@ tc_select :: proc(
   // Re-validate immediately before the write. The object can be freed/reallocated between
   // enumeration and now; writing a stale pointer whose m_pModel has gone NULL crashes the
   // client. This shrinks the TOCTOU window from ~ms (the sort/pick above) to ~µs.
-  if !obj_is_selectable(session, chosen.obj, name) {
+  if !obj_is_selectable(session, chosen.obj, names) {
     return .WentStale, 0, 0, 0, total
   }
   tc_mark_recent(session, chosen.obj, now)
@@ -297,33 +380,35 @@ tc_select :: proc(
   return .Picked, chosen.obj, chosen.d, sel, total
 }
 
-// One-shot: select the nearest selectable mover named <name> by writing it into
+// One-shot: select the nearest selectable mover matching <name> by writing it into
 // m_pObjFocus. Repeated presses advance through the nearby mobs (the recently-targeted
 // cooldown skips a just-killed corpse). All anchors/offsets are baked Flyff constants, so
-// it needs no setup: `target_closest Mutant Yetti`.
+// it needs no setup: `target_closest Mutant Yetti`. Multiple names are allowed, comma-separated
+// (quote names with spaces): `target_closest 'Mutant Yetti', 'Captain Mutant Yetti'`.
 cli_target_closest :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
   }
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  if len(name) == 0 {
-    fmt.eprintln("usage: target_closest <name>")
+  names := parse_target_names(strings.join(args, " ", context.temp_allocator))
+  if len(names) == 0 {
+    fmt.eprintln("usage: target_closest <name>[, <name> ...]")
     return
   }
+  desc := auto_target_desc(names[:])
 
-  res, obj, d, sel, total := tc_select(session, name, false)
+  res, obj, d, sel, total := tc_select(session, names[:], false)
   switch res {
   case .Picked:
-    fmt.printfln("targeted '%s' #%d/%d obj=0x%X at d=%.1f.", name, sel + 1, total, obj, d)
+    fmt.printfln("targeted %s #%d/%d obj=0x%X at d=%.1f.", desc, sel + 1, total, obj, d)
   case .NoCandidates:
-    fmt.printfln("no '%s' found.", name)
+    fmt.printfln("no %s found.", desc)
   case .AnchorFail:
     fmt.eprintln("could not read world/player anchors (wrong build or not in-game?).")
   case .AllOnCooldown:
-    fmt.printfln("no fresh '%s' available.", name) // unreachable with require_fresh=false
+    fmt.printfln("no fresh %s available.", desc) // unreachable with require_fresh=false
   case .WentStale:
-    fmt.printfln("'%s' just died/despawned - try again.", name)
+    fmt.printfln("%s just died/despawned - try again.", desc)
   case .WriteFail: // tc_select already printed the specific error
   }
 }
@@ -372,9 +457,38 @@ focus_obj_live :: proc(session: ^Session, obj: uintptr) -> bool {
   return vtable >= base && vtable < mod_end
 }
 
+// Human-readable run timer: "45s", "4m12s", "1h04m22s".
+fmt_elapsed :: proc(ns: i64) -> string {
+  s := ns / 1_000_000_000
+  if s < 0 {
+    s = 0
+  }
+  h := s / 3600
+  m := (s % 3600) / 60
+  sec := s % 60
+  if h > 0 {
+    return fmt.tprintf("%dh%02dm%02ds", h, m, sec)
+  }
+  if m > 0 {
+    return fmt.tprintf("%dm%02ds", m, sec)
+  }
+  return fmt.tprintf("%ds", sec)
+}
+
+// One-line auto-farm stats since toggle-on: kill counter, run timer, kills/min.
+auto_stats :: proc(session: ^Session, now: i64) -> string {
+  el := now - session.auto_start
+  if el < 0 {
+    el = 0
+  }
+  mins := f64(el) / 60_000_000_000.0
+  kpm := mins > 0 ? f64(session.auto_count) / mins : 0
+  return fmt.tprintf("kill #%d  %s  %.1f/min", session.auto_count, fmt_elapsed(el), kpm)
+}
+
 // Auto-farm tick: called every ~20ms by the watcher thread while auto_on. When no live
 // target is selected (m_pObjFocus cleared on kill, or pointing at a freed object), advance
-// the focus to the next fresh mob named auto_name. F2-held then keeps attacking it.
+// the focus to the next fresh mob named auto_name. Your held attack key then keeps attacking it.
 auto_tick :: proc(session: ^Session) {
   if !session.auto_on || !session.attached {
     return
@@ -388,12 +502,14 @@ auto_tick :: proc(session: ^Session) {
     return
   }
   // Focus cleared (kill) or focused obj freed -> advance to the next fresh mob.
-  res, obj, d, sel, total := tc_select(session, session.auto_name, true)
+  res, obj, d, sel, total := tc_select(session, session.auto_names[:], true)
   session.auto_last = now
   if res == .Picked {
+    session.auto_count += 1
     fmt.printf(
-      "\n[auto] '%s' -> #%d/%d obj=0x%X d=%.1f\n",
-      session.auto_name,
+      "\n[auto] %s %s -> #%d/%d obj=0x%X d=%.1f\n",
+      auto_target_desc(session.auto_names[:]),
+      auto_stats(session, now),
       sel + 1,
       total,
       obj,
@@ -404,63 +520,149 @@ auto_tick :: proc(session: ^Session) {
   // NoCandidates / AllOnCooldown / AnchorFail / WriteFail: stay quiet (no idle spam).
 }
 
-// auto                 -> show status
-// auto off | auto stop -> turn auto-farm off
-// auto <name>          -> toggle on/off for <name> (same name toggles; a different name
-//                         while on switches target). Good to bind to a single hotkey.
-cli_auto :: proc(session: ^Session, args: []string) {
-  if len(args) == 0 {
-    if session.auto_on {
-      fmt.printfln("auto-farm ON: '%s'.", session.auto_name)
-    } else {
-      fmt.println("auto-farm OFF. usage: auto <name>  (toggle)  |  auto off")
+// Parse a raw target argument into a list of names. Comma-separated; each name may be wrapped
+// in single/double quotes and may contain spaces. Empty input (or only whitespace) yields an
+// empty list, meaning "any monster". Allocated in the temp allocator. Examples:
+//   ""                                        -> []            (any monster)
+//   "Aibatt"                                  -> ["Aibatt"]
+//   "Mutant Yetti"                            -> ["Mutant Yetti"]
+//   "'Club-tailed Reptillion', 'Captain ...'" -> ["Club-tailed Reptillion", "Captain ..."]
+parse_target_names :: proc(raw: string) -> [dynamic]string {
+  out := make([dynamic]string, context.temp_allocator)
+  for part in strings.split(raw, ",", context.temp_allocator) {
+    n := strings.trim_space(part)
+    n = strings.trim(n, "'\"") // strip one layer of surrounding quotes
+    n = strings.trim_space(n)
+    if len(n) > 0 {
+      append(&out, n)
     }
-    return
   }
+  return out
+}
 
+// Human-readable description of a target-name list, for status/log lines.
+//   []            -> "any monster"
+//   ["A"]         -> "'A'"
+//   ["A","B"]     -> "'A', 'B'"
+auto_target_desc :: proc(names: []string) -> string {
+  if len(names) == 0 {
+    return "any monster"
+  }
+  sb := strings.builder_make(context.temp_allocator)
+  for n, i in names {
+    if i > 0 {
+      fmt.sbprint(&sb, ", ")
+    }
+    fmt.sbprintf(&sb, "'%s'", n)
+  }
+  return strings.to_string(sb)
+}
+
+// Set-equality of two name lists (order-insensitive, case-insensitive). Two empty lists are
+// equal (both "any monster"), so re-issuing the same request toggles auto off.
+names_equal :: proc(a, b: []string) -> bool {
+  if len(a) != len(b) {
+    return false
+  }
+  for x in a {
+    if !name_matches(x, b) {
+      return false
+    }
+  }
+  return true
+}
+
+// Free the cloned auto_names list (each string + the backing array). Idempotent.
+auto_free_names :: proc(session: ^Session) {
+  for n in session.auto_names {
+    delete(n)
+  }
+  delete(session.auto_names)
+  session.auto_names = nil
+}
+
+// Replace auto_names with persistent clones of <names> (default allocator, so they survive
+// across REPL/watcher calls). Frees the previous list first.
+auto_set_names :: proc(session: ^Session, names: []string) {
+  auto_free_names(session)
+  session.auto_names = make([dynamic]string)
+  for n in names {
+    append(&session.auto_names, strings.clone(n))
+  }
+}
+
+// If auto is in any-monster mode (empty name list) but owner_off isn't configured yet, warn that
+// the player's own pet/mount will also be targeted, and point at the one-time fix.
+auto_warn_pet :: proc(session: ^Session) {
+  L := session.layout
+  if len(session.auto_names) == 0 && L.owner_off == 0 && L.pet_id_off == 0 && L.pet_index == 0 {
+    fmt.println("  note: any-monster mode will also target your pet until you run 'findowner <pet-name>' once.")
+  }
+}
+
+// auto                     -> off: start farming ANY nearby monster;  on: show status
+// auto off | auto stop     -> turn auto-farm off
+// auto any                 -> explicitly farm any monster (same as bare 'auto' when off)
+// auto <name>              -> farm <name> (re-issuing the same request toggles off)
+// auto 'A', 'B', ...       -> farm any of the listed names (comma-separated; quote names that
+//                             contain spaces). A different request while on switches target.
+// Good to bind to a single hotkey (re-issue toggles).
+cli_auto :: proc(session: ^Session, args: []string) {
+  // Stop.
   if len(args) == 1 && (args[0] == "off" || args[0] == "stop") {
     if session.auto_on {
       session.auto_on = false
-      fmt.println("auto-farm OFF.")
+      fmt.printfln("auto-farm OFF.  %s", auto_stats(session, time.now()._nsec))
     } else {
       fmt.println("auto-farm already off.")
     }
     return
   }
 
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  if len(name) == 0 {
-    fmt.eprintln("usage: auto <name>")
+  // Bare 'auto' while running -> status peek (don't disturb the run). When off it falls through
+  // and starts any-monster mode.
+  if len(args) == 0 && session.auto_on {
+    fmt.printfln("auto-farm ON: %s.  %s", auto_target_desc(session.auto_names[:]), auto_stats(session, time.now()._nsec))
     return
   }
 
+  // Resolve the requested targets. No args, or the alias any/anything/*, means "any monster".
+  names := parse_target_names(strings.join(args, " ", context.temp_allocator))
+  if len(names) == 1 &&
+     (strings.equal_fold(names[0], "any") || strings.equal_fold(names[0], "anything") || names[0] == "*") {
+    clear(&names)
+  }
+
+  // Already running -> the same request toggles off; a different one switches target.
   if session.auto_on {
-    if strings.equal_fold(name, session.auto_name) {
-      session.auto_on = false // same name -> toggle off
-      fmt.println("auto-farm OFF.")
+    if names_equal(names[:], session.auto_names[:]) {
+      session.auto_on = false
+      fmt.printfln("auto-farm OFF.  %s", auto_stats(session, time.now()._nsec))
       return
     }
-    delete(session.auto_name) // different name -> switch target, stay on
-    session.auto_name = strings.clone(name)
+    auto_set_names(session, names[:])
     session.auto_last = 0
-    fmt.printfln("auto-farm target -> '%s'.", name)
+    fmt.printfln("auto-farm target -> %s.", auto_target_desc(session.auto_names[:]))
+    auto_warn_pet(session)
     return
   }
 
+  // Start.
   if !session.attached {
     fmt.eprintln("not attached.")
     return
   }
-  delete(session.auto_name)
-  session.auto_name = strings.clone(name)
+  auto_set_names(session, names[:])
   session.auto_last = 0
+  session.auto_count = 0
+  session.auto_start = time.now()._nsec
   session.auto_on = true
   ensure_hotkey_thread(session)
   fmt.printfln(
-    "auto-farm ON: '%s'. hold F2; advances to the next mob on each kill. 'auto %s' or 'auto off' to stop.",
-    name,
-    name,
+    "auto-farm ON: %s. hold your attack key; advances to the next mob on each kill. 'auto off' to stop.",
+    auto_target_desc(session.auto_names[:]),
   )
+  auto_warn_pet(session)
 }
 
 REFOCUS_INTERVAL_NS :: i64(200_000_000) // ~200ms between consistent write-backs

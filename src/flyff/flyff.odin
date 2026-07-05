@@ -25,6 +25,31 @@ FLYFF_SENDSETTARGET_RVA :: 0x0 // entry of CDPClient::SendSetTarget (thiscall(OB
 FLYFF_GDPLAY_RVA :: 0x0 // &g_DPlay (global CDPClient) - the thiscall `this`
 FLYFF_OBJID_OFF :: 0x0 // CObj.m_objid (GetId) - value sent as idTarget
 
+// Owner back-reference on a mover: the field where your pet/mount/summon references YOU - either
+// m_idOwner (your objid) or m_pMaster (a pointer to your player object); wild monsters hold 0. The
+// exclusion matches either encoding. Located at runtime via `findowner`; 0 = not found, which
+// disables owner-based filtering (auto with no name would then also target your pet).
+FLYFF_OWNER_OFF :: 0x0
+
+// Forward pet reference in the PLAYER object: a slot holding your pet's objid (m_idPet). When set,
+// auto skips the mover whose m_objid equals [player + pet_id_off]. This is the reverse of owner_off
+// (some builds link player->pet instead of pet->player); either one alone excludes the pet. Located
+// at runtime via `findowner`; needs objid_off. 0 = not found (disabled). NOTE: fragile - the pet
+// objid changes on re-summon - prefer pet_index below.
+FLYFF_PET_ID_OFF :: 0x0
+
+// Pet species id (m_dwIndex, at pos_off+0x14): the mover-prop id of your pet's kind. Auto skips any
+// mover whose m_dwIndex matches. Unlike the objid links this is STABLE across re-summons and is
+// distinct from monster species ids, so it's the reliable pet filter. Set by `findowner`. 0 = unset.
+FLYFF_PET_INDEX :: 0x0
+
+// Monster-category gate for any-monster auto: a field every attackable MONSTER shares but pets /
+// other players / NPCs don't. In no-name auto, movers where [mover + mob_flag_off] != mob_flag_val
+// are skipped (excludes ALL pets, not just your own species). Found via `findmobflag` (diffs your pet
+// vs a multi-species monster sample). mob_flag_off 0 = disabled. Only applies in any-monster mode.
+FLYFF_MOB_FLAG_OFF :: 0x0
+FLYFF_MOB_FLAG_VAL :: 0x0
+
 // Live, patch-tunable Flyff layout. Held in Session.layout; seeded by flyff_layout_default(),
 // overwritten by flyff.cfg on attach, re-derived by `calibrate`, and persisted back to the cfg.
 // Offsets are i64 (cast to uintptr at address sites); RVAs are uintptr; read_obj_type still
@@ -40,6 +65,11 @@ Flyff_Layout :: struct {
   model_off:         i64,
   mover_type:        u32,
   objid_off:         i64,
+  owner_off:         i64,
+  pet_id_off:        i64,
+  pet_index:         u32,
+  mob_flag_off:      i64,
+  mob_flag_val:      u32,
   sendsettarget_rva: uintptr,
   gdplay_rva:        uintptr,
 }
@@ -56,6 +86,11 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     model_off         = FLYFF_MODEL_OFF,
     mover_type        = FLYFF_MOVER_TYPE,
     objid_off         = FLYFF_OBJID_OFF,
+    owner_off         = FLYFF_OWNER_OFF,
+    pet_id_off        = FLYFF_PET_ID_OFF,
+    pet_index         = FLYFF_PET_INDEX,
+    mob_flag_off      = FLYFF_MOB_FLAG_OFF,
+    mob_flag_val      = FLYFF_MOB_FLAG_VAL,
     sendsettarget_rva = FLYFF_SENDSETTARGET_RVA,
     gdplay_rva        = FLYFF_GDPLAY_RVA,
   }

@@ -36,10 +36,13 @@ Session :: struct {
   tc_recent:     [dynamic]TC_Recent, // objs target_closest picked recently (skip just-killed)
 
   // Auto-farm mode (see auto_tick / cli_auto in target.odin). When on, the watcher thread
-  // advances the focus to the next fresh mob named auto_name whenever m_pObjFocus clears.
+  // advances the focus to the next fresh mob matching auto_names whenever m_pObjFocus clears.
+  // An empty auto_names list means "any monster" (name gate off; player is still excluded).
   auto_on:       bool,
-  auto_name:     string, // cloned target name; freed on toggle/close
+  auto_names:    [dynamic]string, // cloned target names; empty = any monster. Freed on toggle/close.
   auto_last:     i64, // time.now()._nsec of the last advance attempt (throttle)
+  auto_count:    int, // targets selected since auto turned on (reset on each toggle-on)
+  auto_start:    i64, // time.now()._nsec when auto turned on (origin for the run timer)
 
   // Detection experiment (see refocus_tick in target.odin): write the current m_pObjFocus value
   // back to itself periodically - a consistent external write that matches the client's input.
@@ -48,7 +51,8 @@ Session :: struct {
 
   // Server target-sync (see notify_server_target / cli_srvsync). When on, each focus select
   // also fires the client's own SendSetTarget(objid, 2) so the server's m_idSetTarget matches
-  // what we attack - the anti-DC fix. Cleared on detach/close.
+  // what we attack - the anti-DC fix. Defaults ON on attach (inert until configured); cleared on
+  // detach/close and re-enabled on the next attach. 'srvsync off' disables it for the session.
   srvsync_on:    bool,
   srv_shim:      uintptr, // cached RWX shim page in the target (remote_send_settarget); 0 = none
 
@@ -118,5 +122,5 @@ session_close :: proc(session: ^Session) {
   delete(session.targets)
   delete(session.hotkeys)
   delete(session.tc_recent)
-  delete(session.auto_name)
+  auto_free_names(session)
 }

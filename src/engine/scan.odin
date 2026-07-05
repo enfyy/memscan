@@ -497,6 +497,80 @@ codescan_calls :: proc(
   return
 }
 
+// A candidate SendSetTarget call site: the click path fires the target packet via
+// `push imm8(bClear); push dword [reg+disp]; call rel32`. Both srvsync fields fall out of one
+// match: `disp` is the mover's network-id offset (objid_off) and the call target is
+// SendSetTarget (target - base = sendsettarget_rva). See net-package-targeting.md.
+Settarget_Hit :: struct {
+  callsite: uintptr, // address of the E8 (call rel32)
+  target:   uintptr, // absolute call target (SendSetTarget candidate)
+  disp:     i64,     // displacement in `push [reg+disp]` -> candidate objid_off
+  bclear:   u8,      // the pushed imm8: 2 = set target, 1 = clear
+}
+
+// Scan executable image pages for the `push imm8(1|2); push dword [reg+disp]; call rel32`
+// sequence and return every match. Read-only. Handles the disp8 (mod=01) and disp32 (mod=10)
+// forms of the memory push and an optional SIB byte (e.g. an esp base). Used to auto-derive
+// sendsettarget_rva + objid_off after a game patch instead of the manual codescan/disasm route.
+scan_settarget_sig :: proc(
+  handle: win.HANDLE,
+  allocator := context.allocator,
+) -> (
+  out: [dynamic]Settarget_Hit,
+) {
+  out = make([dynamic]Settarget_Hit, allocator)
+  regions := collect_regions(handle, false)
+  defer delete(regions)
+  for r in regions {
+    if r.protect & 0xF0 == 0 {
+      continue // executable pages only
+    }
+    buf := make([]byte, r.size)
+    n, ok := read_into(handle, r.base, buf)
+    if ok {
+      lim := int(n)
+      i := 0
+      for i + 8 <= lim {
+        // push imm8 (6A ib, bClear=1|2); push r/m32 (FF /6); modrm with mod=01|10, reg=110
+        if buf[i] == 0x6A && (buf[i + 1] == 0x01 || buf[i + 1] == 0x02) && buf[i + 2] == 0xFF {
+          modrm := buf[i + 3]
+          mod := modrm & 0xC0
+          if (modrm & 0x38) == 0x30 && (mod == 0x40 || mod == 0x80) {
+            p := i + 4
+            if (modrm & 0x07) == 0x04 {
+              p += 1 // SIB byte (base reg such as esp)
+            }
+            disp: i64 = 0
+            good := false
+            if mod == 0x40 { // disp8
+              if p + 1 <= lim {
+                disp = i64(i8(buf[p]))
+                p += 1
+                good = true
+              }
+            } else { // disp32
+              if p + 4 <= lim {
+                disp = i64(i32(u32(buf[p]) | u32(buf[p + 1]) << 8 | u32(buf[p + 2]) << 16 | u32(buf[p + 3]) << 24))
+                p += 4
+                good = true
+              }
+            }
+            if good && p + 5 <= lim && buf[p] == 0xE8 {
+              rel := i32(u32(buf[p + 1]) | u32(buf[p + 2]) << 8 | u32(buf[p + 3]) << 16 | u32(buf[p + 4]) << 24)
+              callsite := r.base + uintptr(p)
+              target := uintptr(i64(callsite) + 5 + i64(rel))
+              append(&out, Settarget_Hit{callsite, target, disp, buf[i + 1]})
+            }
+          }
+        }
+        i += 1
+      }
+    }
+    delete(buf)
+  }
+  return
+}
+
 // Scan writable heap memory for 3 contiguous little-endian f32 within `eps` of target
 // x/y/z. Returns the address of the first float (a candidate m_vPos). Used by calibrate /
 // findpos to locate an object by its known world position. Floats are 4-aligned in the

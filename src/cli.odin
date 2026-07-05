@@ -149,6 +149,8 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_calibrate_house(session, args)
   case "offsets", "layout":
     flyff.cli_offsets(session, args)
+  case "status", "doctor", "diag":
+    flyff.cli_status(session)
   case "set":
     flyff.cli_set(session, args)
   case "findpos":
@@ -173,6 +175,12 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     cli_codescan(session, args)
   case "idscan":
     flyff.cli_idscan(session, args)
+  case "findsettarget":
+    flyff.cli_findsettarget(session, args)
+  case "findowner":
+    flyff.cli_findowner(session, args)
+  case "findmobflag":
+    flyff.cli_findmobflag(session, args)
   case "srvsync":
     flyff.cli_srvsync(session, args)
   case "srvtest":
@@ -192,70 +200,100 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
 }
 
 cli_help :: proc() {
-  fmt.println(`commands:
-  ps [filter]                list processes (optionally filtered by name)
-  attach <name|pid>          open a process for read/write
-  detach                     close the attached process handle
-  info                       show attached process details
-  vtype <t>                  set default value type (u8 i8 u16 i16 u32 i32 u64 i64 f32 f64)
-  ptrsize <4|8>              pointer width used by 'deref'
-  scan [t] <value>           exact-value scan, replaces match set
-  snapshot [t]               capture memory for an unknown-initial search
-  next <op> [value]          refine matches/snapshot; op = eq ne gt lt changed unchanged inc dec
-  list [n]                   show first n matches (default 20)
-  count                      show number of matches
-  pointers                   keep only matches whose value is a valid heap pointer
-  clearmatches               drop matches but keep snapshot
-  reset                      clear all scan state
-  read  <addr> [t]           read a value at an absolute address
-  write <addr> <value> [t]   write a value at an absolute address
-  peek  [i]                  read match #i live (default 0)
-  poke  [i] <value>          write <value> to match #i (default i=0)
-  deref <addr> [off ...]     follow a pointer chain, show the final address+value
-  dump  <addr|[i]> [len]      hex dump len bytes (default 128) with an f32 column
-  dist  <a|[i]> <b|[j]>       distance between two vec3 (3x f32) positions
-  nearest list    <start|[i]> <next_off> <pos_off> <player> [max]
-  nearest array   <base|[i]> <count> <stride> <pos_off> <player>
-  nearest matches <field_off> <pos_off> <player>   (each match = obj+field_off)
-                             enumerate entities ranked by distance to player;
-                             <player> = address | [i] | literal x,y,z (no spaces)
-  target <focus|[i]> <rank>  write nearest[rank]'s obj ptr into the focus address
-  find  <text>               search readable memory for a string (ASCII + UTF-16)
-  target_closest <name>      select the nearest mover named <name> (Flyff; one-shot).
-                             repeat to advance through nearby mobs (skips just-killed)
-  auto <name>                hands-free farm: auto-advance focus to the next <name> mob
-                             whenever the target dies. toggle: 'auto <name>' again, or
-                             'auto off'. hold F2 and it keeps feeding targets.
-  refocus                    detection test: write the current focus value back to itself
-                             every ~200ms (a consistent external write). toggle / 'refocus off'.
-  calibrate <x,y,z> <name> [hp]  re-derive the Flyff layout after a patch (x,y,z from
-                             /position). saves flyff.cfg, auto-loaded on attach. no rebuild.
-  calibrate_house <name> [hp]  same, but stand still in your house (fixed spawn 253,100,243)
-                             so you only pass your name - no /position needed.
-  offsets [save|load|reset]  show / persist / restore the live layout
-  set <field> <value>        set one layout field (see 'offsets'); auto-saves flyff.cfg
-  findpos <x,y,z> [eps]      addresses whose 3 f32 match a position (recon)
-  findfocus                  select a mob in-game, then run this to derive focus_off
-  findhp <name>              derive hp_off (currentHP); damage a few <name> mobs first
-  hpwatch                    target one mob, run this, hit it: the field that drops is currentHP
-  findpacket [objid]         scan for the outgoing SETTARGET packet to reveal its renumbered id
-  packetwatch                snapshot, click a different mob, find the freshly-written SETTARGET
-  disasm <addr> [count]      disassemble count instructions (default 24) at an address
-  func <addr>                disassemble the whole enclosing function (finds its start)
-  codescan <u32>             find a 4-byte immediate in executable pages (recon)
-  codescan call <addr>       find direct CALL sites targeting <addr> (recon)
-  codescan xref <rva>        find code referencing a base-relative global (e.g. the world)
-  idscan <name>              find CObj.m_objid: distinct in-range fields across <name> movers
-  srvsync [on|off]           after each select, also send the client's own SendSetTarget so
-                             the server registers our target (stops the after-N-kills DC)
-  srvtest                    fire one SendSetTarget at the current target (PoC)
-  hotkey <command>           press a key when prompted to bind it to <command>; fires
-                             globally even while memscan is backgrounded.
-                             also: 'hotkey list', 'hotkey clear'
-  quit                       exit
+  fmt.println(`memscan - cross-process memory scanner with Flyff (Neuz.exe) automation on top.
+(aliases in parens; run any command with wrong args to see its usage)
 
-chain multiple commands on one line with ';' or '&&', e.g.
-  write 0x18D0E04 0x1EDCF820 u32; write 0x1A828B48 0x1EDCF820 u32`)
+============================ GENERAL (any process) ============================
+
+process & session
+  ps [filter]                list processes (optionally filter by name)
+  attach <name|pid>          open a process for read/write
+  detach                     close the attached process
+  info                       show attached process details
+  vtype <t>          (type)  default value type: u8 i8 u16 i16 u32 i32 u64 i64 f32 f64
+  ptrsize <4|8>              pointer width for deref (auto-set on attach)
+
+scan for a value
+  scan [t] <value>     (s)   exact-value scan (starts/replaces the match set)
+  snapshot [t]      (snap)   capture memory for an unknown-value search
+  next <op> [value]    (n)   refine matches: eq ne gt lt changed unchanged inc dec
+  list [n]            (ls)   show first n matches (default 20)
+  count                      how many matches
+  pointers           (ptr)   keep only matches that are valid heap pointers
+  clearmatches        (cm)   drop matches, keep the snapshot
+  reset                      clear all scan state
+
+read / write / inspect
+  read  <addr> [t]     (r)   read a value at an address
+  write <addr> <val> [t] (w) write a value at an address
+  peek  [i]                  read match #i live (default 0)
+  poke  [i] <value>          write to match #i (default 0)
+  deref <addr> [off ...] (d) follow a pointer chain to the final address+value
+  dump  <addr|[i]> [len] (x) hex dump (default 128 bytes) with an f32 column
+  find  <text>               search memory for a string (ASCII + UTF-16)
+  dist  <a> <b>              distance between two vec3 (3x f32) positions
+  nearest <mode> ...  (near) enumerate entities by distance to player;
+                             modes: list | array | matches (run for the exact args)
+  target <focus|[i]> <rank>  write nearest[rank]'s pointer into a focus address
+
+disassembly / code recon
+  disasm <addr> [count] (u)  disassemble count instructions (default 24)
+  func <addr>                disassemble the whole enclosing function
+  codescan <u32>             find a 4-byte immediate in executable pages
+  codescan call <addr>       find direct CALL sites targeting <addr>
+  codescan xref <rva>        find code referencing a base-relative global
+
+automation
+  hotkey <command>    (hk)   bind a key (when prompted) to run <command>, even backgrounded;
+                             also: hotkey list | hotkey clear
+
+============ FLYFF (Neuz.exe - offsets live in flyff.cfg, loaded on attach) ============
+typical use: attach Neuz -> auto -> hold your attack key.   after a patch: select a mob, calibrate.
+check the setup anytime with 'status'.
+
+farming (day to day)
+  target_closest <name>... (tc)  select nearest mover named <name>; repeat to advance.
+                             several names ok: tc 'Aibatt', 'Captain Aibatt'
+  auto [name]...             hands-free farm: re-target the next mob on each kill (hold your attack key).
+                             no name = ANY monster; names comma-separated. re-issue / 'auto off' to stop
+  mobs <name>                list nearby <name> movers by distance (hp, model, address)
+  srvsync [on|off]           mirror each select to the server (stops the after-N-kills DC);
+                             ON by default on attach
+  srvtest                    fire one server SendSetTarget at the current target
+
+setup & health (run once after a game patch)
+  status              (doctor)  health-check: what's configured, what's missing, and how to fix it
+  calibrate <x,y,z> <name> [hp]  (cal) re-derive the whole layout from /position + your
+                             character name; also finds srvsync offsets, and focus_off if a mob
+                             is selected. select a mob first for full setup. saves flyff.cfg
+  calibrate_house <name> [hp]  (calh) same, from your house's fixed spawn (no /position; but no
+                             mobs in the house, so focus_off is kept - pin it later in the field)
+  offsets [save|load|reset] (layout)  no-arg = status; or persist/restore the layout
+  set <field> <value>        set one layout field (see 'status'); auto-saves flyff.cfg
+
+offset finders (one-time; each fills part of the layout)
+  findfocus                  click a mob, then run: derives focus_off
+  hpwatch                    target a mob and hit it: the field that drops is currentHP (hp_off)
+  findsettarget              derive the srvsync offsets by signature (calibrate does this too)
+  findowner <pet-name>       summon your pet, run: excludes YOUR pet from any-monster auto
+  findmobflag <pet-name>     find the monster-category field so any-monster auto skips ALL
+                             pets/players/NPCs (needs 2+ monster species on screen)
+
+deep recon (rarely needed)
+  findpos <x,y,z> [eps]      addresses whose 3 f32 match a position
+  findhp <name>              guess hp_off statistically (prefer hpwatch)
+  idscan <name>              find m_objid across <name> movers
+  findpacket [objid]         scan for the outgoing SETTARGET packet id
+  packetwatch                snapshot, click a mob, catch the fresh SETTARGET packet
+  deathscan <name>           find a corpse despawn-countdown field
+  objscan <value> <name>     find offsets holding <value> across <name> movers
+  refocus                    detection test: rewrite focus to itself every ~200ms
+
+============================================================================
+  help (?)   this list         quit (q)   exit
+
+chain commands on one line with ';' or '&&':
+  set mob_flag_off 0x2830 ; set mob_flag_val 0x13`)
 }
 
 cli_ps :: proc(args: []string) {
@@ -352,6 +390,16 @@ cli_attach :: proc(session: ^flyff.Session, args: []string) {
     fmt.printfln("layout: loaded %s", cfg)
   } else {
     fmt.println("layout: built-in defaults (run 'calibrate' if the game was patched).")
+  }
+
+  // srvsync defaults ON now that the anti-DC path is proven - it's always needed. It stays inert
+  // (notify_server_target no-ops) until sendsettarget_rva/objid_off are set on a 32-bit client, so
+  // enabling it unconditionally is safe. 'srvsync off' still disables it for the rest of the session.
+  session.srvsync_on = true
+  if session.ptr_size == 4 && session.layout.sendsettarget_rva != 0 && session.layout.objid_off != 0 {
+    fmt.println("srvsync: ON (default). 'srvsync off' to disable.")
+  } else {
+    fmt.println("srvsync: ON (default) but inert until configured - run 'findsettarget' on the 32-bit Neuz.exe.")
   }
 }
 
