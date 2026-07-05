@@ -43,6 +43,20 @@ Session :: struct {
   auto_last:     i64, // time.now()._nsec of the last advance attempt (throttle)
   auto_count:    int, // targets selected since auto turned on (reset on each toggle-on)
   auto_start:    i64, // time.now()._nsec when auto turned on (origin for the run timer)
+  auto_timer_at: i64, // nsec deadline at which 'auto' auto-disables ('timer' cmd); 0 = disarmed
+
+  // Obstacle / stuck detection (see auto_monitor in target.odin). Tracks progress toward the
+  // focused mob; if player->target distance plateaus while still far, the mob is blacklisted
+  // (auto_blocked, skipped for BLOCKED_NS) and focus is cleared so the next tick re-acquires.
+  auto_focus_obj:   uintptr, // obj currently being monitored (0 = none / just changed)
+  auto_best_dist:   f32, // closest player->target distance seen this approach
+  auto_progress_at: i64, // time.now()._nsec of the last real progress (start of the STUCK_NS window)
+  auto_blocked:     [dynamic]TC_Recent, // mobs flagged unreachable; skipped by the picker for BLOCKED_NS
+  auto_stuck_on:    bool, // stuck-detection enabled (default on; 'stuck off' disables, e.g. for ranged)
+
+  // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
+  // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
+  world_cal:     [dynamic]World_Cal_Cand,
 
   // Detection experiment (see refocus_tick in target.odin): write the current m_pObjFocus value
   // back to itself periodically - a consistent external write that matches the client's input.
@@ -73,6 +87,7 @@ session_init :: proc(session: ^Session) -> bool {
   session.vtype = .U32
   session.ptr_size = 8
   session.writable_only = true
+  session.auto_stuck_on = true // obstacle/stuck detection on by default (see auto_monitor)
   session.layout = flyff_layout_default()
   if err := virtual.arena_init_growing(&session.scan_arena); err != .None {
     fmt.eprintln("failed to initialise scan arena")
@@ -122,5 +137,7 @@ session_close :: proc(session: ^Session) {
   delete(session.targets)
   delete(session.hotkeys)
   delete(session.tc_recent)
+  delete(session.auto_blocked)
+  delete(session.world_cal)
   auto_free_names(session)
 }

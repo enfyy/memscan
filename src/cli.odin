@@ -141,6 +141,10 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_target_closest(session, args)
   case "auto":
     flyff.cli_auto(session, args)
+  case "timer":
+    flyff.cli_timer(session, args)
+  case "stuck":
+    flyff.cli_stuck(session, args)
   case "refocus":
     flyff.cli_refocus(session, args)
   case "calibrate", "cal":
@@ -193,6 +197,12 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_objscan(session, args)
   case "mobs":
     flyff.cli_mobs(session, args)
+  case "worldscan":
+    flyff.cli_worldscan(session, args)
+  case "attr":
+    flyff.cli_attr(session, args)
+  case "reach":
+    flyff.cli_reach(session, args)
   case:
     fmt.eprintfln("unknown command: %s (try 'help')", cmd)
   }
@@ -256,6 +266,8 @@ farming (day to day)
                              several names ok: tc 'Aibatt', 'Captain Aibatt'
   auto [name]...             hands-free farm: re-target the next mob on each kill (hold your attack key).
                              no name = ANY monster; names comma-separated. re-issue / 'auto off' to stop
+  timer <minutes>            auto-disable 'auto' after N minutes (e.g. 'timer 60'); 'timer off' cancels
+  stuck [on|off]             toggle obstacle skip-detection (on by default; 'stuck off' for ranged/standing)
   mobs <name>                list nearby <name> movers by distance (hp, model, address)
   srvsync [on|off]           mirror each select to the server (stops the after-N-kills DC);
                              ON by default on attach
@@ -278,6 +290,12 @@ offset finders (one-time; each fills part of the layout)
   findowner <pet-name>       summon your pet, run: excludes YOUR pet from any-monster auto
   findmobflag <pet-name>     find the monster-category field so any-monster auto skips ALL
                              pets/players/NPCs (needs 2+ monster species on screen)
+
+terrain / obstacle recon (spike)
+  worldscan [reset]          pin the terrain-grid offsets from your ground height (stand on solid
+                             ground; if ambiguous, walk to a different-height spot and re-run)
+  attr [x,z]                 terrain attribute at your feet (or a world point): NONE/NOWALK/NOMOVE/DIE
+  reach [x,z]                is the straight path player->point (or ->selected target) walkable?
 
 deep recon (rarely needed)
   findpos <x,y,z> [eps]      addresses whose 3 f32 match a position
@@ -410,6 +428,9 @@ cli_detach :: proc(session: ^flyff.Session) {
   }
   pid := session.proc_info.pid
   session.auto_on = false // stop auto-farm when the process goes away
+  session.auto_timer_at = 0
+  session.auto_focus_obj = 0
+  clear(&session.auto_blocked)
   session.refocus_on = false
   session.srvsync_on = false
   flyff.remote_free_shim(session)

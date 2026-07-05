@@ -25,6 +25,14 @@ FLYFF_SENDSETTARGET_RVA :: 0x0 // entry of CDPClient::SendSetTarget (thiscall(OB
 FLYFF_GDPLAY_RVA :: 0x0 // &g_DPlay (global CDPClient) - the thiscall `this`
 FLYFF_OBJID_OFF :: 0x0 // CObj.m_objid (GetId) - value sent as idTarget
 
+// Terrain reachability grid (see terrain.odin). Offsets into CWorld / CLandscape that locate the
+// per-cell walkability map (heightmap-encoded attribute). Found at runtime by `worldscan`; 0 means
+// "not yet found" and the attr/reach commands stay inert while any of the three structural ones is 0.
+FLYFF_LAND_OFF :: 0x0 // CWorld.m_apLand (CLandscape** array base)
+FLYFF_LANDWIDTH_OFF :: 0x0 // CWorld.m_nLandWidth (int); m_nLandHeight is +4
+FLYFF_MPU_OFF :: 0x0 // CWorld.m_iMPU (int meters-per-unit); 0 => assume MPU_DEFAULT (4)
+FLYFF_HMAP_OFF :: 0x0 // CLandscape.m_pHeightMap (float*, 129x129 corner grid)
+
 // Owner back-reference on a mover: the field where your pet/mount/summon references YOU - either
 // m_idOwner (your objid) or m_pMaster (a pointer to your player object); wild monsters hold 0. The
 // exclusion matches either encoding. Located at runtime via `findowner`; 0 = not found, which
@@ -72,6 +80,10 @@ Flyff_Layout :: struct {
   mob_flag_val:      u32,
   sendsettarget_rva: uintptr,
   gdplay_rva:        uintptr,
+  land_off:          i64,
+  landwidth_off:     i64,
+  mpu_off:           i64,
+  hmap_off:          i64,
 }
 
 flyff_layout_default :: proc() -> Flyff_Layout {
@@ -93,5 +105,9 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     mob_flag_val      = FLYFF_MOB_FLAG_VAL,
     sendsettarget_rva = FLYFF_SENDSETTARGET_RVA,
     gdplay_rva        = FLYFF_GDPLAY_RVA,
+    land_off          = FLYFF_LAND_OFF,
+    landwidth_off     = FLYFF_LANDWIDTH_OFF,
+    mpu_off           = FLYFF_MPU_OFF,
+    hmap_off          = FLYFF_HMAP_OFF,
   }
 }

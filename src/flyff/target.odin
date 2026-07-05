@@ -3,6 +3,7 @@ package flyff
 import "core:fmt"
 import "core:os"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 import "core:time"
 import win "core:sys/windows"
@@ -43,6 +44,37 @@ tc_mark_recent :: proc(session: ^Session, obj: uintptr, now: i64) {
     }
   }
   append(&session.tc_recent, TC_Recent{obj = obj, t = now})
+}
+
+// How long a mob flagged unreachable by the stuck-monitor stays blacklisted. Long enough to walk
+// off and find other mobs, short enough that a genuinely-reachable mob (mis-flagged, or the obstacle
+// cleared) becomes eligible again.
+BLOCKED_NS :: i64(20_000_000_000) // ~20s
+
+// True if <obj> was flagged blocked (unreachable) within the last BLOCKED_NS. Mirrors
+// tc_seen_recently but against the auto_blocked list; used by the picker to skip stuck mobs.
+obj_blocked_recently :: proc(session: ^Session, obj: uintptr, now: i64) -> bool {
+  for r in session.auto_blocked {
+    if r.obj == obj && now - r.t < BLOCKED_NS {
+      return true
+    }
+  }
+  return false
+}
+
+// Flag <obj> as blocked (unreachable) as of <now>, dropping any stale/duplicate entry first.
+// Mirrors tc_mark_recent against the auto_blocked list.
+mark_blocked :: proc(session: ^Session, obj: uintptr, now: i64) {
+  i := 0
+  for i < len(session.auto_blocked) {
+    r := session.auto_blocked[i]
+    if r.obj == obj || now - r.t >= BLOCKED_NS {
+      unordered_remove(&session.auto_blocked, i)
+    } else {
+      i += 1
+    }
+  }
+  append(&session.auto_blocked, TC_Recent{obj = obj, t = now})
 }
 
 // Debug: append everything we know about the object we're about to select to
@@ -343,7 +375,7 @@ tc_select :: proc(
   sel = 0
   found := false
   for c, i in cands {
-    if !tc_seen_recently(session, c.obj, now) {
+    if !tc_seen_recently(session, c.obj, now) && !obj_blocked_recently(session, c.obj, now) {
       chosen = c
       sel = i
       found = true
@@ -414,6 +446,34 @@ cli_target_closest :: proc(session: ^Session, args: []string) {
 }
 
 AUTO_MIN_INTERVAL_NS :: i64(300_000_000) // ~300ms between advance attempts (caps idle rescans)
+
+// Stuck / obstacle detection tuning (see auto_monitor). While a target is focused we watch the
+// player->target distance: no meaningful drop for STUCK_NS while still farther than ARRIVE_DIST
+// means the character is jammed against an obstacle -> blacklist the mob and skip. Combat range
+// (d <= ARRIVE_DIST) never trips it. PROGRESS_EPS is the min drop that counts as progress.
+STUCK_NS :: i64(2_500_000_000) // ~2.5s of no progress while far -> blocked
+ARRIVE_DIST :: f32(3.0) // within this of the target = arrived / in melee; never flagged
+PROGRESS_EPS :: f32(0.5) // a distance drop >= this counts as making progress
+
+// Read the player's world position: [base+player_rva] -> the CMover*, then +pos_off (m_vPos).
+// Shared by the stuck monitor (auto_monitor) and any caller needing the live player position.
+read_player_pos :: proc(session: ^Session) -> (pos: [3]f32, ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  pt := engine.Value_Type.U64
+  if session.ptr_size == 4 {
+    pt = .U32
+  }
+  pv, pok := engine.read_value(handle, base + session.layout.player_rva, pt)
+  if !pok {
+    return {}, false
+  }
+  player := uintptr(engine.value_as_u64(pt, pv))
+  if player == 0 {
+    return {}, false
+  }
+  return engine.read_vec3(handle, player + uintptr(session.layout.pos_off))
+}
 
 // Read m_pObjFocus: world = [base+world_rva], then the CObj* at world+focus_off.
 read_focus_ptr :: proc(session: ^Session) -> (focus: uintptr, ok: bool) {
@@ -486,22 +546,98 @@ auto_stats :: proc(session: ^Session, now: i64) -> string {
   return fmt.tprintf("kill #%d  %s  %.1f/min", session.auto_count, fmt_elapsed(el), kpm)
 }
 
-// Auto-farm tick: called every ~20ms by the watcher thread while auto_on. When no live
-// target is selected (m_pObjFocus cleared on kill, or pointing at a freed object), advance
-// the focus to the next fresh mob named auto_name. Your held attack key then keeps attacking it.
+// Progress monitor for the focused mob, called every tick while a live target is selected. Detects
+// the character jamming against an obstacle: if the player->target distance stops dropping for
+// STUCK_NS while still farther than ARRIVE_DIST, the mob is unreachable -> blacklist it and clear
+// focus so the next tick re-acquires a reachable one. Reaching/attacking keeps d <= ARRIVE_DIST so
+// combat is never flagged; a kill clears focus through the normal (advance) path instead.
+auto_monitor :: proc(session: ^Session, focus: uintptr, now: i64) {
+  // New target (or first sighting) -> (re)establish the baseline; judge progress from the next tick.
+  if focus != session.auto_focus_obj {
+    session.auto_focus_obj = focus
+    session.auto_best_dist = 1e30
+    session.auto_progress_at = now
+    return
+  }
+  handle := session.proc_info.handle
+  ppos, pok := read_player_pos(session)
+  tpos, tok := engine.read_vec3(handle, focus + uintptr(session.layout.pos_off))
+  if !pok || !tok {
+    return // transient read failure; retry next tick
+  }
+  d := engine.dist_3d(ppos, tpos)
+  if d <= ARRIVE_DIST {
+    // Arrived / in melee - keep the window fresh so standing in combat never trips the monitor.
+    session.auto_best_dist = d
+    session.auto_progress_at = now
+    return
+  }
+  if d < session.auto_best_dist - PROGRESS_EPS {
+    // Closing in - real progress. Reset the stuck window.
+    session.auto_best_dist = d
+    session.auto_progress_at = now
+    return
+  }
+  // Plateaued while still far. Once that's persisted for STUCK_NS, treat the mob as unreachable.
+  if now - session.auto_progress_at >= STUCK_NS {
+    name, _ := engine.read_obj_name(handle, session.ptr_size, focus, session.layout.name_off)
+    mark_blocked(session, focus, now)
+    // Clear m_pObjFocus so the next tick advances; reset tracking + throttle so it fires promptly.
+    base := session.proc_info.base
+    pt := engine.Value_Type.U64
+    if session.ptr_size == 4 {
+      pt = .U32
+    }
+    if wv, wok := engine.read_value(handle, base + session.layout.world_rva, pt); wok {
+      world := uintptr(engine.value_as_u64(pt, wv))
+      if world != 0 {
+        engine.write_value(handle, world + uintptr(session.layout.focus_off), pt, engine.ptr_to_value(0, session.ptr_size))
+      }
+    }
+    session.auto_focus_obj = 0
+    session.auto_last = 0
+    fmt.printf("\n[auto] '%s' blocked (d=%.1f) - skipping\n", name, d)
+    fmt.print("memscan> ")
+  }
+}
+
+// Auto-farm tick: called every ~20ms by the watcher thread. When a live target is selected, run the
+// obstacle monitor (auto_monitor). When no live target is selected (m_pObjFocus cleared on kill, or
+// pointing at a freed object), advance the focus to the next fresh mob matching auto_names. Your held
+// attack key then keeps attacking it.
 auto_tick :: proc(session: ^Session) {
-  if !session.auto_on || !session.attached {
+  if !session.attached {
     return
   }
   now := time.now()._nsec
+  // Auto-off timer ('timer' command): when the deadline passes, stop auto-farm. Self-disarms even
+  // if auto is already off (silently, so a stale deadline can't kill a later run).
+  if session.auto_timer_at != 0 && now >= session.auto_timer_at {
+    was_on := session.auto_on
+    session.auto_on = false
+    session.auto_timer_at = 0
+    if was_on {
+      fmt.printf("\n[auto] timer elapsed - auto-farm OFF.  %s\n", auto_stats(session, now))
+      fmt.print("memscan> ")
+    }
+    return
+  }
+  if !session.auto_on {
+    return
+  }
+  // A live target is still selected: watch it for obstacle-stuck (every tick, unthrottled) and wait.
+  if focus, fok := read_focus_ptr(session); fok && focus != 0 && focus_obj_live(session, focus) {
+    if session.auto_stuck_on {
+      auto_monitor(session, focus, now)
+    }
+    return
+  }
+  // Focus cleared (kill) or focused obj freed -> advance to the next fresh mob. Throttle only this
+  // rescan path (not the monitor above) so idle rescans stay capped.
   if now - session.auto_last < AUTO_MIN_INTERVAL_NS {
     return
   }
-  // Busy check: a live target is still selected -> nothing to do.
-  if focus, fok := read_focus_ptr(session); fok && focus != 0 && focus_obj_live(session, focus) {
-    return
-  }
-  // Focus cleared (kill) or focused obj freed -> advance to the next fresh mob.
+  session.auto_focus_obj = 0 // reset progress tracking for the mob we're about to pick
   res, obj, d, sel, total := tc_select(session, session.auto_names[:], true)
   session.auto_last = now
   if res == .Picked {
@@ -612,6 +748,9 @@ cli_auto :: proc(session: ^Session, args: []string) {
   if len(args) == 1 && (args[0] == "off" || args[0] == "stop") {
     if session.auto_on {
       session.auto_on = false
+      session.auto_timer_at = 0 // stopping the run cancels any pending auto-off timer
+      session.auto_focus_obj = 0
+      clear(&session.auto_blocked)
       fmt.printfln("auto-farm OFF.  %s", auto_stats(session, time.now()._nsec))
     } else {
       fmt.println("auto-farm already off.")
@@ -637,6 +776,9 @@ cli_auto :: proc(session: ^Session, args: []string) {
   if session.auto_on {
     if names_equal(names[:], session.auto_names[:]) {
       session.auto_on = false
+      session.auto_timer_at = 0 // stopping the run cancels any pending auto-off timer
+      session.auto_focus_obj = 0
+      clear(&session.auto_blocked)
       fmt.printfln("auto-farm OFF.  %s", auto_stats(session, time.now()._nsec))
       return
     }
@@ -656,6 +798,8 @@ cli_auto :: proc(session: ^Session, args: []string) {
   session.auto_last = 0
   session.auto_count = 0
   session.auto_start = time.now()._nsec
+  session.auto_focus_obj = 0 // reset obstacle/stuck tracking for the new run
+  clear(&session.auto_blocked)
   session.auto_on = true
   ensure_hotkey_thread(session)
   fmt.printfln(
@@ -663,6 +807,72 @@ cli_auto :: proc(session: ^Session, args: []string) {
     auto_target_desc(session.auto_names[:]),
   )
   auto_warn_pet(session)
+}
+
+// stuck | stuck on|off -> toggle obstacle/stuck detection (auto_monitor). On by default. Disable for
+// ranged/standing playstyles that attack without closing in, where "not getting closer" is normal and
+// would otherwise be mis-read as blocked.
+cli_stuck :: proc(session: ^Session, args: []string) {
+  switch {
+  case len(args) == 0:
+    session.auto_stuck_on = !session.auto_stuck_on
+  case len(args) == 1 && args[0] == "on":
+    session.auto_stuck_on = true
+  case len(args) == 1 && args[0] == "off":
+    session.auto_stuck_on = false
+  case:
+    fmt.eprintln("usage: stuck [on|off]")
+    return
+  }
+  fmt.printfln("stuck-detection %s.", session.auto_stuck_on ? "ON" : "OFF")
+}
+
+// timer <minutes> -> auto-disable 'auto' after <minutes> elapse (e.g. 'timer 60'): a safety stop
+//                    for an unattended farm session. Absolute deadline from when you run it. If auto
+//                    is already off when it elapses it just does nothing.
+// timer           -> show the time remaining.
+// timer off | 0   -> cancel the pending timer.
+cli_timer :: proc(session: ^Session, args: []string) {
+  now := time.now()._nsec
+
+  if len(args) == 0 {
+    if session.auto_timer_at == 0 {
+      fmt.println("no auto-off timer armed.  usage: timer <minutes>   (e.g. 'timer 60')")
+      return
+    }
+    rem := session.auto_timer_at - now
+    if rem < 0 {
+      rem = 0
+    }
+    fmt.printfln("auto-off timer: %s remaining%s.", fmt_elapsed(rem), session.auto_on ? "" : "  (auto is off)")
+    return
+  }
+
+  if args[0] == "off" || args[0] == "stop" || args[0] == "cancel" {
+    session.auto_timer_at = 0
+    fmt.println("auto-off timer cancelled.")
+    return
+  }
+
+  mins, ok := strconv.parse_f64(args[0])
+  if !ok || mins < 0 {
+    fmt.eprintln("usage: timer <minutes>   (e.g. 'timer 60'; 'timer off' to cancel)")
+    return
+  }
+  if mins == 0 {
+    session.auto_timer_at = 0
+    fmt.println("auto-off timer cancelled.")
+    return
+  }
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+
+  session.auto_timer_at = now + i64(mins * 60_000_000_000.0)
+  ensure_hotkey_thread(session) // keep the watcher alive so the deadline is serviced
+  note := session.auto_on ? "" : "  (auto is off now - it will only stop a run that's in progress then.)"
+  fmt.printfln("auto-off timer armed: auto-farm OFF in %s.%s", fmt_elapsed(session.auto_timer_at - now), note)
 }
 
 REFOCUS_INTERVAL_NS :: i64(200_000_000) // ~200ms between consistent write-backs

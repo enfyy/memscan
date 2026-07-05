@@ -62,6 +62,14 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.sendsettarget_rva = uintptr(v)
   case "gdplay_rva":
     layout.gdplay_rva = uintptr(v)
+  case "land_off":
+    layout.land_off = i64(v)
+  case "landwidth_off":
+    layout.landwidth_off = i64(v)
+  case "mpu_off":
+    layout.mpu_off = i64(v)
+  case "hmap_off":
+    layout.hmap_off = i64(v)
   case:
     return false
   }
@@ -89,6 +97,10 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "mob_flag_val=0x%X", layout.mob_flag_val)
   fmt.sbprintfln(&b, "sendsettarget_rva=0x%X", layout.sendsettarget_rva)
   fmt.sbprintfln(&b, "gdplay_rva=0x%X", layout.gdplay_rva)
+  fmt.sbprintfln(&b, "land_off=0x%X", layout.land_off)
+  fmt.sbprintfln(&b, "landwidth_off=0x%X", layout.landwidth_off)
+  fmt.sbprintfln(&b, "mpu_off=0x%X", layout.mpu_off)
+  fmt.sbprintfln(&b, "hmap_off=0x%X", layout.hmap_off)
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
   return err == nil
 }
