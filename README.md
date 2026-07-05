@@ -1,9 +1,11 @@
 # memscan
 
 A small cross-process memory scanner for Windows, written in [Odin], with automation for the
-DirectX-9 game Flyff (`Neuz.exe`) layered on top. Attach to a running process and scan, refine,
+game Flyff (`Neuz.exe`) layered on top. Attach to a running process and scan, refine,
 read and write its memory from an interactive REPL. On Flyff it can find and set the selected
 combat target, enumerate nearby mobs, and hands-free farm.
+
+Do not ask for a binary. if you cant figure out how to build it by yourself by reading this document, then tough luck.
 
 ## Requirements
 
