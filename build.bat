@@ -4,7 +4,7 @@ setlocal EnableDelayedExpansion
 REM ==============================================
 REM Build Configuration
 REM ==============================================
-set "EXECUTABLE=flyff_in_2025.exe"
+set "EXECUTABLE=memscan.exe"
 set "SOURCE_DIR=src"
 set "OUTPUT_DIR=.out"
 set "DEBUG_DIR=%OUTPUT_DIR%\debug"
