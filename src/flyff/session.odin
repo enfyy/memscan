@@ -44,6 +44,7 @@ Session :: struct {
   auto_count:    int, // targets selected since auto turned on (reset on each toggle-on)
   auto_start:    i64, // time.now()._nsec when auto turned on (origin for the run timer)
   auto_timer_at: i64, // nsec deadline at which 'auto' auto-disables ('timer' cmd); 0 = disarmed
+  auto_count_limit: int, // kill quota at which 'auto' auto-disables ('count' cmd); 0 = disarmed
 
   // Obstacle / stuck detection (see auto_monitor in target.odin). Tracks progress toward the
   // focused mob; if player->target distance plateaus while still far, the mob is blacklisted

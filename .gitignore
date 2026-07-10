@@ -2,3 +2,7 @@
 /.out
 *.exe
 BACKLOG.md
+# Generated each build by tool/gen_build_hash.ps1 (see build.bat). Regenerated locally on
+# first build; never hand-edited, so kept out of version control to avoid churn.
+/src/build_hash.g.odin
+*.log

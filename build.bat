@@ -49,22 +49,27 @@ echo %BLUE%^> Creating output directories%RESET%
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
-echo %BLUE%^> %COMPILER% run %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS%%RESET%
-%COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% > "%TEMP%\build_output.txt" 2>&1
-set BUILD_ERROR=%ERRORLEVEL%
-
-set "BUILD_OUTPUT="
-for /f "delims=" %%i in ('type "%TEMP%\build_output.txt"') do (
-    set "BUILD_OUTPUT=!BUILD_OUTPUT!%%i!NL!"
+echo %BLUE%^> Generating build hash%RESET%
+powershell -NoProfile -ExecutionPolicy Bypass -File "tool\gen_build_hash.ps1"
+if %ERRORLEVEL% neq 0 (
+    echo %RED%Failed to generate build hash%RESET%
+    exit /b 1
 )
-del "%TEMP%\build_output.txt"
 
-if %BUILD_ERROR% neq 0 (
-    echo %RED%!BUILD_OUTPUT!%RESET%
+echo %BLUE%^> %COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS%%RESET%
+REM Stream odin's output straight to the console (preserves newlines/indentation and any '!' in
+REM messages - the old redirect-into-a-delayed-expansion-variable approach mangled all three) and
+REM capture only its exit code.
+%COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS%
+set "BUILD_ERROR=%ERRORLEVEL%"
+
+if not "%BUILD_ERROR%"=="0" (
+    echo %RED%^> build FAILED ^(odin exit %BUILD_ERROR%^)%RESET%
+    if "%BUILD_ERROR%"=="1104" echo %RED%  ^(LNK1104: '%EXECUTABLE%' is locked - close the running instance, then rebuild.^)%RESET%
     exit /b %BUILD_ERROR%
 )
 
-echo %GREEN%!BUILD_OUTPUT!%RESET%
+echo %GREEN%^> build OK -^> %BUILD_DIR%\%EXECUTABLE%%RESET%
 
 echo %BLUE%^> Copying resources%RESET%
 if exist "resources" (

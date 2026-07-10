@@ -87,6 +87,8 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     cli_help()
   case "quit", "exit", "q":
     return true
+  case "version", "ver":
+    cli_version()
   case "ps":
     cli_ps(args)
   case "attach":
@@ -143,6 +145,8 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_auto(session, args)
   case "timer":
     flyff.cli_timer(session, args)
+  case "kills":
+    flyff.cli_kills(session, args)
   case "stuck":
     flyff.cli_stuck(session, args)
   case "reachgate":
@@ -290,6 +294,7 @@ farming (day to day)
                              re-targets on each kill. no name = ANY monster; names comma-separated. 'auto off' stops
   pause                      toggle pause (default key: F10). killing the targeted mob resumes
   timer <minutes>            auto-disable 'auto' after N minutes (e.g. 'timer 60'); 'timer off' cancels
+  kills <n>                  auto-disable 'auto' after N confirmed kills (e.g. 'kills 100'); 'kills off' cancels
   stuck [on|off]             toggle reactive obstacle skip-detection (on by default; 'stuck off' for ranged/standing)
   reachgate [on|off]         proactively skip mobs behind walls/trees/buildings when auto-picks a target
                              (on by default; needs 'worldscan' + 'findcull' once to take effect)
@@ -339,6 +344,8 @@ deep recon (rarely needed)
   refocus                    detection test: rewrite focus to itself every ~200ms
 
 ============================================================================
+  version (ver)  print the version + build hash (compare the hash to the one build.bat
+                 printed to catch a stale build)
   help (?)   this list         quit (q)   exit
 
 chain commands on one line with ';' or '&&':

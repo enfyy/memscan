@@ -698,6 +698,22 @@ auto_stats :: proc(session: ^Session, now: i64) -> string {
   return fmt.tprintf("kill #%d  %s  %.1f/min", session.auto_count, fmt_elapsed(el), kpm)
 }
 
+// Stop condition for the 'kills' command: once the run's confirmed-kill count reaches auto_count_limit,
+// turn auto-farm off and self-disarm. Returns true if it fired (so a caller can skip advancing to a
+// next mob). No-op (returns false) while disarmed or below the quota. Mirrors the timer stop in auto_tick.
+auto_count_reached :: proc(session: ^Session, now: i64) -> bool {
+  if session.auto_count_limit == 0 || session.auto_count < session.auto_count_limit {
+    return false
+  }
+  session.auto_on = false
+  session.auto_count_limit = 0
+  session.auto_paused = false
+  session.pause_obj = 0
+  fmt.printf("\n[auto] count reached (%d kills) - auto-farm OFF.  %s\n", session.auto_count, auto_stats(session, now))
+  fmt.print("memscan> ")
+  return true
+}
+
 // Progress monitor for the focused mob, called every tick while a live target is selected. Detects
 // the character jamming against an obstacle: if the player->target distance stops dropping for
 // STUCK_NS while still farther than ARRIVE_DIST, the mob is unreachable -> blacklist it and clear
@@ -811,6 +827,7 @@ pause_resume :: proc(session: ^Session, killed_obj: uintptr, now: i64) {
   session.auto_last = 0 // advance promptly on the next tick
   fmt.printf("\n[auto] resumed (kill).  %s\n", auto_stats(session, now))
   fmt.print("memscan> ")
+  auto_count_reached(session, now) // 'kills 1' (or a mid-run re-arm at/below current count): stop right away
 }
 
 // Auto-farm tick: called every ~20ms by the watcher thread. When a live target is selected, run the
@@ -879,6 +896,10 @@ auto_tick :: proc(session: ^Session) {
       fmt.print("memscan> ")
     }
     session.auto_sel_set = false
+    // Hit the kill quota ('kills' command)? Stop before advancing so we don't grab an extra target.
+    if died && auto_count_reached(session, now) {
+      return
+    }
   }
   // Advance to the next mob. Selection itself is silent now - no print unless something died above.
   tc_select(session, session.auto_names[:], true)
@@ -977,6 +998,7 @@ cli_auto :: proc(session: ^Session, args: []string) {
     if session.auto_on {
       session.auto_on = false
       session.auto_timer_at = 0 // stopping the run cancels any pending auto-off timer
+      session.auto_count_limit = 0 // ...and any pending kill-count limit
       session.auto_focus_obj = 0
       session.auto_avoid_on = false
       session.auto_sel_set = false
@@ -1011,6 +1033,7 @@ cli_auto :: proc(session: ^Session, args: []string) {
     if names_equal(names[:], session.auto_names[:]) {
       session.auto_on = false
       session.auto_timer_at = 0 // stopping the run cancels any pending auto-off timer
+      session.auto_count_limit = 0 // ...and any pending kill-count limit
       session.auto_focus_obj = 0
       session.auto_avoid_on = false
       session.auto_sel_set = false
@@ -1159,6 +1182,54 @@ cli_timer :: proc(session: ^Session, args: []string) {
   ensure_hotkey_thread(session) // keep the watcher alive so the deadline is serviced
   note := session.auto_on ? "" : "  (auto is off now - it will only stop a run that's in progress then.)"
   fmt.printfln("auto-off timer armed: auto-farm OFF in %s.%s", fmt_elapsed(session.auto_timer_at - now), note)
+}
+
+// kills <n>  -> auto-disable 'auto' after <n> confirmed kills in the current run (e.g. 'kills 100'):
+//               a quota stop for an unattended session. The count is the run total since 'auto'
+//               started (auto resets it to 0), so 'auto <name>' then 'kills 100' stops after 100.
+//               If auto is off when the quota is hit it just does nothing.
+// kills      -> show progress (kills so far / target).
+// kills off | 0 -> cancel the pending kill quota.
+cli_kills :: proc(session: ^Session, args: []string) {
+  if len(args) == 0 {
+    if session.auto_count_limit == 0 {
+      fmt.println("no kill quota armed.  usage: kills <n>   (e.g. 'kills 100')")
+      return
+    }
+    fmt.printfln("kill quota: %d / %d%s.", session.auto_count, session.auto_count_limit, session.auto_on ? "" : "  (auto is off)")
+    return
+  }
+
+  if args[0] == "off" || args[0] == "stop" || args[0] == "cancel" {
+    session.auto_count_limit = 0
+    fmt.println("kill quota cancelled.")
+    return
+  }
+
+  n, ok := strconv.parse_int(args[0])
+  if !ok || n < 0 {
+    fmt.eprintln("usage: kills <n>   (e.g. 'kills 100'; 'kills off' to cancel)")
+    return
+  }
+  if n == 0 {
+    session.auto_count_limit = 0
+    fmt.println("kill quota cancelled.")
+    return
+  }
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+
+  session.auto_count_limit = n
+  ensure_hotkey_thread(session) // keep the watcher alive so the quota is serviced
+  // Arming at or below the current run count -> the quota is already met; stop now.
+  if session.auto_on && auto_count_reached(session, time.now()._nsec) {
+    return
+  }
+  note := session.auto_on ? "" : "  (auto is off now - it will only stop a run that's in progress then.)"
+  remaining := n - session.auto_count
+  fmt.printfln("kill quota armed: auto-farm OFF after %d more kill(s) (target %d).%s", remaining, n, note)
 }
 
 REFOCUS_INTERVAL_NS :: i64(200_000_000) // ~200ms between consistent write-backs

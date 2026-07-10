@@ -105,6 +105,7 @@ farming (day to day)
   auto [name]...             hands-free farm: re-target the next mob on each kill (hold your attack key).
                              no name = ANY monster; names comma-separated. re-issue / 'auto off' to stop
   timer <minutes>            auto-disable 'auto' after N minutes (e.g. 'timer 60'); 'timer off' cancels
+  kills <n>                  auto-disable 'auto' after N confirmed kills (e.g. 'kills 100'); 'kills off' cancels
   stuck [on|off]             toggle obstacle skip-detection (on by default; 'stuck off' for ranged/standing)
   mobs <name>                list nearby <name> movers by distance (hp, model, address)
   srvsync [on|off]           mirror each select to the server (stops the after-N-kills DC);
