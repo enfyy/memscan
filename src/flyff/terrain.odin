@@ -498,12 +498,756 @@ cli_reach :: proc(session: ^Session, args: []string) {
     label = fmt.tprintf("target '%s' (%.1f, %.1f)", nm, tx, tz)
   }
 
-  d := engine.dist_horizontal({ppos[0], 0, ppos[2]}, {tx, 0, tz})
-  blocked, hit := reach_raycast(session, world, ppos[0], ppos[2], tx, tz)
-  if blocked {
-    fmt.printfln("BLOCKED -> %s (d=%.1f): first %s at tile %d cell %d.", label, d, hattr_name(hit.attr), hit.tile, hit.cell)
+  res := compute_reach(session, world, ppos[0], ppos[1], ppos[2], tx, tz)
+  switch res.status {
+  case .Blocked_Terrain:
+    fmt.printfln("BLOCKED (terrain) -> %s (d=%.1f): first %s at tile %d cell %d.", label, res.d, hattr_name(res.thit.attr), res.thit.tile, res.thit.cell)
+  case .Blocked_Object:
+    fmt.printfln(
+      "BLOCKED (object) -> %s (d=%.1f): OBB center (%.1f,%.1f,%.1f) half-extent (%.1f,%.1f,%.1f).",
+      label, res.d, res.ohit.center[0], res.ohit.center[1], res.ohit.center[2], res.ohit.ext[0], res.ohit.ext[1], res.ohit.ext[2],
+    )
+  case .Clear:
+    note := res.oscan ? "" : "  (object scan skipped: world unresolved)"
+    fmt.printfln("CLEAR -> %s (d=%.1f): straight line to it is walkable (terrain + objects).%s", label, res.d, note)
+  }
+}
+
+// attackable (canhit) - is the CURRENTLY SELECTED mob reachable to attack? Select a mob in-game, stand
+// where you want, then run this: it reports ATTACKABLE if the straight approach to within attack_range
+// is clear (terrain grid + placed-object OBBs), else why it's blocked. This is the exact gate that
+// reach-filtered target selection will use, so it's the way to eyeball-verify the oracle: select a mob
+// across a wall or behind a tree and it should say NOT attackable.
+cli_attackable :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if !terrain_ready(session) {
+    fmt.eprintln("terrain not calibrated - run 'worldscan' first.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  ps := session.ptr_size
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  L := session.layout
+  world := read_ptr_at(handle, base + L.world_rva, pt)
+  player := read_ptr_at(handle, base + L.player_rva, pt)
+  if world == 0 || player == 0 {
+    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    return
+  }
+  focus := read_ptr_at(handle, world + uintptr(L.focus_off), pt)
+  if focus == 0 || !in_module_range(read_ptr_at(handle, focus, pt), base, mod_end) {
+    fmt.eprintln("no live mob selected. Click a monster in-game (keep it selected), then run 'attackable'.")
+    return
+  }
+  ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
+  tpos, tok := engine.read_vec3(handle, focus + uintptr(L.pos_off))
+  if !pok || !tok {
+    fmt.eprintln("couldn't read player/target position.")
+    return
+  }
+  nm, _ := engine.read_obj_name(handle, ps, focus, L.name_off)
+
+  res := compute_reach(session, world, ppos[0], ppos[1], ppos[2], tpos[0], tpos[2])
+  switch res.status {
+  case .Clear:
+    rng_note := res.in_range ? fmt.tprintf("in range (%d) - shoot now", L.attack_range) : "out of range - walk up first"
+    fmt.printfln("ATTACKABLE: '%s' (d=%.1f) - straight line clear (terrain + objects); %s.", nm, res.d, rng_note)
+  case .Blocked_Terrain:
+    fmt.printfln("NOT attackable: '%s' (d=%.1f) - blocked by terrain (%s) at tile %d cell %d.", nm, res.d, hattr_name(res.thit.attr), res.thit.tile, res.thit.cell)
+  case .Blocked_Object:
+    fmt.printfln(
+      "NOT attackable: '%s' (d=%.1f) - blocked by an object: OBB center (%.1f,%.1f,%.1f) half-extent (%.1f,%.1f,%.1f).",
+      nm, res.d, res.ohit.center[0], res.ohit.center[1], res.ohit.center[2], res.ohit.ext[0], res.ohit.ext[1], res.ohit.ext[2],
+    )
+  }
+}
+
+// attrmap [radius] [step] - ASCII map of terrain attributes around the player, one char per cell.
+// Reveals invisible walls (NOWALK/NOMOVE bands) that the point-probe 'attr' can't show at a glance.
+//   '.' walkable(NONE)  'w' NOWALK  'f' NOFLY  '#' NOMOVE(wall)  'X' DIE  ' ' off-world  '@' you
+// radius is in world units (default 40); step defaults to the map's mpu (one char == one grid cell).
+cli_attrmap :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if !terrain_ready(session) {
+    fmt.eprintln("terrain not calibrated - run 'worldscan' first.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  ps := session.ptr_size
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  L := session.layout
+  world := read_ptr_at(handle, base + L.world_rva, pt)
+  player := read_ptr_at(handle, base + L.player_rva, pt)
+  if world == 0 || player == 0 {
+    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    return
+  }
+  ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
+  if !pok {
+    fmt.eprintln("couldn't read player position.")
+    return
+  }
+
+  radius := f32(40)
+  if len(args) >= 1 {
+    if r, ok := strconv.parse_f64(args[0]); ok && r > 0 {
+      radius = f32(r)
+    }
+  }
+  mpu := world_mpu(session, world)
+  step := f32(mpu)
+  if len(args) >= 2 {
+    if s, ok := strconv.parse_f64(args[1]); ok && s > 0 {
+      step = f32(s)
+    }
+  }
+  half := int(radius / step)
+  half = clamp(half, 1, 60) // keep the grid console-friendly
+
+  counts: [5]int // indexed by HATTR_*
+  unresolved := 0
+
+  fmt.printfln(
+    "attrmap centered on player (%.1f, %.1f, %.1f); %d cells/side, step %.1f (mpu %d).",
+    ppos[0], ppos[1], ppos[2], half, step, mpu,
+  )
+  fmt.println("  legend: '.' walkable  'w' NOWALK  'f' NOFLY  '#' NOMOVE(wall)  'X' DIE  ' ' off-world  '@' you")
+  fmt.println("  rows: +Z (north) at top -> -Z at bottom;  cols: -X (west) left -> +X (east) right")
+
+  b := strings.builder_make(context.temp_allocator)
+  for zi := half; zi >= -half; zi -= 1 { // top row = +Z
+    strings.builder_reset(&b)
+    wz := ppos[2] + f32(zi) * step
+    for xi := -half; xi <= half; xi += 1 {
+      wx := ppos[0] + f32(xi) * step
+      ch: u8 = '.'
+      if xi == 0 && zi == 0 {
+        ch = '@'
+      } else if wa, wok := world_attr_at(session, world, wx, wz); wok {
+        counts[wa.attr] += 1
+        switch wa.attr {
+        case HATTR_NOWALK:
+          ch = 'w'
+        case HATTR_NOFLY:
+          ch = 'f'
+        case HATTR_NOMOVE:
+          ch = '#'
+        case HATTR_DIE:
+          ch = 'X'
+        case:
+          ch = '.'
+        }
+      } else {
+        ch = ' '
+        unresolved += 1
+      }
+      strings.write_byte(&b, ch)
+    }
+    fmt.println(strings.to_string(b))
+  }
+  fmt.printfln(
+    "  cells: NONE=%d NOWALK=%d NOFLY=%d NOMOVE=%d DIE=%d off-world=%d",
+    counts[HATTR_NONE], counts[HATTR_NOWALK], counts[HATTR_NOFLY], counts[HATTR_NOMOVE], counts[HATTR_DIE], unresolved,
+  )
+  if counts[HATTR_NOWALK] == 0 && counts[HATTR_NOMOVE] == 0 && counts[HATTR_DIE] == 0 {
+    fmt.println("  -> NO blocked terrain cells in view. So either open ground, OR the obstacle is an")
+    fmt.println("     OBJECT (not in the attribute grid), OR worldscan mis-pinned the offsets.")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// objects - enumerate nearby CObj (any type) + locate CObj::m_OBB, for the object-collision layer
+// ---------------------------------------------------------------------------
+
+// Classic Flyff CObj m_dwType enum (OT_MOVER=5 is confirmed = our mover_type).
+ot_name :: proc(t: u32) -> string {
+  switch t {
+  case 0:
+    return "OBJ"
+  case 1:
+    return "SFX"
+  case 2:
+    return "ITEM"
+  case 3:
+    return "CTRL"
+  case 4:
+    return "PATH"
+  case 5:
+    return "MOVER"
+  case 6:
+    return "REGION"
+  }
+  return "?"
+}
+
+Obj_Rec :: struct {
+  obj:       uintptr,
+  ty:        u32,
+  idx:       u32,
+  dist:      f32,
+  pos:       [3]f32,
+  center:    [3]f32,
+  ext:       [3]f32,
+  has_model: bool,
+  obb_off:   i64,
+  obb_ok:    bool,
+}
+
+// Locate CObj::m_OBB in one object by finding the vec3 (Center) in [pos_off-0x50, pos_off) whose xz
+// matches the object's position AND whose following Axis[0] (at +0x18) is unit-length. The unit-axis
+// test rejects m_matWorld's translation row (._41.._43), which also matches xz but isn't an OBB.
+// BBOX layout (xUtil3D.h): Center(+0x0) Extent[3](+0xC) Axis[3](+0x18); sizeof 0x3C.
+find_obb :: proc(session: ^Session, obj: uintptr, pos: [3]f32) -> (off: i64, center, ext: [3]f32, ok: bool) {
+  handle := session.proc_info.handle
+  pos_off := session.layout.pos_off
+  WIN :: 0x50
+  buf: [WIN]byte
+  n, rok := engine.read_into(handle, obj + uintptr(pos_off - WIN), buf[:])
+  if !rok {
+    return
+  }
+  rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
+  best_err := f32(1e9)
+  best_k := -1
+  k := 0
+  for k + 0x24 <= int(n) {
+    cx, cy, cz := rf(buf[:], k), rf(buf[:], k + 4), rf(buf[:], k + 8)
+    ax, ay, az := rf(buf[:], k + 0x18), rf(buf[:], k + 0x1C), rf(buf[:], k + 0x20)
+    alen := math.sqrt(ax * ax + ay * ay + az * az)
+    xz := math.abs(cx - pos[0]) + math.abs(cz - pos[2])
+    _ = cy
+    if xz < 2.0 && math.abs(alen - 1.0) < 0.1 && xz < best_err {
+      best_err = xz
+      best_k = k
+    }
+    k += 4
+  }
+  if best_k < 0 {
+    return
+  }
+  off = pos_off - WIN + i64(best_k)
+  center = {rf(buf[:], best_k), rf(buf[:], best_k + 4), rf(buf[:], best_k + 8)}
+  ext = {rf(buf[:], best_k + 0xC), rf(buf[:], best_k + 0x10), rf(buf[:], best_k + 0x14)}
+  ok = true
+  return
+}
+
+// objects [radius] - enumerate nearby CObj of ANY type (not just movers) via the world-ptr scan, and
+// auto-locate CObj::m_OBB per object. Static props (trees/rocks = OT_OBJ) that the terrain grid misses
+// show up here; this is the recon that grounds the object-collision reach layer.
+cli_objects :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if session.ptr_size != 4 {
+    fmt.eprintln("objects: 32-bit Flyff client only.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  ps := session.ptr_size
+  pt := engine.Value_Type.U32
+  L := session.layout
+
+  radius := f32(30)
+  if len(args) >= 1 {
+    if r, ok := strconv.parse_f64(args[0]); ok && r > 0 {
+      radius = f32(r)
+    }
+  }
+
+  ppos, pok := read_player_pos(session)
+  if !pok {
+    fmt.eprintln("objects: couldn't read player position.")
+    return
+  }
+  wv, wok := engine.read_value(handle, base + L.world_rva, pt)
+  if !wok {
+    fmt.eprintln("objects: world not resolved - run 'calibrate'.")
+    return
+  }
+  world := uintptr(engine.value_as_u64(pt, wv))
+  wval := engine.ptr_to_value(world, ps)
+  all := engine.collect_regions(handle, true)
+  defer delete(all)
+  set := engine.scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
+
+  recs := make([dynamic]Obj_Rec, context.temp_allocator)
+  seen := make([dynamic]uintptr, context.temp_allocator)
+  outer: for m in set.matches {
+    obj := uintptr(i64(m.addr) - L.field_off)
+    for s in seen {
+      if s == obj {
+        continue outer
+      }
+    }
+    vt, vtok := engine.read_value(handle, obj, pt)
+    if !vtok {
+      continue
+    }
+    vtable := uintptr(engine.value_as_u64(pt, vt))
+    if vtable < base || vtable >= mod_end {
+      continue // no module vtable -> not a CObj
+    }
+    pos, posok := engine.read_vec3(handle, obj + uintptr(L.pos_off))
+    if !posok {
+      continue
+    }
+    dist := engine.dist_horizontal({ppos[0], 0, ppos[2]}, {pos[0], 0, pos[2]})
+    if dist > radius {
+      continue
+    }
+    append(&seen, obj)
+    ty := u32(read_i32_at(handle, obj + uintptr(L.pos_off + 0x10)))
+    idx := u32(read_i32_at(handle, obj + uintptr(L.pos_off + 0x14)))
+    model := read_ptr_at(handle, obj + uintptr(L.model_off), pt)
+    off, center, ext, obb_ok := find_obb(session, obj, pos)
+    append(&recs, Obj_Rec{obj, ty, idx, dist, pos, center, ext, is_heap_ptr(session, model), off, obb_ok})
+  }
+
+  // sort by distance (selection sort; the near-set is small)
+  for i in 0 ..< len(recs) {
+    mn := i
+    for j in i + 1 ..< len(recs) {
+      if recs[j].dist < recs[mn].dist {
+        mn = j
+      }
+    }
+    recs[i], recs[mn] = recs[mn], recs[i]
+  }
+
+  fmt.printfln("objects within %.0f of player (%.1f, %.1f, %.1f): %d found.", radius, ppos[0], ppos[1], ppos[2], len(recs))
+  fmt.println("  addr        type       idx   dist  model  m_OBB   center (x,y,z)            half-extent (x,y,z)")
+  obb_votes := make(map[i64]int, 8, context.temp_allocator)
+  for r in recs {
+    obb := "  -  "
+    if r.obb_ok {
+      obb = fmt.tprintf("0x%X", r.obb_off)
+      obb_votes[r.obb_off] += 1
+    }
+    fmt.printfln(
+      "  0x%08X  %-6s(%d)  %-4d  %5.1f  %-4v  %-6s (%8.1f,%8.1f,%8.1f)  (%6.1f,%6.1f,%6.1f)",
+      r.obj, ot_name(r.ty), r.ty, r.idx, r.dist, r.has_model, obb, r.center[0], r.center[1], r.center[2], r.ext[0], r.ext[1], r.ext[2],
+    )
+  }
+  // Report the consensus m_OBB offset.
+  best_off: i64 = 0
+  best_votes := 0
+  for off, v in obb_votes {
+    if v > best_votes {
+      best_votes = v
+      best_off = off
+    }
+  }
+  if best_votes > 0 {
+    fmt.printfln("  => CObj::m_OBB offset = 0x%X  (%d/%d objects agree; expected 0x124).", best_off, best_votes, len(recs))
   } else {
-    fmt.printfln("CLEAR -> %s (d=%.1f): straight path is walkable.", label, d)
+    fmt.println("  => no OBB located (no object had a Center matching its position with a unit axis).")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// object-collision reach: segment vs each nearby OBB (placed props the grid misses)
+// ---------------------------------------------------------------------------
+
+Obb :: struct {
+  center: [3]f32,
+  ext:    [3]f32, // HALF-extents
+  axis:   [3][3]f32, // orthonormal box axes
+}
+
+// Read CObj::m_OBB (BBOX at pos_off-0x3C): Center(+0x0), Extent[3](+0xC), Axis[3][3](+0x18). sizeof 0x3C.
+read_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, ok: bool) {
+  handle := session.proc_info.handle
+  off := session.layout.pos_off - 0x3C
+  buf: [0x3C]byte
+  n, rok := engine.read_into(handle, obj + uintptr(off), buf[:])
+  if !rok || n < 0x3C {
+    return
+  }
+  rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
+  o.center = {rf(buf[:], 0), rf(buf[:], 4), rf(buf[:], 8)}
+  o.ext = {rf(buf[:], 0xC), rf(buf[:], 0x10), rf(buf[:], 0x14)}
+  o.axis[0] = {rf(buf[:], 0x18), rf(buf[:], 0x1C), rf(buf[:], 0x20)}
+  o.axis[1] = {rf(buf[:], 0x24), rf(buf[:], 0x28), rf(buf[:], 0x2C)}
+  o.axis[2] = {rf(buf[:], 0x30), rf(buf[:], 0x34), rf(buf[:], 0x38)}
+  ok = true
+  return
+}
+
+dot3 :: proc(a, b: [3]f32) -> f32 {return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]}
+
+// Is point p inside the OBB? Used to skip boxes we already stand within (e.g. under a tree's canopy -
+// the OBB bounds the whole silhouette but the real collision is the small trunk mesh, so being inside
+// the box is NOT being blocked). Keeps the loose OBB from flagging every direction as obstructed.
+point_in_obb :: proc(p: [3]f32, o: Obb) -> bool {
+  for i in 0 ..< 3 {
+    if math.abs(dot3(p - o.center, o.axis[i])) > o.ext[i] {
+      return false
+    }
+  }
+  return true
+}
+
+// Segment (p0->p1) vs OBB via slab clip in the box's local frame. Mirrors IntrSegment3Box3_Test.
+seg_vs_obb :: proc(p0, p1: [3]f32, o: Obb) -> bool {
+  s0, d: [3]f32
+  for i in 0 ..< 3 {
+    s0[i] = dot3(p0 - o.center, o.axis[i])
+    d[i] = dot3(p1 - o.center, o.axis[i]) - s0[i]
+  }
+  tmin := f32(0)
+  tmax := f32(1)
+  for i in 0 ..< 3 {
+    if math.abs(d[i]) < 1e-6 {
+      if s0[i] < -o.ext[i] || s0[i] > o.ext[i] {
+        return false // segment parallel to this slab and outside it
+      }
+    } else {
+      t1 := (-o.ext[i] - s0[i]) / d[i]
+      t2 := (o.ext[i] - s0[i]) / d[i]
+      if t1 > t2 {
+        t1, t2 = t2, t1
+      }
+      if t1 > tmin {tmin = t1}
+      if t2 < tmax {tmax = t2}
+      if tmin > tmax {
+        return false
+      }
+    }
+  }
+  return true
+}
+
+// Horizontal distance from point (px,pz) to segment (ax,az)-(bx,bz). Prune for the object scan.
+seg_dist_2d :: proc(px, pz, ax, az, bx, bz: f32) -> f32 {
+  dx := bx - ax
+  dz := bz - az
+  l2 := dx * dx + dz * dz
+  t := f32(0)
+  if l2 > 1e-6 {
+    t = clamp(((px - ax) * dx + (pz - az) * dz) / l2, 0, 1)
+  }
+  cx := ax + t * dx
+  cz := az + t * dz
+  return math.sqrt((px - cx) * (px - cx) + (pz - cz) * (pz - cz))
+}
+
+// Test one CObj at `obj` against the knee-height segment. One windowed read covers vtable + m_OBB +
+// m_vPos + m_dwType. is_cobj=false means `obj` has no in-module vtable (not a live CObj) - the cull
+// walk uses that to stop at the end of the live prefix. Filters to OT_OBJ / OT_CTRL and prunes by
+// distance to the line before the slab test.
+obj_obb_blocks :: proc(session: ^Session, obj: uintptr, ax, az, bx, bz, knee: f32) -> (hit: bool, obb: Obb, is_cobj: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  po := int(session.layout.pos_off)
+  wlen := po + 0x1C
+  if wlen > 512 {
+    return // implausible pos_off
+  }
+  buf: [512]byte
+  n, rok := engine.read_into(handle, obj, buf[:wlen])
+  if !rok || int(n) < wlen {
+    return
+  }
+  vt := uintptr(rd_u32le(buf[:], 0))
+  if vt < base || vt >= mod_end {
+    return // not a live CObj
+  }
+  is_cobj = true
+  ty := rd_u32le(buf[:], po + 0x10)
+  if ty != 0 && ty != 3 {
+    return // OT_OBJ (trees/rocks/buildings) or OT_CTRL (walls/railings/housing) only
+  }
+  rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
+  px, pz := rf(buf[:], po), rf(buf[:], po + 8)
+  if seg_dist_2d(px, pz, ax, az, bx, bz) > 48 {
+    return // too far from the line (loose; seg_vs_obb is the exact test)
+  }
+  oo := po - 0x3C
+  obb.center = {rf(buf[:], oo), rf(buf[:], oo + 4), rf(buf[:], oo + 8)}
+  obb.ext = {rf(buf[:], oo + 0xC), rf(buf[:], oo + 0x10), rf(buf[:], oo + 0x14)}
+  obb.axis[0] = {rf(buf[:], oo + 0x18), rf(buf[:], oo + 0x1C), rf(buf[:], oo + 0x20)}
+  obb.axis[1] = {rf(buf[:], oo + 0x24), rf(buf[:], oo + 0x28), rf(buf[:], oo + 0x2C)}
+  obb.axis[2] = {rf(buf[:], oo + 0x30), rf(buf[:], oo + 0x34), rf(buf[:], oo + 0x38)}
+  if point_in_obb({ax, knee, az}, obb) {
+    return // already inside it (under a canopy / standing at it) - not an approach blocker
+  }
+  hit = seg_vs_obb({ax, knee, az}, {bx, knee, bz}, obb)
+  return
+}
+
+// Test the knee-height segment player(ax,ay,az)->(bx,_,bz) against nearby collidable props (OT_OBJ +
+// OT_CTRL, the two sets ProcessCollision uses). FAST path: walk the game's on-screen display array
+// m_aobjCull (aobjcull_rva) - a handful of reads, no memory scan. Fallback (aobjcull_rva==0): the full
+// world-ptr scan. ok_scan=false => world anchor didn't resolve.
+obj_segment_blocked :: proc(session: ^Session, ax, ay, az, bx, bz: f32) -> (blocked: bool, hit: Obb, ok_scan: bool) {
+  if session.ptr_size != 4 {
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  pt := engine.Value_Type.U32
+  L := session.layout
+  knee := ay + 0.4
+
+  // FAST: read the on-screen display list and test each entry until the live prefix ends.
+  if L.aobjcull_rva != 0 {
+    ok_scan = true
+    CAP :: 8192
+    idx := make([]byte, CAP * 4, context.temp_allocator)
+    n, _ := engine.read_into(handle, base + L.aobjcull_rva, idx)
+    for k in 0 ..< int(n) / 4 {
+      p := uintptr(rd_u32le(idx, k * 4))
+      if p < 0x10000 {
+        break // null slot = past the live entries
+      }
+      h, o, is_cobj := obj_obb_blocks(session, p, ax, az, bx, bz, knee)
+      if !is_cobj {
+        break // first non-CObj slot = end of the live cull prefix
+      }
+      if h {
+        return true, o, true
+      }
+    }
+    return false, {}, true
+  }
+
+  // SLOW fallback: scan all writable memory for CObj (each holds m_pWorld at field_off).
+  wv, wok := engine.read_value(handle, base + L.world_rva, pt)
+  if !wok {
+    return
+  }
+  world := uintptr(engine.value_as_u64(pt, wv))
+  if world == 0 {
+    return
+  }
+  ok_scan = true
+  wval := engine.ptr_to_value(world, session.ptr_size)
+  all := engine.collect_regions(handle, true)
+  defer delete(all)
+  set := engine.scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
+  seen := make([dynamic]uintptr, context.temp_allocator)
+  outer: for m in set.matches {
+    obj := uintptr(i64(m.addr) - L.field_off)
+    for s in seen {
+      if s == obj {
+        continue outer
+      }
+    }
+    append(&seen, obj)
+    h, o, _ := obj_obb_blocks(session, obj, ax, az, bx, bz, knee)
+    if h {
+      return true, o, true
+    }
+  }
+  return false, {}, true
+}
+
+Reach_Status :: enum {
+  Clear, // straight line player->target is walkable (terrain + objects)
+  Blocked_Terrain, // an invisible wall / cliff / water cell on the line
+  Blocked_Object, // a placed prop (tree/rock/building) OBB on the line
+}
+
+Reach_Res :: struct {
+  status:   Reach_Status,
+  d:        f32, // horizontal player->target distance
+  in_range: bool, // d <= attack_range - informational ONLY, never bypasses the obstruction test
+  thit:     World_Attr, // set when Blocked_Terrain
+  ohit:     Obb, // set when Blocked_Object
+  oscan:    bool, // did the object scan run (world resolved)
+}
+
+// The one reachability check shared by `reach` and `attackable`. Tests the FULL straight line
+// player->(tx,tz) for obstruction: terrain grid first, then placed-object OBBs. Being within
+// attack_range does NOT skip the test (a mob can be close yet walled off) - it's returned as a flag.
+// Matches the game: it runs you straight at the mob and shoots straight at it, so the whole line to the
+// mob must be clear.
+compute_reach :: proc(session: ^Session, world: uintptr, px, py, pz, tx, tz: f32) -> Reach_Res {
+  L := session.layout
+  d := engine.dist_horizontal({px, 0, pz}, {tx, 0, tz})
+  in_range := L.attack_range > 0 && d <= f32(L.attack_range)
+  if tblocked, thit := reach_raycast(session, world, px, pz, tx, tz); tblocked {
+    return {status = .Blocked_Terrain, d = d, in_range = in_range, thit = thit, oscan = true}
+  }
+  oblocked, ohit, oscan := obj_segment_blocked(session, px, py, pz, tx, tz)
+  if oblocked {
+    return {status = .Blocked_Object, d = d, in_range = in_range, ohit = ohit, oscan = oscan}
+  }
+  return {status = .Clear, d = d, in_range = in_range, oscan = oscan}
+}
+
+// reachdbg - explain the object check for the SELECTED mob: list every nearby OT_OBJ/OT_CTRL with its
+// OBB, distance-to-line, and which filter (type / prune / enclosing) accepted or rejected it, plus the
+// slab-test result. This is how we find why a verdict is wrong. Read-only.
+cli_reachdbg :: proc(session: ^Session, args: []string) {
+  if !session.attached || session.ptr_size != 4 {
+    fmt.eprintln("attach a 32-bit Neuz first.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  ps := session.ptr_size
+  pt := engine.Value_Type.U32
+  L := session.layout
+  world := read_ptr_at(handle, base + L.world_rva, pt)
+  player := read_ptr_at(handle, base + L.player_rva, pt)
+  if world == 0 || player == 0 {
+    fmt.eprintln("world/player not resolved.")
+    return
+  }
+  focus := read_ptr_at(handle, world + uintptr(L.focus_off), pt)
+  if focus == 0 || !in_module_range(read_ptr_at(handle, focus, pt), base, mod_end) {
+    fmt.eprintln("select a mob first (reachdbg explains the check for the selected target).")
+    return
+  }
+  ppos, _ := engine.read_vec3(handle, player + uintptr(L.pos_off))
+  tpos, _ := engine.read_vec3(handle, focus + uintptr(L.pos_off))
+  nm, _ := engine.read_obj_name(handle, ps, focus, L.name_off)
+  ax, ay, az := ppos[0], ppos[1], ppos[2]
+  bx, bz := tpos[0], tpos[2]
+  knee := ay + 0.4
+  d := engine.dist_horizontal({ax, 0, az}, {bx, 0, bz})
+  fmt.printfln("reachdbg -> '%s'  player (%.1f,%.1f,%.1f) -> target (%.1f,%.1f,%.1f)  d=%.1f", nm, ax, ay, az, bx, tpos[1], bz, d)
+
+  tblocked, thit := reach_raycast(session, world, ax, az, bx, bz)
+  fmt.printfln("  terrain: %s", tblocked ? fmt.tprintf("BLOCKED (%s tile %d cell %d)", hattr_name(thit.attr), thit.tile, thit.cell) : "clear")
+
+  wval := engine.ptr_to_value(world, ps)
+  all := engine.collect_regions(handle, true)
+  defer delete(all)
+  set := engine.scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
+  fmt.println("  nearby OT_OBJ/OT_CTRL vs the line (dseg=center dist to line; in=you inside it; HIT=slab hit):")
+  fmt.println("    type       center (x,y,z)            half-ext (x,y,z)       dseg  in   knee-HIT")
+  seen := make([dynamic]uintptr, context.temp_allocator)
+  shown := 0
+  outer: for m in set.matches {
+    obj := uintptr(i64(m.addr) - L.field_off)
+    for s in seen {
+      if s == obj {continue outer}
+    }
+    vt := read_ptr_at(handle, obj, pt)
+    if vt < base || vt >= mod_end {continue}
+    ty := u32(read_i32_at(handle, obj + uintptr(L.pos_off + 0x10)))
+    if ty != 0 && ty != 3 {continue} // OT_OBJ or OT_CTRL only
+    pos, posok := engine.read_vec3(handle, obj + uintptr(L.pos_off))
+    if !posok {continue}
+    append(&seen, obj)
+    dseg := seg_dist_2d(pos[0], pos[2], ax, az, bx, bz)
+    if dseg > 80 {continue} // loose: only report objects plausibly near the line
+    o, ook := read_obb(session, obj)
+    if !ook {continue}
+    in_start := point_in_obb({ax, knee, az}, o)
+    hit := seg_vs_obb({ax, knee, az}, {bx, knee, bz}, o)
+    fmt.printfln(
+      "    %-6s(%d)  (%8.1f,%8.1f,%8.1f)  (%5.1f,%5.1f,%5.1f)  %5.1f  %-3v  %v",
+      ot_name(ty), ty, o.center[0], o.center[1], o.center[2], o.ext[0], o.ext[1], o.ext[2], dseg, in_start, hit,
+    )
+    shown += 1
+    if shown >= 30 {
+      fmt.println("    ... (capped at 30)")
+      break
+    }
+  }
+  fmt.println("  a would-be blocker = a row with HIT=true and in=false. current obj_segment_blocked also")
+  fmt.println("  requires type=OBJ and dseg<=16, so anything failing those is a candidate bug.")
+}
+
+// findcull - locate the static CObj* CWorld::m_aobjCull[] on-screen display array (the fast replacement
+// for the full memory scan). Enumerate all loaded CObj once, then scan the module image for the longest
+// run of contiguous pointers into that set - that run is m_aobjCull. Read-only recon.
+cli_findcull :: proc(session: ^Session, args: []string) {
+  if !session.attached || session.ptr_size != 4 {
+    fmt.eprintln("attach a 32-bit Neuz first.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  size := int(session.proc_info.module_size)
+  mod_end := base + uintptr(size)
+  pt := engine.Value_Type.U32
+  L := session.layout
+  world := read_ptr_at(handle, base + L.world_rva, pt)
+  if world == 0 {
+    fmt.eprintln("world not resolved.")
+    return
+  }
+  wval := engine.ptr_to_value(world, session.ptr_size)
+  all := engine.collect_regions(handle, true)
+  set := engine.scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
+  delete(all)
+  objset := make(map[uintptr]bool, 8192, context.temp_allocator)
+  for m in set.matches {
+    obj := uintptr(i64(m.addr) - L.field_off)
+    vt := read_ptr_at(handle, obj, pt)
+    if vt >= base && vt < mod_end {
+      objset[obj] = true
+    }
+  }
+  fmt.printfln("findcull: %d loaded CObj; scanning %d KB module image for the display array...", len(objset), size / 1024)
+  img := make([]byte, size, context.temp_allocator)
+  engine.read_into(handle, base, img)
+  Run :: struct {
+    off: int,
+    len: int,
+  }
+  runs := make([dynamic]Run, context.temp_allocator)
+  cur_off, cur_len := -1, 0
+  i := 0
+  for i + 4 <= size {
+    v := uintptr(rd_u32le(img, i))
+    if v in objset {
+      if cur_len == 0 {cur_off = i}
+      cur_len += 1
+    } else {
+      if cur_len >= 8 {append(&runs, Run{cur_off, cur_len})}
+      cur_len = 0
+    }
+    i += 4
+  }
+  if cur_len >= 8 {append(&runs, Run{cur_off, cur_len})}
+  if len(runs) == 0 {
+    fmt.eprintln("findcull: no CObj*-array run found. Are you in-game with objects visible?")
+    return
+  }
+  for a in 0 ..< len(runs) {
+    mx := a
+    for b in a + 1 ..< len(runs) {
+      if runs[b].len > runs[mx].len {mx = b}
+    }
+    runs[a], runs[mx] = runs[mx], runs[a]
+  }
+  fmt.println("  candidate CObj* arrays (longest first); the on-screen display list is m_aobjCull:")
+  for r, k in runs {
+    if k >= 8 {break}
+    e0 := uintptr(rd_u32le(img, r.off))
+    ty := u32(read_i32_at(handle, e0 + uintptr(L.pos_off + 0x10)))
+    fmt.printfln("    Neuz.exe+0x%X  len=%d  first-entry type=%s(%d)", uintptr(r.off), r.len, ot_name(ty), ty)
+  }
+  // Auto-save when the longest run clearly dominates (m_aobjCull is far bigger than incidental arrays).
+  best := runs[0]
+  if best.len >= 200 && (len(runs) == 1 || best.len >= 2 * runs[1].len) {
+    session.layout.aobjcull_rva = uintptr(best.off)
+    fmt.printfln("  => aobjcull_rva = 0x%X (fast object reach enabled).", best.off)
+    if flyff_save_cfg(session.layout, flyff_cfg_path()) {
+      fmt.println("  saved to flyff.cfg.")
+    }
+  } else {
+    fmt.println("  => ambiguous (no dominant array). Pick the display list and 'set aobjcull_rva 0x<off>'.")
   }
 }
 

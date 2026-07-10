@@ -146,39 +146,23 @@ cli_idscan :: proc(session: ^Session, args: []string) {
   }
 }
 
-// A pet<->player link candidate: a 4-byte field at +off that references you, either as your
-// player objid (id=true) or as a pointer to your player object (id=false).
-Owner_Cand :: struct {
-  off: int,
-  id:  bool,
-}
-
-// findowner <pet-name> -> find how the client links your pet/mount to you, so auto's no-name /
-// any-monster mode can skip your own summons. Summon the pet, run this with its exact name (keep a
-// few wild monsters on screen for the cross-check). It searches the pet for a field that references
-// YOU - either your objid (m_idOwner) or a pointer to your player object (m_pMaster) - keeps the one
-// that is 0 on wild monsters, and auto-sets owner_off. The runtime exclusion compares that field
-// against BOTH your objid and your player pointer, so either link works. If the pet holds no
-// back-reference within the window, it instead reports any forward link in the PLAYER object
-// (m_idPet / m_pPet) for diagnosis. Read-only except the cfg write.
-cli_findowner :: proc(session: ^Session, args: []string) {
+// findaii -> DIAGNOSTIC (RE only; not the gate - that's `findprop`). With a mover selected it scans
+// the OBJECT for per-object AI-region fields that differ between the selection and the nearby crowd,
+// and `findaii <off> <off> ...` dumps the selected object's raw u32 at those offsets. Used to prove
+// that the client doesn't carry a usable AI type ON the object (only your stat pet gets AII_PET/EGG
+// there) - the real classification is per-species via GetProp()->dwAI, which `findprop` reads. Read-only.
+cli_findaii :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
   }
-  if len(args) < 1 {
-    fmt.eprintln("usage: findowner <pet-name>   (summon your pet/mount first)")
-    return
-  }
-  L := session.layout
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  LEN :: 0x8000
-
   handle := session.proc_info.handle
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
   ps := session.ptr_size
   pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  L := session.layout
+  LEN :: 0x4000
 
   wv, wok := engine.read_value(handle, base + L.world_rva, pt)
   pv, pok := engine.read_value(handle, base + L.player_rva, pt)
@@ -188,211 +172,232 @@ cli_findowner :: proc(session: ^Session, args: []string) {
   }
   world := uintptr(engine.value_as_u64(pt, wv))
   player := uintptr(engine.value_as_u64(pt, pv))
-  pptr := u32(player) // your player object as a 32-bit pointer (m_pMaster would hold this)
 
-  // Your objid (for the id-link search). Not fatal if objid_off is unset - we can still match the
-  // pointer link; id matching is just disabled.
-  player_objid: u32 = 0
-  if L.objid_off != 0 {
-    if oiv, oiok := engine.read_value(handle, player + uintptr(L.objid_off), .U32); oiok {
-      player_objid = u32(engine.value_as_u64(.U32, oiv))
+  fp, fok := engine.read_value(handle, world + uintptr(L.focus_off), pt)
+  if !fok {
+    fmt.eprintln("could not read the selection (focus_off) - run calibrate / findfocus first.")
+    return
+  }
+  focus := uintptr(engine.value_as_u64(pt, fp))
+  if focus == 0 || focus == player {
+    fmt.eprintln("target your PET (or any known NON-monster) first, then run findaii.")
+    return
+  }
+  fvt, fvtok := engine.read_value(handle, focus, pt)
+  if !fvtok || !in_module_range(uintptr(engine.value_as_u64(pt, fvt)), base, mod_end) ||
+     engine.read_obj_type(handle, focus, L.pos_off) != L.mover_type {
+    fmt.eprintln("the selected object isn't a live mover - target your pet and retry.")
+    return
+  }
+  fnm, _ := engine.read_obj_name(handle, ps, focus, L.name_off)
+  ref := make([]byte, LEN, context.temp_allocator)
+  engine.read_into(handle, focus, ref)
+
+  // Offset-dump mode: `findaii 0x190 0x3F0C ...` prints the SELECTED object's raw u32 at each given
+  // offset. Run it on a pet, then a known monster, then an NPC to compare the same offsets by hand.
+  if len(args) > 0 {
+    fmt.printfln("findaii dump for selected '%s':", fnm)
+    for a in args {
+      off, ok := engine.parse_addr(a)
+      if !ok {
+        fmt.printfln("  %s: bad offset", a)
+        continue
+      }
+      if int(off) + 4 > LEN {
+        fmt.printfln("  +0x%X: beyond the %d-byte scan window", off, LEN)
+        continue
+      }
+      v := rd_u32le(ref, int(off))
+      fmt.printfln("  +0x%X = %d (0x%X)", off, v, v)
     }
+    return
   }
 
-  // Enumerate movers: your pet(s) (name matches, keep buffer + address) + a monster sample.
+  // Sample nearby movers (the "crowd" - mostly monsters, plus players/NPCs). Exclude self + the ref.
   wval := engine.ptr_to_value(world, ps)
   all := engine.collect_regions(handle, true)
   defer delete(all)
   set := engine.scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
-  pets := make([dynamic][]byte, context.temp_allocator)
-  pet_addrs := make([dynamic]uintptr, context.temp_allocator)
-  mobs := make([dynamic][]byte, context.temp_allocator)
+  bufs := make([dynamic][]byte, context.temp_allocator)
   for m in set.matches {
     obj := uintptr(i64(m.addr) - L.field_off)
+    if obj == player || obj == focus {
+      continue
+    }
     vt, vok := engine.read_value(handle, obj, pt)
     if !vok || !in_module_range(uintptr(engine.value_as_u64(pt, vt)), base, mod_end) {
       continue
     }
-    if engine.read_obj_type(handle, obj, L.pos_off) != L.mover_type || obj == player {
-      continue
-    }
-    nm, nok := engine.read_obj_name(handle, ps, obj, L.name_off)
-    if !nok {
+    if engine.read_obj_type(handle, obj, L.pos_off) != L.mover_type {
       continue
     }
     b := make([]byte, LEN, context.temp_allocator)
     engine.read_into(handle, obj, b)
-    if strings.equal_fold(nm, name) {
-      append(&pets, b)
-      append(&pet_addrs, obj)
-    } else if len(mobs) < 80 {
-      append(&mobs, b)
+    append(&bufs, b)
+    if len(bufs) >= 120 {
+      break
     }
   }
-  fmt.printfln(
-    "findowner '%s': player=0x%X objid=%d (0x%X); %d matching mover(s), %d monsters sampled.",
-    name,
-    player,
-    player_objid,
-    player_objid,
-    len(pets),
-    len(mobs),
-  )
-  if len(pets) == 0 {
-    fmt.println("no mover with that exact name. Summon the pet, verify the name (exact, case-insensitive), and retry.")
+  nmov := len(bufs)
+  fmt.printfln("findaii: using selected '%s' as the non-monster reference; scanned vs %d nearby movers.", fnm, nmov)
+  if nmov < 5 {
+    fmt.println("need a few monsters on screen too. Stand where monsters are visible (pet targeted) and retry.")
     return
   }
 
-  // Primary + reliable: exclude by the pet's mover-prop species id (m_dwIndex at pos_off+0x14). It's
-  // stable across re-summons (unlike the objid) and distinct from monster species ids. This alone
-  // makes any-monster mode skip the pet; the objid links below are attempted only for extra precision.
-  pet_index := rd_u32le(pets[0], int(L.pos_off) + 0x14)
-  if pet_index != 0 {
-    session.layout.pet_index = pet_index
-    fmt.printfln("pet_index = %d - '%s' species id (m_dwIndex); any-monster mode will now skip it.", pet_index, name)
-    if flyff_save_cfg(session.layout, flyff_cfg_path()) {
-      fmt.println("saved to flyff.cfg.")
+  // Fallback discriminator report: the pet's species id (m_dwIndex @ pos+0x14) is unique to the pet,
+  // so if ~no monster shares it, excluding that species also works.
+  sp_off := int(L.pos_off) + 0x14
+  ref_sp := rd_u32le(ref, sp_off)
+  same_sp := 0
+  for b in bufs {
+    if rd_u32le(b, sp_off) == ref_sp {
+      same_sp += 1
     }
-  } else {
-    fmt.println("WARNING: read the pet's m_dwIndex as 0 (unexpected) - falling back to the objid links below.")
   }
+  fmt.printfln("  ref species (m_dwIndex @ +0x%X) = %d; %d/%d crowd movers share it.", sp_off, ref_sp, same_sp, nmov)
 
-  // --- Direction 1: pet -> you. Offsets where EVERY pet holds your objid (id) or your pointer. ---
-  raw := make([dynamic]Owner_Cand, context.temp_allocator)
-  off := 0
-  for off + 4 <= LEN {
-    all_id := player_objid != 0
-    all_ptr := true
-    for b in pets {
+  // Find the AI-type field WITHOUT assuming enum numbers (this modded build may have remapped both the
+  // offset AND the values). Scan the whole object for the offset where the crowd strongly agrees on one
+  // small value (the monster consensus) but the selected pet holds a DIFFERENT small value - AND where
+  // almost no monster shares the pet's value (that last part separates the real type field from mere
+  // proximity/size flags, which many close monsters share with the pet).
+  Cand :: struct {
+    off:    int,
+    petv:   u32,
+    mv:     int, // crowd modal small value (the monster consensus)
+    mc:     int, // crowd count sharing mv
+    shares: int, // crowd count sharing the pet's value (i.e. other pets)
+    big:    int,
+  }
+  cands := make([dynamic]Cand, context.temp_allocator)
+  for off := 0; off + 4 <= LEN; off += 4 {
+    petv := rd_u32le(ref, off)
+    if petv >= 256 {
+      continue // the AI-type value is a small enum, not a pointer/id/float
+    }
+    cnt: [256]int
+    big := 0
+    for b in bufs {
       v := rd_u32le(b, off)
-      if v != player_objid {
-        all_id = false
-      }
-      if v != pptr {
-        all_ptr = false
+      if v < 256 {
+        cnt[v] += 1
+      } else {
+        big += 1
       }
     }
-    if all_id {
-      append(&raw, Owner_Cand{off, true})
-    } else if all_ptr {
-      append(&raw, Owner_Cand{off, false})
+    if big * 5 > nmov {
+      continue // mostly pointer/float/id field
     }
-    off += 4
+    mv, mc := 0, 0
+    for c, v in cnt {
+      if c > mc {
+        mc = c
+        mv = v
+      }
+    }
+    if mc * 2 < nmov {
+      continue // no strong single-value consensus among the crowd
+    }
+    if u32(mv) == petv {
+      continue // pet agrees with the crowd here - not a discriminator
+    }
+    append(&cands, Cand{off, petv, mv, mc, cnt[petv], big})
   }
-  if len(raw) > 0 {
-    // Prefer candidates that are 0 on all sampled monsters (m_pMaster/m_idOwner is NULL/0 on wild
-    // mobs), which rejects a coincidental shared value.
-    best := make([dynamic]Owner_Cand, context.temp_allocator)
-    for c in raw {
-      zero := true
-      for b in mobs {
-        if rd_u32le(b, c.off) != 0 {
-          zero = false
-          break
-        }
-      }
-      if zero {
-        append(&best, c)
-      }
-    }
-    pick := best
-    tag := " (0 on all sampled monsters)"
-    if len(best) == 0 {
-      pick = raw
-      tag = ""
-    }
-    fmt.printfln("pet -> you back-reference candidate(s)%s:", tag)
-    for c in pick {
-      fmt.printfln("  +0x%X  (%s)", c.off, c.id ? "your objid" : "pointer to you")
-    }
-    if len(pick) == 1 {
-      session.layout.owner_off = i64(pick[0].off)
-      fmt.printfln("owner_off = 0x%X (auto-set; matches your %s).", pick[0].off, pick[0].id ? "objid" : "player pointer")
-      if flyff_save_cfg(session.layout, flyff_cfg_path()) {
-        fmt.println("saved to flyff.cfg. 'auto' (no-name / any-monster) will now skip your pet.")
-      }
-    } else {
-      fmt.println("multiple candidates - the owner/master field is the stable one. 'set owner_off 0x..' then verify 'auto' skips the pet.")
-    }
+  if len(cands) == 0 {
+    fmt.println("no field separates the pet from the monster crowd in the first 0x4000 bytes.")
+    fmt.println("Tell me and I'll widen the window or switch to a pet-vs-known-monster capture diff.")
     return
   }
-
-  // --- Direction 2: you -> pet (diagnostic). Does the PLAYER object reference the pet? ---
-  pbuf := make([]byte, LEN, context.temp_allocator)
-  engine.read_into(handle, player, pbuf)
-  pet_obj := pet_addrs[0]
-  petptr := u32(pet_obj)
-  pet_objid: u32 = 0
-  if L.objid_off != 0 {
-    if piv, piok := engine.read_value(handle, pet_obj + uintptr(L.objid_off), .U32); piok {
-      pet_objid = u32(engine.value_as_u64(.U32, piv))
+  slice.sort_by(cands[:], proc(a, b: Cand) -> bool {
+    if a.shares != b.shares {
+      return a.shares < b.shares // fewest monsters sharing the pet's value first = most likely the type field
     }
+    return a.mc > b.mc
+  })
+  fmt.println("fields where the crowd agrees on one value but the pet differs (best candidates first;")
+  fmt.println("the AI-type field has crowd-sharing-pet-val ~0 - no monster is a pet):")
+  shown := 0
+  for c in cands {
+    if shown >= 40 {
+      fmt.printfln("  ... (%d more)", len(cands) - shown)
+      break
+    }
+    extra := c.big > 0 ? fmt.tprintf("  big=%d", c.big) : ""
+    fmt.printfln(
+      "  +0x%X  pet=%d  crowd-consensus=%d (x%d/%d)  crowd-sharing-pet-val=%d%s",
+      c.off, c.petv, c.mv, c.mc, nmov, c.shares, extra,
+    )
+    shown += 1
   }
-  fwd := make([dynamic]Owner_Cand, context.temp_allocator)
-  off = 0
-  for off + 4 <= LEN {
-    v := rd_u32le(pbuf, off)
-    if pet_objid != 0 && v == pet_objid {
-      append(&fwd, Owner_Cand{off, true})
-    } else if v == petptr {
-      append(&fwd, Owner_Cand{off, false})
-    }
-    off += 4
-  }
-  fmt.printfln("no pet->you reference within +0x%X. pet=0x%X pet_objid=%d.", LEN, pet_obj, pet_objid)
-  if len(fwd) > 0 {
-    fmt.println("the PLAYER object references the pet at:")
-    for c in fwd {
-      fmt.printfln("  +0x%X  (%s)", c.off, c.id ? "pet objid" : "pointer to pet")
-    }
-    // An objid slot (m_idPet) is the one we can wire: at runtime we read [player+pet_id_off] and
-    // skip the mover whose m_objid matches. A single such slot -> auto-set. (A pointer-to-pet slot
-    // would go stale if the pet object reallocates, so we don't auto-wire that.)
-    id_slots := make([dynamic]int, context.temp_allocator)
-    for c in fwd {
-      if c.id {
-        append(&id_slots, c.off)
-      }
-    }
-    if len(id_slots) == 1 {
-      session.layout.pet_id_off = i64(id_slots[0])
-      fmt.printfln("pet_id_off = 0x%X (auto-set; your player object holds the pet's objid here).", id_slots[0])
-      if flyff_save_cfg(session.layout, flyff_cfg_path()) {
-        fmt.println("saved to flyff.cfg. 'auto' (no-name / any-monster) will now skip your pet.")
-      }
-    } else if len(id_slots) > 1 {
-      fmt.println("multiple pet-objid slots - pick the stable one with 'set pet_id_off 0x..', then verify 'auto' skips the pet.")
-    } else {
-      fmt.println("only a pointer-to-pet slot found (goes stale on re-summon); paste this and I'll wire it specially.")
-    }
-  } else {
-    fmt.println("no extra objid link found either way - that's fine, pet_index (species id) above already excludes the pet.")
-  }
+  fmt.println("--> paste this; the top rows (pet differs, ~0 monsters share the pet's value) are m_dwAIInterface.")
 }
 
-// findmobflag <pet-name> -> find a MONSTER-category field so any-monster auto skips ALL pets/players/
-// NPCs, not just your own pet. Summon your pet and stand where 2+ monster SPECIES are visible, then
-// run this: it diffs your pet against the monster sample and reports offsets where the monsters agree
-// on one value ACROSS >=2 species (so it's a category field, not a species id) while your pet differs.
-// The right one is a mob-kind/belligerence flag. Wire it with 'set mob_flag_off 0x.. ; set mob_flag_val ..'
-// (any-monster mode then requires [mover+mob_flag_off]==mob_flag_val). Read-only. Verify captains still
-// share the value before trusting it. Needs a multi-species sample - single-species spots can't tell a
-// category flag from a species id.
-cli_findmobflag :: proc(session: ^Session, args: []string) {
+// Read a mover's species id (m_dwIndex @ pos_off+0x14).
+read_species :: proc(session: ^Session, obj: uintptr) -> (u32, bool) {
+  v, ok := engine.read_value(session.proc_info.handle, obj + uintptr(session.layout.pos_off + SPECIES_REL), .U32)
+  if !ok {
+    return 0, false
+  }
+  return u32(engine.value_as_u64(.U32, v)), true
+}
+
+// All addresses in writable memory whose 4-byte value == <val>. Used by findprop to anchor the
+// MoverProp array (record[i].dwID == i). Temp-allocated.
+scan_u32_addrs :: proc(session: ^Session, val: u32) -> [dynamic]uintptr {
+  handle := session.proc_info.handle
+  regions := engine.collect_regions(handle, true)
+  defer delete(regions)
+  set := engine.scan_exact_regions(handle, .U32, engine.ptr_to_value(uintptr(val), 4), regions[:], nil, context.temp_allocator)
+  out := make([dynamic]uintptr, context.temp_allocator)
+  for m in set.matches {
+    append(&out, uintptr(m.addr))
+  }
+  return out
+}
+
+// Read GetProp()->dwAI for a species id off an already-resolved prop-array base (uses the layout's
+// current stride/ai_off). -1 on read failure.
+read_prop_ai :: proc(session: ^Session, propbase: uintptr, id: u32) -> i64 {
+  addr := propbase + uintptr(i64(id) * session.layout.moverprop_stride + session.layout.moverprop_ai_off)
+  if v, ok := engine.read_value(session.proc_info.handle, addr, .U32); ok {
+    return i64(u32(engine.value_as_u64(.U32, v)))
+  }
+  return -1
+}
+
+// Human-readable verdict for a species' GetProp()->dwAI under the any-monster gate.
+aii_verdict :: proc(ai: i64) -> string {
+  switch ai {
+  case 2:
+    return "AII_MONSTER -> TARGETED by auto any"
+  case 5:
+    return "AII_PET -> excluded"
+  case 9:
+    return "AII_EGG -> excluded"
+  case 0:
+    return "AII_NONE (NPC) -> excluded"
+  case 1:
+    return "AII_MOVER (player/mover) -> excluded"
+  }
+  return "excluded (not AII_MONSTER)"
+}
+
+// findprop -> derive the species MoverProp-array gate for "auto any": propmover_rva / moverprop_stride
+// / moverprop_ai_off. TARGET your PET (target_closest <pet>) with a few monsters on screen, then run it.
+// The client resolves a mob's AI class as GetProp()->dwAI = m_pPropMover[m_dwIndex].dwAI - a flat array
+// indexed by species. Since record[i].dwID == i, this locates the array base + stride from the live
+// species ids on screen, then finds dwAI's column (your pet reads AII_PET=5/EGG=9, monsters read
+// AII_MONSTER=2) and the stable global-pointer RVA. Saves flyff.cfg. Read-only except the cfg write.
+cli_findprop :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
   }
-  if len(args) < 1 {
-    fmt.eprintln("usage: findmobflag <pet-name>   (summon pet; stand where 2+ monster species are visible)")
-    return
-  }
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  LEN :: 0x8000
-
   handle := session.proc_info.handle
   base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
+  size := session.proc_info.module_size
+  mod_end := base + uintptr(size)
   ps := session.ptr_size
   pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
   L := session.layout
@@ -405,16 +410,73 @@ cli_findmobflag :: proc(session: ^Session, args: []string) {
   }
   world := uintptr(engine.value_as_u64(pt, wv))
   player := uintptr(engine.value_as_u64(pt, pv))
-  idx_off := int(L.pos_off) + 0x14 // m_dwIndex (species id)
 
+  // `findprop check <species_id>` -> look up a species' prop dwAI + szName directly (no target needed).
+  if len(args) >= 2 && args[0] == "check" {
+    if idv, idok := engine.parse_addr(args[1]); idok {
+      if !prop_gate_ready(session) {
+        fmt.eprintln("prop gate not configured - run findprop (pet targeted) first.")
+        return
+      }
+      pb, pbok := engine.read_value(handle, base + L.propmover_rva, pt)
+      if !pbok {
+        fmt.eprintln("couldn't resolve the prop-array pointer.")
+        return
+      }
+      propbase := uintptr(engine.value_as_u64(pt, pb))
+      sp := u32(idv)
+      ai := read_prop_ai(session, propbase, sp)
+      nb: [24]byte
+      engine.read_into(handle, propbase + uintptr(i64(sp) * L.moverprop_stride + 4), nb[:])
+      end := 0
+      for end < len(nb) && nb[end] >= 0x20 && nb[end] < 0x7F {
+        end += 1
+      }
+      fmt.printfln("findprop check: species=%d szName='%s' dwAI=%d  %s", sp, string(nb[:end]), ai, aii_verdict(ai))
+      return
+    }
+  }
+
+  fp, fok := engine.read_value(handle, world + uintptr(L.focus_off), pt)
+  if !fok {
+    fmt.eprintln("could not read the selection - run calibrate / findfocus first.")
+    return
+  }
+  focus := uintptr(engine.value_as_u64(pt, fp))
+  if focus == 0 || focus == player {
+    fmt.eprintln("target your PET first (target_closest <pet name>), with monsters on screen, then run findprop.")
+    return
+  }
+  focus_id, fidok := read_species(session, focus)
+  if !fidok || focus_id == 0 || focus_id > 0xFFFF {
+    fmt.eprintln("couldn't read the pet's species id - retry with the pet targeted.")
+    return
+  }
+  fnm, _ := engine.read_obj_name(handle, ps, focus, L.name_off)
+
+  // `findprop check` -> classify the currently-targeted mob via the configured prop gate (verify).
+  if len(args) >= 1 && args[0] == "check" {
+    if !prop_gate_ready(session) {
+      fmt.eprintln("prop gate not configured - run findprop (pet targeted) first.")
+      return
+    }
+    pb, pbok := engine.read_value(handle, base + L.propmover_rva, pt)
+    if !pbok {
+      fmt.eprintln("couldn't resolve the prop-array pointer.")
+      return
+    }
+    ai := read_prop_ai(session, uintptr(engine.value_as_u64(pt, pb)), focus_id)
+    fmt.printfln("findprop check: '%s' species=%d dwAI=%d  %s", fnm, focus_id, ai, aii_verdict(ai))
+    return
+  }
+
+  // Gather distinct live species ids (anchors for the array-identity solve).
   wval := engine.ptr_to_value(world, ps)
-  all := engine.collect_regions(handle, true)
-  defer delete(all)
-  set := engine.scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
-  pets := make([dynamic][]byte, context.temp_allocator)
-  mobs := make([dynamic][]byte, context.temp_allocator)
-  mob_sp := make([dynamic]u32, context.temp_allocator) // each monster's species id (m_dwIndex)
-  for m in set.matches {
+  regions0 := engine.collect_regions(handle, true)
+  set0 := engine.scan_exact_regions(handle, pt, wval, regions0[:], nil, context.temp_allocator)
+  delete(regions0)
+  ids := make([dynamic]u32, context.temp_allocator)
+  for m in set0.matches {
     obj := uintptr(i64(m.addr) - L.field_off)
     if obj == player {
       continue
@@ -426,126 +488,222 @@ cli_findmobflag :: proc(session: ^Session, args: []string) {
     if engine.read_obj_type(handle, obj, L.pos_off) != L.mover_type {
       continue
     }
-    nm, nok := engine.read_obj_name(handle, ps, obj, L.name_off)
-    if !nok {
-      continue
-    }
-    b := make([]byte, LEN, context.temp_allocator)
-    engine.read_into(handle, obj, b)
-    if strings.equal_fold(nm, name) {
-      append(&pets, b)
-    } else if len(mobs) < 80 {
-      append(&mobs, b)
-      append(&mob_sp, rd_u32le(b, idx_off))
-    }
-  }
-  n := len(mobs)
-  // count distinct species in the whole sample (sanity)
-  species := make([dynamic]u32, context.temp_allocator)
-  for s in mob_sp {
-    dup := false
-    for x in species {
-      if x == s {
-        dup = true
-        break
+    if id, ok := read_species(session, obj); ok && id != 0 && id <= 0xFFFF {
+      dup := false
+      for x in ids {
+        if x == id {
+          dup = true
+          break
+        }
+      }
+      if !dup {
+        append(&ids, id)
       }
     }
-    if !dup {
-      append(&species, s)
+  }
+  dup := false
+  for x in ids {
+    if x == focus_id {
+      dup = true
+      break
     }
   }
-  fmt.printfln("findmobflag '%s': %d pet(s), %d other movers (%d distinct species) sampled.", name, len(pets), n, len(species))
-  if len(pets) == 0 {
-    fmt.println("no mover with that exact name - summon the pet and retry.")
-    return
+  if !dup {
+    append(&ids, focus_id)
   }
-  if n < 6 || len(species) < 2 {
-    fmt.println("need >=6 other movers spanning >=2 monster species on screen (else a species id looks like a category flag). Move to a busier/mixed spot and retry.")
+  if len(ids) < 4 {
+    fmt.println("need more species variety on screen (a few different monsters + your pet). Move and retry.")
     return
   }
 
-  Cand :: struct {
-    off:   int,
-    mval:  u32, // value the monsters share
-    pval:  u32, // your pet's value at this offset
-    cnt:   int, // monsters holding mval
-    sp:    int, // distinct species holding mval
-  }
-  cands := make([dynamic]Cand, context.temp_allocator)
-  off := 0
-  for off + 4 <= LEN {
-    // modal value among monsters at this offset
-    bestv: u32 = 0
-    bestc := 0
-    for i in 0 ..< n {
-      v := rd_u32le(mobs[i], off)
-      c := 0
-      for j in 0 ..< n {
-        if rd_u32le(mobs[j], off) == v {
-          c += 1
-        }
-      }
-      if c > bestc {
-        bestc = c
-        bestv = v
-      }
-    }
-    // strong agreement + pet differs -> maybe a category field
-    if bestc * 100 >= n * 85 && rd_u32le(pets[0], off) != bestv {
-      // distinct species among monsters holding bestv (>=2 => category-level, not a species id)
-      seen := make([dynamic]u32, context.temp_allocator)
-      for i in 0 ..< n {
-        if rd_u32le(mobs[i], off) == bestv {
-          s := mob_sp[i]
-          dup := false
-          for x in seen {
-            if x == s {
-              dup = true
-              break
-            }
-          }
-          if !dup {
-            append(&seen, s)
-          }
-        }
-      }
-      if len(seen) >= 2 {
-        append(&cands, Cand{off, bestv, rd_u32le(pets[0], off), bestc, len(seen)})
-      }
-    }
-    off += 4
-  }
-  slice.sort_by(cands[:], proc(a, b: Cand) -> bool {
-    if a.sp != b.sp {
-      return a.sp > b.sp
-    }
-    return a.cnt > b.cnt
-  })
-  fmt.printfln("%d monster-category candidate(s) (monsters agree across >=2 species, pet differs):", len(cands))
-  if len(cands) == 0 {
-    fmt.println("none found. Either the sample wasn't varied enough, or the pet/monster split isn't a simple 4-byte field in +0x8000. Paste a monster 'dump' + pet 'dump' and I'll look by hand.")
+  // Anchor1 = the pet's id (definitely valid). Some of the "live species" are garbage from coincidental
+  // world-ptr scan hits, so don't trust the single largest id; try several plausible ones (<= 5000).
+  // record[i].dwID == i, so for the right (R0, stride): u32(R0 + i*stride) == i for every real id.
+  anchor1 := focus_id
+  hitsA := scan_u32_addrs(session, anchor1)
+  if len(hitsA) == 0 {
+    fmt.println("pet species value not found in memory - retry with the pet targeted.")
     return
   }
-  shown := 0
-  for c in cands {
-    if shown >= 24 {
-      fmt.printfln("  ... (%d more)", len(cands) - shown)
+  cand2 := make([dynamic]u32, context.temp_allocator)
+  for id in ids {
+    if id == anchor1 || id > 5000 {
+      continue
+    }
+    seen := false
+    for x in cand2 {
+      if x == id {
+        seen = true
+        break
+      }
+    }
+    if !seen {
+      append(&cand2, id)
+    }
+  }
+  if len(cand2) == 0 {
+    fmt.println("need at least two distinct plausible species on screen.")
+    return
+  }
+  slice.sort(cand2[:]) // ascending; iterate from the back (largest ids = rarest in memory)
+  fmt.printfln("findprop: pet '%s' species %d; %d live species; anchor %d x%d; locating array...", fnm, focus_id, len(ids), anchor1, len(hitsA))
+
+  best_r0 := i64(0)
+  best_stride := i64(0)
+  best_score := 0
+  good := max(12, len(ids) / 3)
+  tried := 0
+  anchors: for k := len(cand2) - 1; k >= 0; k -= 1 {
+    if tried >= 8 {
       break
     }
-    fmt.printfln(
-      "  +0x%X  monster=0x%X (%d/%d, %d species)  pet=0x%X   -> set mob_flag_off 0x%X ; set mob_flag_val 0x%X",
-      c.off,
-      c.mval,
-      c.cnt,
-      n,
-      c.sp,
-      c.pval,
-      c.off,
-      c.mval,
-    )
-    shown += 1
+    anchor2 := cand2[k]
+    hitsB := scan_u32_addrs(session, anchor2)
+    if len(hitsB) == 0 || len(hitsB) > 40000 {
+      continue // not found, or too common to pair efficiently
+    }
+    tried += 1
+    span := i64(anchor1) - i64(anchor2)
+    if span == 0 {
+      continue
+    }
+    pre_id := u32(0)
+    for id in ids {
+      if id != anchor1 && id != anchor2 {
+        pre_id = id
+        break
+      }
+    }
+    for a in hitsA {
+      aa := i64(a)
+      for b in hitsB {
+        d := aa - i64(b)
+        if d > 0x8000000 || d < -0x8000000 {
+          continue // records of one array are within ~128MB
+        }
+        if d % span != 0 {
+          continue
+        }
+        stride := d / span
+        if stride < 0x80 || stride > 0x20000 || stride % 4 != 0 {
+          continue
+        }
+        r0 := aa - i64(anchor1) * stride
+        if r0 <= 0 {
+          continue
+        }
+        // Cheap pre-check on a third id before the full validation (skips coincidental strides fast).
+        if pre_id != 0 {
+          if v, ok := engine.read_value(handle, uintptr(r0 + i64(pre_id) * stride), .U32);
+             !ok || u32(engine.value_as_u64(.U32, v)) != pre_id {
+            continue
+          }
+        }
+        score := 0
+        for id in ids {
+          if v, ok := engine.read_value(handle, uintptr(r0 + i64(id) * stride), .U32); ok &&
+             u32(engine.value_as_u64(.U32, v)) == id {
+            score += 1
+          }
+        }
+        if score > best_score {
+          best_score = score
+          best_r0 = r0
+          best_stride = stride
+        }
+      }
+    }
+    if best_score >= good {
+      break anchors
+    }
   }
-  fmt.println("pick one whose monster value ALSO holds for captains/bosses (check a 'dump' of one), then set the two fields; any-monster auto will then skip everything that isn't that.")
+  min_score := max(8, len(ids) / 4)
+  if best_score < min_score {
+    fmt.printfln("couldn't lock the prop array (best %d/%d ids matched). Retry with more monster species on screen.", best_score, len(ids))
+    return
+  }
+  r0 := best_r0
+  stride := best_stride
+  fmt.printfln("  array located: record[i].dwID matched %d/%d live species; stride 0x%X.", best_score, len(ids), stride)
+
+  // propbase (record[0] start) + stable global-pointer RVA. m_pPropMover points at record[0]; dwID is
+  // usually the first record field, but allow a small lead-in offset.
+  propbase := uintptr(0)
+  propmover_rva := uintptr(0)
+  for doff := i64(0); doff <= 0x40; doff += 4 {
+    cand := uintptr(r0 - doff)
+    hits := engine.scan_image_for_ptr(handle, base, size, cand, ps, context.temp_allocator)
+    if len(hits) > 0 {
+      propbase = cand
+      propmover_rva = hits[0] - base
+      break
+    }
+  }
+  if propbase == 0 {
+    fmt.printfln("  located the array (record[0].dwID @ 0x%X, stride 0x%X) but couldn't find the global", r0, stride)
+    fmt.println("  m_pPropMover pointer in the module image - paste this and I'll widen the pointer search.")
+    return
+  }
+
+  // dwAI column: an ENUM field, so every species record reads a small AII value (0..14 or 100). It's
+  // the all-enum column where the PET reads its own AII type (AII_PET=5 / AII_EGG=9) and at least some
+  // live species read AII_MONSTER(2); pick the one with the most monsters (the gate keeps those). No
+  // fixed monster-fraction threshold - a farm area can have few distinct AII_MONSTER species on screen.
+  ai_off := i64(-1)
+  best_two := -1
+  lim := stride < 0x600 ? stride : 0x600
+  for off := i64(0); off + 4 <= lim; off += 4 {
+    pav, paok := engine.read_value(handle, propbase + uintptr(i64(focus_id) * stride + off), .U32)
+    if !paok {
+      continue
+    }
+    pv := u32(engine.value_as_u64(.U32, pav))
+    if pv != 5 && pv != 9 {
+      continue // the pet's species reads AII_PET or AII_EGG at the real dwAI column
+    }
+    all_enum := true
+    two := 0
+    for id in ids {
+      v, ok := engine.read_value(handle, propbase + uintptr(i64(id) * stride + off), .U32)
+      if !ok {
+        all_enum = false
+        break
+      }
+      vv := u32(engine.value_as_u64(.U32, v))
+      if !(vv <= 14 || vv == 100) {
+        all_enum = false
+        break
+      }
+      if vv == 2 {
+        two += 1
+      }
+    }
+    if all_enum && two >= 1 && two > best_two {
+      best_two = two
+      ai_off = off
+    }
+  }
+  if ai_off < 0 {
+    fmt.printfln("  found the array (propbase 0x%X rva 0x%X stride 0x%X) but not a clean dwAI column.", propbase, propmover_rva, stride)
+    fmt.print("  pet record dump (+off=value):")
+    for o := i64(0); o < 0x180; o += 4 {
+      if v, ok := engine.read_value(handle, propbase + uintptr(i64(focus_id) * stride + o), .U32); ok {
+        fmt.printf(" +0x%X=%d", o, u32(engine.value_as_u64(.U32, v)))
+      }
+    }
+    fmt.println("")
+    return
+  }
+
+  session.layout.propmover_rva = propmover_rva
+  session.layout.moverprop_stride = stride
+  session.layout.moverprop_ai_off = ai_off
+  pet_ai := read_prop_ai(session, propbase, focus_id)
+  fmt.printfln("  propmover_rva=0x%X moverprop_stride=0x%X moverprop_ai_off=0x%X", propmover_rva, stride, ai_off)
+  fmt.printfln("  validation: pet '%s' (species %d) dwAI=%d; %d/%d live species read AII_MONSTER(2).", fnm, focus_id, pet_ai, best_two, len(ids))
+  if flyff_save_cfg(session.layout, flyff_cfg_path()) {
+    fmt.println("saved to flyff.cfg. run 'auto off' then 'auto any' - it now skips pets / eggs / NPCs / players by species.")
+  }
 }
 
 // One SendSetTarget call-target candidate (see rank_settarget_cands).

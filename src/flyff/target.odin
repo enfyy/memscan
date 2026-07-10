@@ -12,6 +12,7 @@ import "../engine"
 TC_Cand :: struct {
   obj: uintptr,
   d:   f32,
+  pos: [3]f32, // mob world position (for the post-stuck opposite-direction retarget)
 }
 
 // A mob target_closest recently selected. We skip these for TC_RECENT_NS so a just-killed
@@ -77,6 +78,31 @@ mark_blocked :: proc(session: ^Session, obj: uintptr, now: i64) {
   append(&session.auto_blocked, TC_Recent{obj = obj, t = now})
 }
 
+// Proactive reach gate: is the straight approach to <cand_pos> clear (terrain grid + object OBBs)?
+// Stays inert (returns true) when the FAST object path (aobjcull_rva) isn't set, so the gate never runs
+// the slow full-memory scan inside the pick loop; compute_reach's terrain part self-noops if terrain
+// isn't calibrated. Selecting an unreachable mob just makes the character jam - this skips it up front.
+cand_reachable :: proc(session: ^Session, world: uintptr, player_pos, cand_pos: [3]f32) -> bool {
+  if session.layout.aobjcull_rva == 0 {
+    return true
+  }
+  res := compute_reach(session, world, player_pos[0], player_pos[1], player_pos[2], cand_pos[0], cand_pos[2])
+  return res.status == .Clear
+}
+
+// Shared candidate-skip test for the auto picker passes: skip a mob if recently targeted,
+// stuck-blacklisted, or (when `gate`) proactively unreachable. Manual target_closest passes gate=false
+// so it still honours an explicit pick behind cover.
+tc_skip_cand :: proc(session: ^Session, world: uintptr, player_pos: [3]f32, c: TC_Cand, now: i64, gate: bool) -> bool {
+  if tc_seen_recently(session, c.obj, now) || obj_blocked_recently(session, c.obj, now) {
+    return true
+  }
+  if gate && !cand_reachable(session, world, player_pos, c.pos) {
+    return true
+  }
+  return false
+}
+
 // Debug: append everything we know about the object we're about to select to
 // tc_targets.log (in the cwd), flushed before the focus write. The GAME crashes on a
 // bad selection, not memscan, so memscan survives and the LAST entry in the log is
@@ -109,7 +135,7 @@ log_target :: proc(session: ^Session, obj: uintptr, world: uintptr, sel, total: 
     fmt.sbprint(sb, "\n")
   }
 
-  name, _ := engine.read_obj_name(handle, session.ptr_size, obj, session.layout.name_off)
+  name, _ := read_mover_name(session, obj)
   pos, _ := engine.read_vec3(handle, obj + uintptr(session.layout.pos_off))
   mpw := rdp(handle, obj + uintptr(session.layout.field_off), pt)
   prev := rdp(handle, world + uintptr(session.layout.focus_off), pt)
@@ -159,7 +185,8 @@ name_matches :: proc(name: string, names: []string) -> bool {
 // focused object's model to draw the selection), so this is used BOTH as the enumeration filter
 // AND as the re-check done immediately before the focus write - objects can be freed/reallocated
 // in between. NOTE: an empty <names> matches any mover including NPCs/other players; the caller
-// (tc_collect_cands) excludes the player object, but not peaceful NPCs.
+// (tc_collect_cands) excludes the player object and, in any-monster mode, applies the AII gate that
+// keeps only attackable monsters (m_dwAIInterface == AII_MONSTER).
 obj_is_selectable :: proc(session: ^Session, obj: uintptr, names: []string) -> bool {
   handle := session.proc_info.handle
   base := session.proc_info.base
@@ -179,9 +206,10 @@ obj_is_selectable :: proc(session: ^Session, obj: uintptr, names: []string) -> b
   if engine.read_obj_type(handle, obj, session.layout.pos_off) != session.layout.mover_type {
     return false // movers only
   }
-  // Name gate: an empty list matches any mover (auto with no name); otherwise require a match.
+  // Name gate: an empty list matches any mover (auto with no name); otherwise require a match. Uses the
+  // species prop name (reliable) so named auto works even for mobs whose inline name buffer misreads.
   if len(names) > 0 {
-    nm, nok := engine.read_obj_name(handle, session.ptr_size, obj, session.layout.name_off)
+    nm, nok := read_mover_name(session, obj)
     if !nok || !name_matches(nm, names) {
       return false
     }
@@ -206,22 +234,91 @@ obj_is_selectable :: proc(session: ^Session, obj: uintptr, names: []string) -> b
   return true
 }
 
+// True if the species prop-table gate is configured (findprop has run): the array pointer RVA and
+// the record stride are both known. The AI offset may legitimately be small, so it isn't required.
+prop_gate_ready :: proc(session: ^Session) -> bool {
+  return session.layout.propmover_rva != 0 && session.layout.moverprop_stride != 0
+}
+
+// Read a mover's species AI class the way the client does: GetProp()->dwAI, i.e.
+// [propbase + m_dwIndex*stride + moverprop_ai_off]. <propbase> is the already-resolved MoverProp
+// array base. Returns 0xFFFFFFFF on any read failure or an out-of-range species id, so the caller
+// treats such a mover as "not a monster" (conservative skip).
+species_ai :: proc(session: ^Session, propbase: uintptr, obj: uintptr) -> u32 {
+  handle := session.proc_info.handle
+  idv, idok := engine.read_value(handle, obj + uintptr(session.layout.pos_off + SPECIES_REL), .U32)
+  if !idok {
+    return 0xFFFFFFFF
+  }
+  id := u32(engine.value_as_u64(.U32, idv))
+  if id > 0xFFFF {
+    return 0xFFFFFFFF // garbage / freed object - real species ids are small (~1300 max)
+  }
+  rec := propbase + uintptr(i64(id) * session.layout.moverprop_stride) + uintptr(session.layout.moverprop_ai_off)
+  av, aok := engine.read_value(handle, rec, .U32)
+  if !aok {
+    return 0xFFFFFFFF
+  }
+  return u32(engine.value_as_u64(.U32, av))
+}
+
+// Best-effort mover NAME. For MONSTERS the reliable name is the species prop szName (GetProp()->szName)
+// - the inline object name buffer misreads for some mobs (e.g. a Turtle Spear reads "USER32"). Pets,
+// players, and NPCs keep their inline INSTANCE name (a pet's custom name like "jefe", a player's
+// character name) - the species prop only has the generic species name for those. So: prop szName when
+// the species is AII_MONSTER, else the inline buffer. Falls back to inline when the prop gate isn't
+// configured. Result is temp-allocated.
+read_mover_name :: proc(session: ^Session, obj: uintptr) -> (string, bool) {
+  handle := session.proc_info.handle
+  L := session.layout
+  if L.propmover_rva != 0 && L.moverprop_stride != 0 {
+    pt := engine.Value_Type.U64
+    if session.ptr_size == 4 {
+      pt = .U32
+    }
+    if pbv, ok := engine.read_value(handle, session.proc_info.base + L.propmover_rva, pt); ok {
+      propbase := uintptr(engine.value_as_u64(pt, pbv))
+      if propbase != 0 {
+        if idv, iok := engine.read_value(handle, obj + uintptr(L.pos_off + SPECIES_REL), .U32); iok {
+          id := u32(engine.value_as_u64(.U32, idv))
+          if id != 0 && id <= 0xFFFF {
+            rec := propbase + uintptr(i64(id) * L.moverprop_stride)
+            // Only override the inline name for real monsters (species-named); pets/players/NPCs have
+            // their own instance name inline.
+            if aiv, aok := engine.read_value(handle, rec + uintptr(L.moverprop_ai_off), .U32);
+               aok && u32(engine.value_as_u64(.U32, aiv)) == AII_MONSTER {
+              nb: [40]byte
+              if n, rok := engine.read_into(handle, rec + uintptr(MOVERPROP_NAME_OFF), nb[:]); rok && n > 0 {
+                e := 0
+                for e < len(nb) && nb[e] >= 0x20 && nb[e] < 0x7F {
+                  e += 1
+                }
+                name := strings.trim_space(string(nb[:e]))
+                if len(name) > 0 {
+                  return strings.clone(name, context.temp_allocator), true
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return engine.read_obj_name(handle, session.ptr_size, obj, L.name_off)
+}
+
 // Scan for objects and return the selectable movers matching <names> (or any mover when
 // <names> is empty), nearest first. Enumerates ALL writable regions fresh every call - complete
 // regardless of spawns/zoning (the old region cache went stale and missed most of a big spawn).
 // Each world-ptr hit is gated by obj_is_selectable (live object, mover, name, HP, model). The
-// <player> object is always skipped; your pet/mount/summon is skipped too, via whichever link is
-// configured: pet_index (mover's m_dwIndex == your pet's species id - the reliable one, stable
-// across re-summons), owner_off (mover back-references you: m_idOwner==owner_id or m_pMaster==player),
-// and/or pet_id (mover's m_objid == the pet objid your player object holds). Pass owner_id=0 /
-// pet_id=0 to disable those; pet_index is read from the layout.
+// <player> object is always skipped. In any-monster mode (empty <names>) the species prop-table gate
+// is the sole target filter: a mover whose GetProp()->dwAI (indexed by m_dwIndex) != AII_MONSTER is
+// skipped, so pets / eggs / NPCs / other players / bosses are excluded. Inert until `findprop` runs.
 tc_collect_cands :: proc(
   session: ^Session,
   names: []string,
   world: uintptr,
   player: uintptr,
-  owner_id: u32,
-  pet_id: u32,
   player_pos: [3]f32,
 ) -> [dynamic]TC_Cand {
   handle := session.proc_info.handle
@@ -229,15 +326,21 @@ tc_collect_cands :: proc(
   if session.ptr_size == 4 {
     pt = .U32
   }
-  owner_off := session.layout.owner_off
-  objid_off := session.layout.objid_off
-  pet_index := session.layout.pet_index
-  index_off := session.layout.pos_off + 0x14 // m_dwIndex (species id), relative to m_vPos
-  // Monster-only gate: only in any-monster mode (empty names), require the mob-category field. This
-  // excludes ALL pets/players/NPCs, not just your own pet. Inert until findmobflag sets it.
-  mob_gate := len(names) == 0 && session.layout.mob_flag_off != 0
-  mob_flag_off := session.layout.mob_flag_off
-  mob_flag_val := session.layout.mob_flag_val
+  // Attackable-monster gate: only in any-monster mode (empty names), require the mover's SPECIES to be
+  // a monster - GetProp()->dwAI == AII_MONSTER, read from the client's MoverProp array. This excludes
+  // pets (AII_PET=5), eggs (AII_EGG=9), NPCs (AII_NONE), other players, and special-AI bosses. Inert
+  // until `findprop` fills propmover_rva / moverprop_stride / moverprop_ai_off. `propbase` is resolved
+  // once here (the array base); per-mover we index it by m_dwIndex.
+  prop_gate := len(names) == 0 && prop_gate_ready(session)
+  propbase: uintptr = 0
+  if prop_gate {
+    if pb, ok := engine.read_value(handle, session.proc_info.base + session.layout.propmover_rva, pt); ok {
+      propbase = uintptr(engine.value_as_u64(pt, pb))
+    }
+    if propbase == 0 {
+      prop_gate = false // couldn't resolve the array; fall back to no gate rather than mis-filter
+    }
+  }
   wval := engine.ptr_to_value(world, session.ptr_size)
   regions := engine.collect_regions(handle, true) // all writable - complete, no stale cache
   defer delete(regions)
@@ -249,35 +352,8 @@ tc_collect_cands :: proc(
     if obj == player {
       continue // never target yourself (matters in any-monster mode where the name gate is off)
     }
-    if owner_off != 0 {
-      if ov, ook := engine.read_value(handle, obj + uintptr(owner_off), .U32); ook {
-        v := u32(engine.value_as_u64(.U32, ov))
-        // Your pet/mount/summon references you via m_idOwner (your objid) or m_pMaster (a pointer
-        // to your player object); wild monsters hold 0 here. Match either encoding.
-        if (owner_id != 0 && v == owner_id) || v == u32(player) {
-          continue
-        }
-      }
-    }
-    if pet_id != 0 && objid_off != 0 {
-      if idv, idok := engine.read_value(handle, obj + uintptr(objid_off), .U32); idok {
-        if u32(engine.value_as_u64(.U32, idv)) == pet_id {
-          continue // this mover's objid is the pet objid your player object points at
-        }
-      }
-    }
-    if pet_index != 0 {
-      if xv, xok := engine.read_value(handle, obj + uintptr(index_off), .U32); xok {
-        if u32(engine.value_as_u64(.U32, xv)) == pet_index {
-          continue // same mover-prop species id as your pet (stable across re-summons)
-        }
-      }
-    }
-    if mob_gate {
-      fv, fok := engine.read_value(handle, obj + uintptr(mob_flag_off), .U32)
-      if !fok || u32(engine.value_as_u64(.U32, fv)) != mob_flag_val {
-        continue // not an attackable monster (pet / other player / NPC) - any-monster mode only
-      }
+    if prop_gate && species_ai(session, propbase, obj) != AII_MONSTER {
+      continue // not an attackable monster (pet / egg / NPC / other player / boss) - any-monster mode only
     }
     if !obj_is_selectable(session, obj, names) {
       continue
@@ -286,10 +362,20 @@ tc_collect_cands :: proc(
     if !posok {
       continue
     }
-    append(&cands, TC_Cand{obj = obj, d = engine.dist_3d(pos, player_pos)})
+    append(&cands, TC_Cand{obj = obj, d = engine.dist_3d(pos, player_pos), pos = pos})
   }
   slice.sort_by(cands[:], proc(a, b: TC_Cand) -> bool {return a.d < b.d})
   return cands
+}
+
+// True if <cand_pos> lies on the opposite side of the player from <avoid> (a horizontal x,z delta
+// pointing at the mob we just got stuck on). Only the sign of the dot matters, so no normalization
+// is needed - a zero/degenerate avoid yields dot 0 (not opposite), so nothing qualifies and the
+// caller falls back to the normal nearest pick.
+cand_is_opposite :: proc(player_pos, cand_pos: [3]f32, avoid: [2]f32) -> bool {
+  dx := cand_pos[0] - player_pos[0]
+  dz := cand_pos[2] - player_pos[2]
+  return dx * avoid[0] + dz * avoid[1] < 0
 }
 
 TC_Result :: enum {
@@ -342,25 +428,8 @@ tc_select :: proc(
     return .AnchorFail, 0, 0, 0, 0
   }
 
-  // Your pet references you via m_idOwner (== your objid); read your objid so tc_collect_cands can
-  // skip owned movers via the owner_off link. Needs owner_off + objid_off; else stays 0.
-  owner_id: u32 = 0
-  if session.layout.owner_off != 0 && session.layout.objid_off != 0 {
-    if oiv, oiok := engine.read_value(handle, player + uintptr(session.layout.objid_off), .U32); oiok {
-      owner_id = u32(engine.value_as_u64(.U32, oiv))
-    }
-  }
-  // Reverse link: your player object holds your pet's objid at pet_id_off. Read it so
-  // tc_collect_cands can skip the mover whose m_objid matches. Needs pet_id_off + objid_off.
-  pet_id: u32 = 0
-  if session.layout.pet_id_off != 0 && session.layout.objid_off != 0 {
-    if piv, piok := engine.read_value(handle, player + uintptr(session.layout.pet_id_off), .U32); piok {
-      pet_id = u32(engine.value_as_u64(.U32, piv))
-    }
-  }
-
   // Collect selectable (alive + rendered) movers matching <names> (or any mover), nearest first.
-  cands := tc_collect_cands(session, names, world, player, owner_id, pet_id, player_pos)
+  cands := tc_collect_cands(session, names, world, player, player_pos)
   total = len(cands)
   if total == 0 {
     return .NoCandidates, 0, 0, 0, 0
@@ -371,15 +440,80 @@ tc_select :: proc(
   // animation, so picking the strict closest would re-select the corpse. Skipping recent
   // picks advances to the next mob after each kill.
   now := time.now()._nsec
+  gate := require_fresh && session.reach_gate_on // proactive reach filter (auto only; inert w/o aobjcull_rva)
   chosen := cands[0]
   sel = 0
   found := false
-  for c, i in cands {
-    if !tc_seen_recently(session, c.obj, now) && !obj_blocked_recently(session, c.obj, now) {
+  // Melee fast-path: a mob in melee range is immediately reachable, so take the nearest such mob and
+  // skip the stuck/anchor heuristics. Name-filtered auto ONLY: in any-monster mode a mob of some kind
+  // is almost always within melee range, so this would grab whatever's closest and ignore the last-kill
+  // anchor, making the pick ping-pong across the field. Any-monster mode instead falls straight to the
+  // bow-pocket cascade below (nearest to the last kill, within bow range) - the same thing that makes
+  // name-filtered auto feel coherent.
+  if require_fresh && len(names) > 0 {
+    for c, i in cands {
+      if c.d > MELEE_RANGE {
+        break // sorted by distance - nothing further is in melee range
+      }
+      if tc_skip_cand(session, world, player_pos, c, now, gate) {
+        continue
+      }
       chosen = c
       sel = i
       found = true
       break
+    }
+  }
+  // Right after a stuck-skip (auto only), try the nearest eligible mob on the OPPOSITE side of us from
+  // the one we jammed on (dot(player->cand, avoid_dir) < 0), so we walk away from the wall instead of
+  // straight back into it. Falls through to the normal nearest pick if there's none.
+  if !found && require_fresh && session.auto_avoid_on {
+    for c, i in cands {
+      if !cand_is_opposite(player_pos, c.pos, session.auto_avoid_dir) {
+        continue // cheap direction test first; only reach-check opposite-side candidates
+      }
+      if tc_skip_cand(session, world, player_pos, c, now, gate) {
+        continue
+      }
+      chosen = c
+      sel = i
+      found = true
+      break
+    }
+  }
+  // Bow-range retarget: if we have a shootable pocket (an eligible mob within BOW_RANGE of us), stay on
+  // the pack - pick the in-range mob nearest the last kill's spot rather than the one nearest us. Falls
+  // through to plain nearest-to-player when nothing eligible is in range (walk to the next pocket).
+  if !found && require_fresh && session.last_kill_set {
+    best := -1
+    best_ad := f32(1e30)
+    for c, i in cands {
+      if c.d > BOW_RANGE {
+        break // sorted by distance - nothing further is in bow range
+      }
+      if tc_skip_cand(session, world, player_pos, c, now, gate) {
+        continue
+      }
+      ad := engine.dist_horizontal(c.pos, session.last_kill_pos)
+      if ad < best_ad {
+        best_ad = ad
+        best = i
+      }
+    }
+    if best >= 0 {
+      chosen = cands[best]
+      sel = best
+      found = true
+    }
+  }
+  if !found {
+    for c, i in cands {
+      if !tc_skip_cand(session, world, player_pos, c, now, gate) {
+        chosen = c
+        sel = i
+        found = true
+        break
+      }
     }
   }
   if !found {
@@ -388,6 +522,8 @@ tc_select :: proc(
     }
     chosen = cands[0] // manual: fall back to the closest
     sel = 0
+  } else if require_fresh {
+    session.auto_avoid_on = false // one-shot: consumed by this auto pick
   }
   // Re-validate immediately before the write. The object can be freed/reallocated between
   // enumeration and now; writing a stale pointer whose m_pModel has gone NULL crashes the
@@ -403,6 +539,13 @@ tc_select :: proc(
   if !engine.write_value(handle, focus_addr, pt, engine.ptr_to_value(chosen.obj, session.ptr_size)) {
     fmt.eprintfln("write failed at focus 0x%X (error %d)", focus_addr, win.GetLastError())
     return .WriteFail, chosen.obj, chosen.d, sel, total
+  }
+  if require_fresh {
+    // Remember this mob (obj + where it was) so auto_tick can confirm it actually died before it
+    // counts/prints a kill and anchors to it. Cleared/promoted before the next pick (tracks one target).
+    session.auto_sel_pos = chosen.pos
+    session.auto_sel_obj = chosen.obj
+    session.auto_sel_set = true
   }
   // Server sync: also make the client emit its own SendSetTarget so the server registers the
   // same target (stops the after-N-kills DC). Inert unless 'srvsync on' and Phase-0 configured.
@@ -454,6 +597,15 @@ AUTO_MIN_INTERVAL_NS :: i64(300_000_000) // ~300ms between advance attempts (cap
 STUCK_NS :: i64(2_500_000_000) // ~2.5s of no progress while far -> blocked
 ARRIVE_DIST :: f32(3.0) // within this of the target = arrived / in melee; never flagged
 PROGRESS_EPS :: f32(0.5) // a distance drop >= this counts as making progress
+
+// Ranger bow range. When an eligible mob is within BOW_RANGE of the player, the auto picker ranks by
+// nearest-to-the-last-kill-anchor instead of nearest-to-player (stay on the pack); otherwise it walks
+// to the nearest mob as usual. See the retarget block in tc_select.
+BOW_RANGE :: f32(16.0)
+
+// Melee range: a mob this close is "on top of us" and immediately reachable, so it gets top pick
+// priority over every other heuristic. Rough guess - tune to taste. See the top pass in tc_select.
+MELEE_RANGE :: f32(3.0)
 
 // Read the player's world position: [base+player_rva] -> the CMover*, then +pos_off (m_vPos).
 // Shared by the stuck monitor (auto_monitor) and any caller needing the live player position.
@@ -580,8 +732,12 @@ auto_monitor :: proc(session: ^Session, focus: uintptr, now: i64) {
   }
   // Plateaued while still far. Once that's persisted for STUCK_NS, treat the mob as unreachable.
   if now - session.auto_progress_at >= STUCK_NS {
-    name, _ := engine.read_obj_name(handle, session.ptr_size, focus, session.layout.name_off)
+    name, _ := read_mover_name(session, focus)
     mark_blocked(session, focus, now)
+    // We jammed trying to reach this mob, so the obstacle is roughly in its direction. Hint the next
+    // pick to steer to the opposite side of us (see the retarget in tc_select).
+    session.auto_avoid_dir = {tpos[0] - ppos[0], tpos[2] - ppos[2]}
+    session.auto_avoid_on = true
     // Clear m_pObjFocus so the next tick advances; reset tracking + throttle so it fires promptly.
     base := session.proc_info.base
     pt := engine.Value_Type.U64
@@ -601,6 +757,62 @@ auto_monitor :: proc(session: ^Session, focus: uintptr, now: i64) {
   }
 }
 
+// Read a mover's current HP (hp_off). ok=false when hp_off isn't configured or the read fails.
+read_mob_hp :: proc(session: ^Session, obj: uintptr) -> (hp: i64, ok: bool) {
+  if session.layout.hp_off == 0 {
+    return 0, false
+  }
+  if v, rok := engine.read_value(session.proc_info.handle, obj + uintptr(session.layout.hp_off), .U32); rok {
+    return i64(u32(engine.value_as_u64(.U32, v))), true
+  }
+  return 0, false
+}
+
+// Called every tick while auto is PAUSED. It doesn't advance/select; it just watches the currently
+// targeted mob and resumes auto when that mob is KILLED (HP hits 0, or it despawns/frees). A mere
+// deselect (mob still alive) keeps us paused, and with no target it idles - so you resume by targeting
+// a mob and killing it (this is also how the armed 'auto' kicks off on the first kill).
+pause_tick :: proc(session: ^Session, now: i64) {
+  focus, fok := read_focus_ptr(session)
+  if fok && focus != 0 && focus_obj_live(session, focus) {
+    if hp, hok := read_mob_hp(session, focus); hok && hp <= 0 {
+      pause_resume(session, focus, now) // HP hit 0 while focused = kill
+      return
+    }
+    session.pause_obj = focus // alive (or HP unknown) - keep watching this one
+    return
+  }
+  // No live target now. If we were watching one, tell a kill (freed / HP<=0) from a plain deselect.
+  if session.pause_obj != 0 {
+    watched := session.pause_obj
+    session.pause_obj = 0
+    killed := !focus_obj_live(session, watched)
+    if !killed {
+      if hp, hok := read_mob_hp(session, watched); hok && hp <= 0 {
+        killed = true
+      }
+    }
+    if killed {
+      pause_resume(session, watched, now)
+    }
+  }
+}
+
+// Leave the paused state and let auto resume advancing. Seeds the bow-range anchor from where the mob
+// died so the first pick after resuming stays on that spot's pack.
+pause_resume :: proc(session: ^Session, killed_obj: uintptr, now: i64) {
+  session.auto_paused = false
+  session.pause_obj = 0
+  session.auto_count += 1 // the kill that resumes us counts too (this is the first kill when armed)
+  if pos, ok := engine.read_vec3(session.proc_info.handle, killed_obj + uintptr(session.layout.pos_off)); ok {
+    session.last_kill_pos = pos
+    session.last_kill_set = true
+  }
+  session.auto_last = 0 // advance promptly on the next tick
+  fmt.printf("\n[auto] resumed (kill).  %s\n", auto_stats(session, now))
+  fmt.print("memscan> ")
+}
+
 // Auto-farm tick: called every ~20ms by the watcher thread. When a live target is selected, run the
 // obstacle monitor (auto_monitor). When no live target is selected (m_pObjFocus cleared on kill, or
 // pointing at a freed object), advance the focus to the next fresh mob matching auto_names. Your held
@@ -616,6 +828,8 @@ auto_tick :: proc(session: ^Session) {
     was_on := session.auto_on
     session.auto_on = false
     session.auto_timer_at = 0
+    session.auto_paused = false
+    session.pause_obj = 0
     if was_on {
       fmt.printf("\n[auto] timer elapsed - auto-farm OFF.  %s\n", auto_stats(session, now))
       fmt.print("memscan> ")
@@ -623,6 +837,11 @@ auto_tick :: proc(session: ^Session) {
     return
   }
   if !session.auto_on {
+    return
+  }
+  // Paused (armed): don't advance; just watch the targeted mob and resume auto when it's killed.
+  if session.auto_paused {
+    pause_tick(session, now)
     return
   }
   // A live target is still selected: watch it for obstacle-stuck (every tick, unthrottled) and wait.
@@ -638,22 +857,32 @@ auto_tick :: proc(session: ^Session) {
     return
   }
   session.auto_focus_obj = 0 // reset progress tracking for the mob we're about to pick
-  res, obj, d, sel, total := tc_select(session, session.auto_names[:], true)
-  session.auto_last = now
-  if res == .Picked {
-    session.auto_count += 1
-    fmt.printf(
-      "\n[auto] %s %s -> #%d/%d obj=0x%X d=%.1f\n",
-      auto_target_desc(session.auto_names[:]),
-      auto_stats(session, now),
-      sel + 1,
-      total,
-      obj,
-      d,
-    )
-    fmt.print("memscan> ")
+  // The focus cleared. If that was a genuine KILL (not a stuck-skip, which sets auto_avoid_on),
+  // count it, anchor the next pick to its spot, and print - a kill is the ONLY thing that prints here.
+  // auto_avoid_on is still set at this point (tc_select consumes it just below), so this reads it.
+  if session.auto_sel_set {
+    // Confirm the selected mob actually died (freed, or HP<=0) rather than being deselected - so a
+    // stray Esc/deselect never prints a phantom kill. Stuck-skips (auto_avoid_on) are never kills.
+    died := false
+    if !session.auto_avoid_on {
+      if !focus_obj_live(session, session.auto_sel_obj) {
+        died = true
+      } else if hp, hok := read_mob_hp(session, session.auto_sel_obj); hok && hp <= 0 {
+        died = true
+      }
+    }
+    if died {
+      session.auto_count += 1
+      session.last_kill_pos = session.auto_sel_pos
+      session.last_kill_set = true
+      fmt.printf("\n[auto] %s\n", auto_stats(session, now))
+      fmt.print("memscan> ")
+    }
+    session.auto_sel_set = false
   }
-  // NoCandidates / AllOnCooldown / AnchorFail / WriteFail: stay quiet (no idle spam).
+  // Advance to the next mob. Selection itself is silent now - no print unless something died above.
+  tc_select(session, session.auto_names[:], true)
+  session.auto_last = now
 }
 
 // Parse a raw target argument into a list of names. Comma-separated; each name may be wrapped
@@ -727,12 +956,11 @@ auto_set_names :: proc(session: ^Session, names: []string) {
   }
 }
 
-// If auto is in any-monster mode (empty name list) but owner_off isn't configured yet, warn that
-// the player's own pet/mount will also be targeted, and point at the one-time fix.
-auto_warn_pet :: proc(session: ^Session) {
-  L := session.layout
-  if len(session.auto_names) == 0 && L.owner_off == 0 && L.pet_id_off == 0 && L.pet_index == 0 {
-    fmt.println("  note: any-monster mode will also target your pet until you run 'findowner <pet-name>' once.")
+// If auto is in any-monster mode (empty name list) but the species prop-table gate isn't configured
+// yet, warn that pets / other players / NPCs will also be targeted, and point at the one-time fix.
+auto_warn_mobgate :: proc(session: ^Session) {
+  if len(session.auto_names) == 0 && !prop_gate_ready(session) {
+    fmt.println("  note: any-monster mode will also target pets / players / NPCs until you run 'findprop' once (target your pet, with monsters on screen).")
   }
 }
 
@@ -750,6 +978,11 @@ cli_auto :: proc(session: ^Session, args: []string) {
       session.auto_on = false
       session.auto_timer_at = 0 // stopping the run cancels any pending auto-off timer
       session.auto_focus_obj = 0
+      session.auto_avoid_on = false
+      session.auto_sel_set = false
+      session.last_kill_set = false
+      session.auto_paused = false
+      session.pause_obj = 0
       clear(&session.auto_blocked)
       fmt.printfln("auto-farm OFF.  %s", auto_stats(session, time.now()._nsec))
     } else {
@@ -761,7 +994,8 @@ cli_auto :: proc(session: ^Session, args: []string) {
   // Bare 'auto' while running -> status peek (don't disturb the run). When off it falls through
   // and starts any-monster mode.
   if len(args) == 0 && session.auto_on {
-    fmt.printfln("auto-farm ON: %s.  %s", auto_target_desc(session.auto_names[:]), auto_stats(session, time.now()._nsec))
+    state := session.auto_paused ? "ARMED/paused" : "ON"
+    fmt.printfln("auto-farm %s: %s.  %s", state, auto_target_desc(session.auto_names[:]), auto_stats(session, time.now()._nsec))
     return
   }
 
@@ -778,6 +1012,11 @@ cli_auto :: proc(session: ^Session, args: []string) {
       session.auto_on = false
       session.auto_timer_at = 0 // stopping the run cancels any pending auto-off timer
       session.auto_focus_obj = 0
+      session.auto_avoid_on = false
+      session.auto_sel_set = false
+      session.last_kill_set = false
+      session.auto_paused = false
+      session.pause_obj = 0
       clear(&session.auto_blocked)
       fmt.printfln("auto-farm OFF.  %s", auto_stats(session, time.now()._nsec))
       return
@@ -785,7 +1024,7 @@ cli_auto :: proc(session: ^Session, args: []string) {
     auto_set_names(session, names[:])
     session.auto_last = 0
     fmt.printfln("auto-farm target -> %s.", auto_target_desc(session.auto_names[:]))
-    auto_warn_pet(session)
+    auto_warn_mobgate(session)
     return
   }
 
@@ -799,14 +1038,21 @@ cli_auto :: proc(session: ^Session, args: []string) {
   session.auto_count = 0
   session.auto_start = time.now()._nsec
   session.auto_focus_obj = 0 // reset obstacle/stuck tracking for the new run
+  session.auto_avoid_on = false
+  session.auto_sel_set = false
+  session.last_kill_set = false
   clear(&session.auto_blocked)
+  // Start ARMED (paused): the first kill kicks off farming (see pause_tick). This avoids auto grabbing
+  // a target the instant you type the command - you engage the first mob yourself.
+  session.auto_paused = true
+  session.pause_obj = 0
   session.auto_on = true
   ensure_hotkey_thread(session)
   fmt.printfln(
-    "auto-farm ON: %s. hold your attack key; advances to the next mob on each kill. 'auto off' to stop.",
+    "auto-farm ARMED: %s. target a mob and kill it to start; then it advances on each kill. F10 to pause, 'auto off' to stop.",
     auto_target_desc(session.auto_names[:]),
   )
-  auto_warn_pet(session)
+  auto_warn_mobgate(session)
 }
 
 // stuck | stuck on|off -> toggle obstacle/stuck detection (auto_monitor). On by default. Disable for
@@ -825,6 +1071,46 @@ cli_stuck :: proc(session: ^Session, args: []string) {
     return
   }
   fmt.printfln("stuck-detection %s.", session.auto_stuck_on ? "ON" : "OFF")
+}
+
+// reachgate | reachgate on|off -> toggle the PROACTIVE reach filter for auto: skip candidate mobs whose
+// straight approach is blocked by terrain or a placed-object OBB, before selecting (the reactive
+// stuck-monitor still catches the rest). On by default, but inert until 'findcull' sets aobjcull_rva (so
+// it can't accidentally starve target selection or fall back to the slow scan in the pick loop).
+cli_reachgate :: proc(session: ^Session, args: []string) {
+  switch {
+  case len(args) == 0:
+    session.reach_gate_on = !session.reach_gate_on
+  case len(args) == 1 && args[0] == "on":
+    session.reach_gate_on = true
+  case len(args) == 1 && args[0] == "off":
+    session.reach_gate_on = false
+  case:
+    fmt.eprintln("usage: reachgate [on|off]")
+    return
+  }
+  inert := session.layout.aobjcull_rva == 0
+  hint := (session.reach_gate_on && inert) ? "  (inert: run 'findcull' once in-game to enable it)" : ""
+  fmt.printfln("reach-gate %s.%s", session.reach_gate_on ? "ON" : "OFF", hint)
+}
+
+// pause -> toggle the auto-farm pause (default key: F10). Paused = auto stays on but stops advancing;
+// killing the targeted mob resumes it. Does nothing if auto is off (won't start it).
+cli_pause :: proc(session: ^Session, args: []string) {
+  if !session.auto_on {
+    fmt.println("auto is off - nothing to pause. start it with 'auto <name>'.")
+    return
+  }
+  if session.auto_paused {
+    session.auto_paused = false
+    session.pause_obj = 0
+    session.auto_last = 0 // advance promptly now that we've resumed
+    fmt.println("auto-farm RESUMED.")
+  } else {
+    session.auto_paused = true
+    session.pause_obj = 0
+    fmt.println("auto-farm PAUSED - kill the targeted mob (or 'pause' again) to resume.")
+  }
 }
 
 // timer <minutes> -> auto-disable 'auto' after <minutes> elapse (e.g. 'timer 60'): a safety stop

@@ -25,6 +25,13 @@ FLYFF_SENDSETTARGET_RVA :: 0x0 // entry of CDPClient::SendSetTarget (thiscall(OB
 FLYFF_GDPLAY_RVA :: 0x0 // &g_DPlay (global CDPClient) - the thiscall `this`
 FLYFF_OBJID_OFF :: 0x0 // CObj.m_objid (GetId) - value sent as idTarget
 
+// In-world debug markers (see draw.odin / remote_spawn_particles). We call the client's own
+// CParticleMng::CreateParticle(nType, &vPos, &vVel, fGroundY) from an injected thread to drop soft
+// billboard dots at world positions (colour keyed by nType). Found via the particle texture strings
+// (see flyff-particle-draw.md). PATCH-SPECIFIC RVAs - re-derive after a patch. 0 = disabled.
+FLYFF_PARTICLEMNG_RVA :: 0x73ABE0 // &g_ParticleMng; m_Particles[0] at +0x8, sizeof(CParticles)=0x3C, m_bActive +0x2C
+FLYFF_CREATEPARTICLE_RVA :: 0x422DB0 // CParticleMng::CreateParticle; ret 0x10; folds g_ParticleMng absolute (ecx unused)
+
 // Terrain reachability grid (see terrain.odin). Offsets into CWorld / CLandscape that locate the
 // per-cell walkability map (heightmap-encoded attribute). Found at runtime by `worldscan`; 0 means
 // "not yet found" and the attr/reach commands stay inert while any of the three structural ones is 0.
@@ -33,30 +40,36 @@ FLYFF_LANDWIDTH_OFF :: 0x0 // CWorld.m_nLandWidth (int); m_nLandHeight is +4
 FLYFF_MPU_OFF :: 0x0 // CWorld.m_iMPU (int meters-per-unit); 0 => assume MPU_DEFAULT (4)
 FLYFF_HMAP_OFF :: 0x0 // CLandscape.m_pHeightMap (float*, 129x129 corner grid)
 
-// Owner back-reference on a mover: the field where your pet/mount/summon references YOU - either
-// m_idOwner (your objid) or m_pMaster (a pointer to your player object); wild monsters hold 0. The
-// exclusion matches either encoding. Located at runtime via `findowner`; 0 = not found, which
-// disables owner-based filtering (auto with no name would then also target your pet).
-FLYFF_OWNER_OFF :: 0x0
+// Reach-gating tuning (NOT a memory offset): your attack range in world units. `reach`/reach-gated
+// target selection only needs the straight path to within this distance of the mob to be walkable
+// (you close to range, then attack - ranged has no LOS check on the shot). Per-character; `set
+// attack_range <n>`. 0 => test the full path to the mob's cell.
+FLYFF_ATTACK_RANGE :: 16
 
-// Forward pet reference in the PLAYER object: a slot holding your pet's objid (m_idPet). When set,
-// auto skips the mover whose m_objid equals [player + pet_id_off]. This is the reverse of owner_off
-// (some builds link player->pet instead of pet->player); either one alone excludes the pet. Located
-// at runtime via `findowner`; needs objid_off. 0 = not found (disabled). NOTE: fragile - the pet
-// objid changes on re-summon - prefer pet_index below.
-FLYFF_PET_ID_OFF :: 0x0
+// Static CObj* CWorld::m_aobjCull[] - the render on-screen display array (World.cpp:69). The object
+// reach test reads this (fast, ~on-screen count) instead of scanning all of memory for CObj. Found by
+// `findcull` (which saves it here); PATCH-SPECIFIC. 0 => fall back to the slow full-memory scan.
+FLYFF_AOBJCULL_RVA :: 0x0
 
-// Pet species id (m_dwIndex, at pos_off+0x14): the mover-prop id of your pet's kind. Auto skips any
-// mover whose m_dwIndex matches. Unlike the objid links this is STABLE across re-summons and is
-// distinct from monster species ids, so it's the reliable pet filter. Set by `findowner`. 0 = unset.
-FLYFF_PET_INDEX :: 0x0
-
-// Monster-category gate for any-monster auto: a field every attackable MONSTER shares but pets /
-// other players / NPCs don't. In no-name auto, movers where [mover + mob_flag_off] != mob_flag_val
-// are skipped (excludes ALL pets, not just your own species). Found via `findmobflag` (diffs your pet
-// vs a multi-species monster sample). mob_flag_off 0 = disabled. Only applies in any-monster mode.
-FLYFF_MOB_FLAG_OFF :: 0x0
-FLYFF_MOB_FLAG_VAL :: 0x0
+// Attackable-monster gate - the SOLE target filter for any-monster ("auto any") mode. The client
+// doesn't store a usable AI type on the mover OBJECT (per-object m_dwAIInterface is only set for
+// things the client runs AI for, e.g. your stat pet). The game's real classification lives in the
+// SPECIES property: CMover::GetProp()->dwAI, where GetProp() = prj.GetMoverProp(m_dwIndex) =
+// m_pPropMover + m_dwIndex (a flat MoverProp array indexed by species id). So the gate reads the
+// mover's species (m_dwIndex @ pos_off+0x14), indexes the prop array, and keeps only dwAI==AII_MONSTER
+// - which excludes pets(5)/eggs(9)/NPCs(AII_NONE)/players and special-AI bosses, generically.
+//
+// Three runtime-found values wire it (see `findprop`); all patch-specific, 0 = disabled:
+//   propmover_rva   - RVA of the global pointer prj.m_pPropMover (points at MoverProp record[0]).
+//                     propbase = [module_base + propmover_rva]; record[i] = propbase + i*stride.
+//   moverprop_stride- sizeof(MoverProp) (the per-record byte stride). Derived, not from the header.
+//   moverprop_ai_off- dwAI's byte offset inside a MoverProp record.
+FLYFF_PROPMOVER_RVA :: 0x0
+FLYFF_MOVERPROP_STRIDE :: 0x0
+FLYFF_MOVERPROP_AI_OFF :: 0x0
+AII_MONSTER :: u32(2) // Resource/defineNeuz.h: AII_MONSTER (pets=5, eggs=9, none/NPC=0)
+SPECIES_REL :: 0x14   // m_dwIndex (species id) offset relative to pos_off (m_vPos)
+MOVERPROP_NAME_OFF :: 4 // MoverProp.szName sits right after the 4-byte dwID at record start
 
 // Live, patch-tunable Flyff layout. Held in Session.layout; seeded by flyff_layout_default(),
 // overwritten by flyff.cfg on attach, re-derived by `calibrate`, and persisted back to the cfg.
@@ -73,17 +86,19 @@ Flyff_Layout :: struct {
   model_off:         i64,
   mover_type:        u32,
   objid_off:         i64,
-  owner_off:         i64,
-  pet_id_off:        i64,
-  pet_index:         u32,
-  mob_flag_off:      i64,
-  mob_flag_val:      u32,
+  propmover_rva:     uintptr,
+  moverprop_stride:  i64,
+  moverprop_ai_off:  i64,
   sendsettarget_rva: uintptr,
   gdplay_rva:        uintptr,
+  particlemng_rva:    uintptr,
+  createparticle_rva: uintptr,
   land_off:          i64,
   landwidth_off:     i64,
   mpu_off:           i64,
   hmap_off:          i64,
+  attack_range:      i64,
+  aobjcull_rva:      uintptr,
 }
 
 flyff_layout_default :: proc() -> Flyff_Layout {
@@ -98,16 +113,18 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     model_off         = FLYFF_MODEL_OFF,
     mover_type        = FLYFF_MOVER_TYPE,
     objid_off         = FLYFF_OBJID_OFF,
-    owner_off         = FLYFF_OWNER_OFF,
-    pet_id_off        = FLYFF_PET_ID_OFF,
-    pet_index         = FLYFF_PET_INDEX,
-    mob_flag_off      = FLYFF_MOB_FLAG_OFF,
-    mob_flag_val      = FLYFF_MOB_FLAG_VAL,
+    propmover_rva     = FLYFF_PROPMOVER_RVA,
+    moverprop_stride  = FLYFF_MOVERPROP_STRIDE,
+    moverprop_ai_off  = FLYFF_MOVERPROP_AI_OFF,
     sendsettarget_rva = FLYFF_SENDSETTARGET_RVA,
     gdplay_rva        = FLYFF_GDPLAY_RVA,
+    particlemng_rva    = FLYFF_PARTICLEMNG_RVA,
+    createparticle_rva = FLYFF_CREATEPARTICLE_RVA,
     land_off          = FLYFF_LAND_OFF,
     landwidth_off     = FLYFF_LANDWIDTH_OFF,
     mpu_off           = FLYFF_MPU_OFF,
     hmap_off          = FLYFF_HMAP_OFF,
+    attack_range      = FLYFF_ATTACK_RANGE,
+    aobjcull_rva      = FLYFF_AOBJCULL_RVA,
   }
 }

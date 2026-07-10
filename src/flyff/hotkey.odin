@@ -6,6 +6,8 @@ import "core:strings"
 import "core:sync"
 import win "core:sys/windows"
 
+PAUSE_VK :: u32(0x79) // F10 - default key that toggles the auto-farm pause
+
 // A global hotkey: when `vk` transitions from up to down (anywhere, even while
 // memscan is in the background), run `command` through the normal CLI. `was_down`
 // is the watcher's edge-detection state.
@@ -26,12 +28,24 @@ hotkey_thread_start :: proc "system" (param: rawptr) -> win.DWORD {
 }
 
 hotkey_watch_loop :: proc(session: ^Session) {
+  pause_prev := false // F10 edge-detection for the pause binding
   for {
     sync.mutex_lock(&session.exec_mutex)
     if session.hk_stop {
       sync.mutex_unlock(&session.exec_mutex)
       return
     }
+    // Default pause binding: F10 toggles the auto-farm pause (only while auto is on, so a stray press
+    // off the clock does nothing).
+    pause_down := hotkey_key_down(PAUSE_VK)
+    if pause_down && !pause_prev {
+      if session.auto_on && session.exec_line != nil {
+        fmt.printf("\n[F10] pause\n")
+        session.exec_line(session, "pause")
+        fmt.print("memscan> ")
+      }
+    }
+    pause_prev = pause_down
     for &hk in session.hotkeys {
       down := hotkey_key_down(hk.vk)
       if down && !hk.was_down {

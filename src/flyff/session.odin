@@ -53,6 +53,27 @@ Session :: struct {
   auto_progress_at: i64, // time.now()._nsec of the last real progress (start of the STUCK_NS window)
   auto_blocked:     [dynamic]TC_Recent, // mobs flagged unreachable; skipped by the picker for BLOCKED_NS
   auto_stuck_on:    bool, // stuck-detection enabled (default on; 'stuck off' disables, e.g. for ranged)
+  auto_avoid_dir:   [2]f32, // horizontal (x,z) player->last-stuck-mob delta; one-shot steer-away hint
+  auto_avoid_on:    bool, // next auto pick prefers a mob on the opposite side (dot < 0) from auto_avoid_dir
+
+  // Proactive reach gate (see cand_reachable / tc_select). When on, auto skips candidate mobs whose
+  // straight approach is blocked by terrain OR a placed-object OBB (the reach oracle) BEFORE selecting -
+  // complements the reactive stuck-monitor. Inert unless the fast object path (aobjcull_rva) is set, so
+  // it never triggers the slow scan in the pick loop. Default on; 'reachgate off' disables.
+  reach_gate_on:    bool,
+
+  // Bow-range retarget anchor (see tc_select). While a shootable mob is in bow range, the auto picker
+  // ranks by nearest-to-the-last-kill's-spot instead of nearest-to-you, so a ranger stays on the pack.
+  auto_sel_pos:     [3]f32, // world pos of the current auto target when it was selected (pending anchor)
+  auto_sel_obj:     uintptr, // the auto target's object ptr, to confirm it actually died (vs deselected)
+  auto_sel_set:     bool,
+  last_kill_pos:    [3]f32, // selection pos of the last mob actually killed - the in-range retarget anchor
+  last_kill_set:    bool,
+
+  // Pause (see pause_tick / cli_pause). auto_paused holds a running auto without advancing; killing the
+  // watched mob resumes it. 'auto' starts paused (armed), so the first kill kicks off farming.
+  auto_paused:      bool,
+  pause_obj:        uintptr, // mob watched for a kill while paused (0 = none)
 
   // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
@@ -69,6 +90,12 @@ Session :: struct {
   // detach/close and re-enabled on the next attach. 'srvsync off' disables it for the session.
   srvsync_on:    bool,
   srv_shim:      uintptr, // cached RWX shim page in the target (remote_send_settarget); 0 = none
+
+  // Cached RWX page for particle-marker injection (remote_spawn_particles). Reused across refreshes
+  // so a fast tracking overlay doesn't VirtualAllocEx/Free every tick; grown when a batch needs more.
+  // Freed with the other remote pages on detach/close. 0 = none.
+  spawn_page:      uintptr,
+  spawn_page_size: uint,
 
   // Global hotkeys (see hotkey.odin). exec_mutex serializes command execution between the REPL
   // thread and the hotkey watcher thread. exec_line runs a CLI line (set by main to the REPL's
@@ -88,6 +115,7 @@ session_init :: proc(session: ^Session) -> bool {
   session.ptr_size = 8
   session.writable_only = true
   session.auto_stuck_on = true // obstacle/stuck detection on by default (see auto_monitor)
+  session.reach_gate_on = true // proactive reach gate on by default (inert until findcull sets aobjcull_rva)
   session.layout = flyff_layout_default()
   if err := virtual.arena_init_growing(&session.scan_arena); err != .None {
     fmt.eprintln("failed to initialise scan arena")
@@ -131,6 +159,7 @@ session_close :: proc(session: ^Session) {
   }
   if session.attached {
     remote_free_shim(session)
+    remote_free_spawn_page(session)
     win.CloseHandle(session.proc_info.handle)
   }
   free_all(virtual.arena_allocator(&session.scan_arena))

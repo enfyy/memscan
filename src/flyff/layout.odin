@@ -48,20 +48,20 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.mover_type = u32(v)
   case "objid_off":
     layout.objid_off = i64(v)
-  case "owner_off":
-    layout.owner_off = i64(v)
-  case "pet_id_off":
-    layout.pet_id_off = i64(v)
-  case "pet_index":
-    layout.pet_index = u32(v)
-  case "mob_flag_off":
-    layout.mob_flag_off = i64(v)
-  case "mob_flag_val":
-    layout.mob_flag_val = u32(v)
+  case "propmover_rva":
+    layout.propmover_rva = uintptr(v)
+  case "moverprop_stride":
+    layout.moverprop_stride = i64(v)
+  case "moverprop_ai_off":
+    layout.moverprop_ai_off = i64(v)
   case "sendsettarget_rva":
     layout.sendsettarget_rva = uintptr(v)
   case "gdplay_rva":
     layout.gdplay_rva = uintptr(v)
+  case "particlemng_rva":
+    layout.particlemng_rva = uintptr(v)
+  case "createparticle_rva":
+    layout.createparticle_rva = uintptr(v)
   case "land_off":
     layout.land_off = i64(v)
   case "landwidth_off":
@@ -70,6 +70,10 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.mpu_off = i64(v)
   case "hmap_off":
     layout.hmap_off = i64(v)
+  case "attack_range":
+    layout.attack_range = i64(v)
+  case "aobjcull_rva":
+    layout.aobjcull_rva = uintptr(v)
   case:
     return false
   }
@@ -90,17 +94,19 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "model_off=0x%X", layout.model_off)
   fmt.sbprintfln(&b, "mover_type=%d", layout.mover_type)
   fmt.sbprintfln(&b, "objid_off=0x%X", layout.objid_off)
-  fmt.sbprintfln(&b, "owner_off=0x%X", layout.owner_off)
-  fmt.sbprintfln(&b, "pet_id_off=0x%X", layout.pet_id_off)
-  fmt.sbprintfln(&b, "pet_index=%d", layout.pet_index)
-  fmt.sbprintfln(&b, "mob_flag_off=0x%X", layout.mob_flag_off)
-  fmt.sbprintfln(&b, "mob_flag_val=0x%X", layout.mob_flag_val)
+  fmt.sbprintfln(&b, "propmover_rva=0x%X", layout.propmover_rva)
+  fmt.sbprintfln(&b, "moverprop_stride=0x%X", layout.moverprop_stride)
+  fmt.sbprintfln(&b, "moverprop_ai_off=0x%X", layout.moverprop_ai_off)
   fmt.sbprintfln(&b, "sendsettarget_rva=0x%X", layout.sendsettarget_rva)
   fmt.sbprintfln(&b, "gdplay_rva=0x%X", layout.gdplay_rva)
+  fmt.sbprintfln(&b, "particlemng_rva=0x%X", layout.particlemng_rva)
+  fmt.sbprintfln(&b, "createparticle_rva=0x%X", layout.createparticle_rva)
   fmt.sbprintfln(&b, "land_off=0x%X", layout.land_off)
   fmt.sbprintfln(&b, "landwidth_off=0x%X", layout.landwidth_off)
   fmt.sbprintfln(&b, "mpu_off=0x%X", layout.mpu_off)
   fmt.sbprintfln(&b, "hmap_off=0x%X", layout.hmap_off)
+  fmt.sbprintfln(&b, "attack_range=%d", layout.attack_range)
+  fmt.sbprintfln(&b, "aobjcull_rva=0x%X", layout.aobjcull_rva)
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
   return err == nil
 }
@@ -191,20 +197,55 @@ cli_status :: proc(session: ^Session) {
     fmt.println("    fix: findsettarget    (or just re-run 'calibrate' - it derives these too)")
   }
 
-  // --- Pet / non-monster exclusion for no-name auto ---
-  own_pet := L.pet_index != 0 || L.owner_off != 0 || L.pet_id_off != 0
+  // --- Species prop-table gate for no-name auto ---
   fmt.println("")
-  fmt.println("EXCLUSIONS for no-name 'auto' (any-monster mode) - OPTIONAL:")
-  fmt.printfln("  pet_index=%d owner_off=0x%X pet_id_off=0x%X mob_flag_off=0x%X mob_flag_val=0x%X", L.pet_index, L.owner_off, L.pet_id_off, L.mob_flag_off, L.mob_flag_val)
-  if L.mob_flag_off != 0 {
-    fmt.println("  [OK] any-monster 'auto' skips ALL pets, other players, and NPCs.")
-  } else if own_pet {
-    fmt.println("  [PARTIAL] skips YOUR pet only; other players' pets / NPCs can still be picked.")
-    fmt.println("    optional: findmobflag <pet-name>   (stand where 2+ monster species are visible)")
+  fmt.println("ATTACKABLE-MONSTER gate for no-name 'auto' (any-monster mode) - species GetProp()->dwAI == AII_MONSTER:")
+  fmt.printfln("  propmover_rva=0x%X moverprop_stride=0x%X moverprop_ai_off=0x%X", L.propmover_rva, L.moverprop_stride, L.moverprop_ai_off)
+  if L.propmover_rva != 0 && L.moverprop_stride != 0 {
+    pb := read_ptr_at(handle, base + L.propmover_rva, pt)
+    if pb != 0 {
+      fmt.println("  [OK] 'auto any' targets only AII_MONSTER species; pets / eggs / NPCs / other players / bosses are skipped.")
+    } else {
+      fmt.println("  [BROKEN] prop offsets set but the array pointer doesn't resolve - re-run 'findprop' in-game.")
+    }
   } else {
-    fmt.println("  [OFF] no-name 'auto' can target your own pet / other pets / NPCs.")
-    fmt.println("    optional: findowner <pet-name> (skip your pet), findmobflag <pet-name> (skip all).")
+    fmt.println("  [OFF] not configured - 'auto any' can target your pet / other pets / NPCs.")
+    fmt.println("    fix: target your PET (with monsters on screen) and run 'findprop' once.")
     fmt.println("    only matters if you use 'auto' with NO name; farming by name is unaffected.")
+  }
+
+  // --- Terrain reachability oracle (worldscan) ---
+  fmt.println("")
+  fmt.println("TERRAIN reachability oracle (from 'worldscan') - reach-gated target selection - OPTIONAL:")
+  fmt.printfln("  land_off=0x%X landwidth_off=0x%X hmap_off=0x%X mpu_off=0x%X  attack_range=%d", L.land_off, L.landwidth_off, L.hmap_off, L.mpu_off, L.attack_range)
+  fmt.printfln(
+    "  aobjcull_rva=0x%X  object reach: %s   auto reach-gate: %s",
+    L.aobjcull_rva,
+    L.aobjcull_rva != 0 ? "FAST (m_aobjCull)" : "SLOW full-scan - run 'findcull'",
+    session.reach_gate_on ? (L.aobjcull_rva != 0 ? "ON" : "on but inert (needs findcull)") : "OFF",
+  )
+  if !terrain_ready(session) {
+    fmt.println("  [OFF] terrain grid not calibrated - 'attr' / 'reach' are inert.")
+    fmt.println("    fix: stand on solid flat ground and run 'worldscan' (repeat at a clearly")
+    fmt.println("         different ground height until it PINS to one hypothesis).")
+  } else if world == 0 {
+    fmt.println("  [BROKEN] terrain offsets pinned but world doesn't resolve - run 'calibrate'.")
+  } else {
+    // Live probe: the player stands on walkable ground, so their own cell should decode as
+    // NONE at ~their Y. A mismatch means the pinned offsets are wrong (e.g. a coincidental
+    // single-sample worldscan) - re-run worldscan at a second ground height.
+    ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
+    wa, wok := world_attr_at(session, world, ppos[0], ppos[2])
+    if pok && wok {
+      d := wa.height - ppos[1]
+      if wa.attr == HATTR_NONE && d >= -8 && d <= 8 {
+        fmt.printfln("  [OK] feet read NONE (walkable), height delta %.1f - 'reach' verdicts should be trustworthy.", d)
+      } else {
+        fmt.printfln("  [SUSPECT] feet read %s, height delta %.1f - re-run 'worldscan' on flat ground.", hattr_name(wa.attr), d)
+      }
+    } else {
+      fmt.println("  [SUSPECT] offsets pinned but the player's own cell won't resolve - re-run 'worldscan'.")
+    }
   }
 
   fmt.println("")
@@ -316,11 +357,11 @@ cli_findpos :: proc(session: ^Session, args: []string) {
 // calibrate <x,y,z> <name> [hp]
 // One-command layout setup/recovery from facts you can read in-game: <x,y,z> your character
 // position (type /position), <name> your character name, [hp] your current HP (optional; pins
-// hp_off). Finds pos_off/field_off/model_off/name_off + world_rva/player_rva (+hp_off); on the
-// 32-bit client also re-derives the srvsync offsets (sendsettarget_rva + objid_off); and if a mob
-// is SELECTED when you run it, also pins focus_off (folds in findfocus). Saves flyff.cfg. So the
-// full core setup is: select a mob, then `calibrate <pos> <name> [hp]`. (Pet exclusion -
-// pet_index/mob_flag - still needs `findowner`/`findmobflag` since those require a summoned pet.)
+// hp_off). Finds pos_off/field_off/model_off/name_off + world_rva/player_rva (+hp_off); on the 32-bit
+// client also re-derives the srvsync offsets (sendsettarget_rva + objid_off); and if a mob is SELECTED
+// when you run it, also pins focus_off (folds in findfocus). Saves flyff.cfg. So the core setup is one
+// command: select a mob, then `calibrate <pos> <name> [hp]`. (The any-monster gate is separate: target
+// your pet with monsters on screen and run `findprop` once.)
 cli_calibrate :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")

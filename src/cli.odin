@@ -145,6 +145,10 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_timer(session, args)
   case "stuck":
     flyff.cli_stuck(session, args)
+  case "reachgate":
+    flyff.cli_reachgate(session, args)
+  case "pause":
+    flyff.cli_pause(session, args)
   case "refocus":
     flyff.cli_refocus(session, args)
   case "calibrate", "cal":
@@ -181,10 +185,10 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_idscan(session, args)
   case "findsettarget":
     flyff.cli_findsettarget(session, args)
-  case "findowner":
-    flyff.cli_findowner(session, args)
-  case "findmobflag":
-    flyff.cli_findmobflag(session, args)
+  case "findaii":
+    flyff.cli_findaii(session, args)
+  case "findprop":
+    flyff.cli_findprop(session, args)
   case "srvsync":
     flyff.cli_srvsync(session, args)
   case "srvtest":
@@ -197,12 +201,30 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_objscan(session, args)
   case "mobs":
     flyff.cli_mobs(session, args)
+  case "mark":
+    flyff.cli_mark(session, args)
+  case "markmobs":
+    flyff.cli_markmobs(session, args)
+  case "findparticle":
+    flyff.cli_findparticle(session, args)
+  case "warmtype":
+    flyff.cli_warmtype(session, args)
   case "worldscan":
     flyff.cli_worldscan(session, args)
   case "attr":
     flyff.cli_attr(session, args)
+  case "attrmap":
+    flyff.cli_attrmap(session, args)
+  case "objects":
+    flyff.cli_objects(session, args)
   case "reach":
     flyff.cli_reach(session, args)
+  case "attackable", "canhit":
+    flyff.cli_attackable(session, args)
+  case "reachdbg":
+    flyff.cli_reachdbg(session, args)
+  case "findcull":
+    flyff.cli_findcull(session, args)
   case:
     fmt.eprintfln("unknown command: %s (try 'help')", cmd)
   }
@@ -264,10 +286,13 @@ check the setup anytime with 'status'.
 farming (day to day)
   target_closest <name>... (tc)  select nearest mover named <name>; repeat to advance.
                              several names ok: tc 'Aibatt', 'Captain Aibatt'
-  auto [name]...             hands-free farm: re-target the next mob on each kill (hold your attack key).
-                             no name = ANY monster; names comma-separated. re-issue / 'auto off' to stop
+  auto [name]...             hands-free farm: starts ARMED (paused) - kill the first mob to begin, then it
+                             re-targets on each kill. no name = ANY monster; names comma-separated. 'auto off' stops
+  pause                      toggle pause (default key: F10). killing the targeted mob resumes
   timer <minutes>            auto-disable 'auto' after N minutes (e.g. 'timer 60'); 'timer off' cancels
-  stuck [on|off]             toggle obstacle skip-detection (on by default; 'stuck off' for ranged/standing)
+  stuck [on|off]             toggle reactive obstacle skip-detection (on by default; 'stuck off' for ranged/standing)
+  reachgate [on|off]         proactively skip mobs behind walls/trees/buildings when auto-picks a target
+                             (on by default; needs 'worldscan' + 'findcull' once to take effect)
   mobs <name>                list nearby <name> movers by distance (hp, model, address)
   srvsync [on|off]           mirror each select to the server (stops the after-N-kills DC);
                              ON by default on attach
@@ -287,15 +312,21 @@ offset finders (one-time; each fills part of the layout)
   findfocus                  click a mob, then run: derives focus_off
   hpwatch                    target a mob and hit it: the field that drops is currentHP (hp_off)
   findsettarget              derive the srvsync offsets by signature (calibrate does this too)
-  findowner <pet-name>       summon your pet, run: excludes YOUR pet from any-monster auto
-  findmobflag <pet-name>     find the monster-category field so any-monster auto skips ALL
-                             pets/players/NPCs (needs 2+ monster species on screen)
+  findprop                   target your PET (monsters on screen), then run: derives the any-monster gate
+                             (species MoverProp array -> GetProp()->dwAI==AII_MONSTER). Excludes pets /
+                             eggs / NPCs / players / bosses. One-time; re-run after a game patch.
+  findaii                    diagnostic: dump a mover's AI-region fields / find pet tags (RE only)
 
-terrain / obstacle recon (spike)
+terrain / obstacle reach oracle (one-time setup: worldscan + findcull)
   worldscan [reset]          pin the terrain-grid offsets from your ground height (stand on solid
                              ground; if ambiguous, walk to a different-height spot and re-run)
+  findcull                   locate the on-screen object array (makes reach checks ~instant; re-run after a patch)
   attr [x,z]                 terrain attribute at your feet (or a world point): NONE/NOWALK/NOMOVE/DIE
+  attrmap [radius] [step]    ASCII map of terrain attributes around you (reveals invisible walls)
+  objects [radius]           list nearby CObj of any type + locate m_OBB (props the grid misses)
   reach [x,z]                is the straight path player->point (or ->selected target) walkable?
+  attackable          (canhit)  is the SELECTED mob reachable to attack? (terrain + object obstacles,
+                             within attack_range). select a mob, stand behind cover, run it.
 
 deep recon (rarely needed)
   findpos <x,y,z> [eps]      addresses whose 3 f32 match a position
@@ -311,7 +342,7 @@ deep recon (rarely needed)
   help (?)   this list         quit (q)   exit
 
 chain commands on one line with ';' or '&&':
-  set mob_flag_off 0x2830 ; set mob_flag_val 0x13`)
+  calibrate 253,100,243 MyChar 1234 ; auto any`)
 }
 
 cli_ps :: proc(args: []string) {
@@ -371,6 +402,7 @@ cli_attach :: proc(session: ^flyff.Session, args: []string) {
 
   if session.attached {
     flyff.remote_free_shim(session) // release the old process's cached shim page before re-attaching
+    flyff.remote_free_spawn_page(session)
     win.CloseHandle(session.proc_info.handle)
   }
   flyff.session_reset_scan(session)
@@ -430,10 +462,16 @@ cli_detach :: proc(session: ^flyff.Session) {
   session.auto_on = false // stop auto-farm when the process goes away
   session.auto_timer_at = 0
   session.auto_focus_obj = 0
+  session.auto_avoid_on = false
+  session.auto_sel_set = false
+  session.last_kill_set = false
+  session.auto_paused = false
+  session.pause_obj = 0
   clear(&session.auto_blocked)
   session.refocus_on = false
   session.srvsync_on = false
   flyff.remote_free_shim(session)
+  flyff.remote_free_spawn_page(session)
   win.CloseHandle(session.proc_info.handle)
   flyff.session_reset_scan(session)
   session.attached = false

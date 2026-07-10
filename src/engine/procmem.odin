@@ -12,6 +12,29 @@ read_into :: proc(handle: win.HANDLE, addr: uintptr, buf: []byte) -> (n: uint, o
   return read, res != win.FALSE
 }
 
+// Best-effort read: fill as much of buf as is mapped, page by page, stopping at the first unreadable
+// page. ReadProcessMemory fails the WHOLE call (reads 0) if any byte of the range is unmapped, so a
+// single big read of an object near the end of its region returns nothing; this captures the valid
+// prefix instead. Returns bytes read; the unread tail is left untouched (callers pass a zeroed buf).
+read_into_partial :: proc(handle: win.HANDLE, addr: uintptr, buf: []byte) -> (n: uint) {
+  if got, ok := read_into(handle, addr, buf); ok {
+    return got // fast path: whole range mapped
+  }
+  total := uint(len(buf))
+  off: uint = 0
+  for off < total {
+    cur := addr + uintptr(off)
+    to_boundary := uint(0x1000) - (uint(cur) & 0xFFF) // read up to the next page boundary
+    chunk := min(to_boundary, total - off)
+    got, ok := read_into(handle, cur, buf[off:off + chunk])
+    off += got
+    if !ok || got < chunk {
+      break // hit an unmapped page - stop at the valid prefix
+    }
+  }
+  return off
+}
+
 read_value :: proc(handle: win.HANDLE, addr: uintptr, t: Value_Type) -> (out: Value, ok: bool) {
   size := value_size(t)
   read: uint
