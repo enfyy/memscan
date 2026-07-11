@@ -58,6 +58,36 @@ FLYFF_AOBJCULL_RVA :: 0x0
 // Frustum: vFOV pi/4 (45deg) at default zoom, far plane 512, near 0.5 (World3D.cpp). 0 => not found.
 FLYFF_CAMERA_RVA :: 0x0
 
+// Collision-mesh filter (see terrain.odin collscan / obj_obb_blocks). The pursuit-movement collision
+// (CWorld::ProcessCollision) skips static OT_OBJ props whose model has no dedicated collision mesh
+// (m_CollObject.m_Type == GMT_ERROR): those are decorative (bushes, grass, butterflies) that you walk
+// through. We reproduce that so decoratives stop marking mobs unreachable. Two build-stable struct
+// offsets pin the chain CObj.m_pModel -> m_Element[0].m_pObject3D -> m_CollObject.m_Type; re-pin with
+// `collscan` after a patch. 0 => not pinned (filter off; every prop with an OBB blocks, as before).
+//   coll_obj3d_off - offset in CModelObject of m_Element[0].m_pObject3D (the collision CObject3D*)
+//   coll_type_off  - offset in CObject3D of m_CollObject.m_Type (GMTYPE; GMT_ERROR == -1 == no mesh)
+FLYFF_COLL_OBJ3D_OFF :: 0xFC
+FLYFF_COLL_TYPE_OFF :: 0x104
+
+// Mesh-accurate reach via the client's own CWorld::IntersectObjLine(pOut,&vPos,&vEnd,bSkipTrans,
+// bWithTerrain,bWithObject) - thiscall(ecx=CWorld*), 6 stack args, ret 0x18, BOOL in eax (TRUE=hit).
+// Called from an injected thread (remote_intersect_objline) for ground-truth OBB+triangle-mesh line
+// tests, replacing our loose whole-OBB approximation for GMT_NORMAL props. PATCH-SPECIFIC RVA; a stale
+// value would jump into wrong code = client crash, so remote_intersect_objline verifies the function
+// prologue bytes before every call. Re-find after a patch (string "CWorld::IntersectObjLine" ->
+// codescan -> func prologue). 0 => disabled.
+FLYFF_INTERSECTOBJLINE_RVA :: 0x44AA10
+
+// Camera-INDEPENDENT obstacle source (see terrain.odin collect_area_colliders). Each CLandscape tile
+// keeps a flat array of every object on it, unlike m_aobjCull which only holds what the render frustum
+// draws (measured: the cull list hides ~47% of nearby colliders). Layout (landscape.h, __MOD_OBJARR):
+//   CObj*  m_apObject[MAX_OBJARRAY=8]   @ CLandscape+landobj_off   (index by OT type: OBJ=0, CTRL=3)
+//   DWORD  m_adwObjNum[MAX_OBJARRAY=8]  @ CLandscape+landobj_off+0x20  (per-type live count)
+// Reach walks the player's tile + neighbours' OBJ/CTRL arrays instead of the cull list. Build-stable
+// struct offset; 0 => disabled (reach falls back to the camera-culled cull walk).
+FLYFF_LANDOBJ_OFF :: 0x80C
+LANDOBJ_MAX_ARRAY :: 8 // MAX_OBJARRAY (ProjectCmn.h); m_adwObjNum follows m_apObject at +MAX_ARRAY*4
+
 // Attackable-monster gate - the SOLE target filter for any-monster ("auto any") mode. The client
 // doesn't store a usable AI type on the mover OBJECT (per-object m_dwAIInterface is only set for
 // things the client runs AI for, e.g. your stat pet). The game's real classification lives in the
@@ -108,6 +138,10 @@ Flyff_Layout :: struct {
   attack_range:      f32,
   aobjcull_rva:      uintptr,
   camera_rva:        uintptr,
+  coll_obj3d_off:    i64,
+  coll_type_off:     i64,
+  intersectobjline_rva: uintptr,
+  landobj_off:       i64,
 }
 
 flyff_layout_default :: proc() -> Flyff_Layout {
@@ -137,5 +171,9 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     attack_range      = FLYFF_ATTACK_RANGE,
     aobjcull_rva      = FLYFF_AOBJCULL_RVA,
     camera_rva        = FLYFF_CAMERA_RVA,
+    coll_obj3d_off    = FLYFF_COLL_OBJ3D_OFF,
+    coll_type_off     = FLYFF_COLL_TYPE_OFF,
+    intersectobjline_rva = FLYFF_INTERSECTOBJLINE_RVA,
+    landobj_off       = FLYFF_LANDOBJ_OFF,
   }
 }

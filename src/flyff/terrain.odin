@@ -862,9 +862,10 @@ cli_objects :: proc(session: ^Session, args: []string) {
 // ---------------------------------------------------------------------------
 
 Obb :: struct {
-  center: [3]f32,
-  ext:    [3]f32, // HALF-extents
-  axis:   [3][3]f32, // orthonormal box axes
+  center:     [3]f32,
+  ext:        [3]f32, // HALF-extents
+  axis:       [3][3]f32, // orthonormal box axes
+  decorative: bool, // OT_OBJ with no dedicated collision mesh (GMT_ERROR) - walk-through, not a real blocker
 }
 
 // Read CObj::m_OBB (BBOX at pos_off-0x3C): Center(+0x0), Extent[3](+0xC), Axis[3][3](+0x18). sizeof 0x3C.
@@ -976,6 +977,9 @@ obj_obb_blocks :: proc(session: ^Session, obj: uintptr, ax, az, bx, bz, knee: f3
   if seg_dist_2d(px, pz, ax, az, bx, bz) > 48 {
     return // too far from the line (loose; seg_vs_obb is the exact test)
   }
+  if obj_is_decorative(session, obj, ty) {
+    return // no dedicated collision mesh -> the game's pursuit walks through it (bush/grass/etc.)
+  }
   oo := po - 0x3C
   obb.center = {rf(buf[:], oo), rf(buf[:], oo + 4), rf(buf[:], oo + 8)}
   obb.ext = {rf(buf[:], oo + 0xC), rf(buf[:], oo + 0x10), rf(buf[:], oo + 0x14)}
@@ -1002,6 +1006,31 @@ obj_segment_blocked :: proc(session: ^Session, ax, ay, az, bx, bz: f32) -> (bloc
   pt := engine.Value_Type.U32
   L := session.layout
   knee := ay + 0.4
+
+  // CAMERA-INDEPENDENT (preferred): test the segment against the cached tile-object colliders (all props
+  // on the nearby tiles, not just the on-screen cull list). Same OBB logic obj_obb_blocks uses.
+  if L.landobj_off != 0 && L.land_off != 0 && L.landwidth_off != 0 {
+    world := read_ptr_at(handle, base + L.world_rva, pt)
+    if world != 0 {
+      obbs := collect_area_colliders(session, world, ax, az)
+      ok_scan = true
+      for o in obbs {
+        if o.decorative {
+          continue // no dedicated collision mesh -> walk-through (bush/grass)
+        }
+        if seg_dist_2d(o.center[0], o.center[2], ax, az, bx, bz) > 48 {
+          continue
+        }
+        if point_in_obb({ax, knee, az}, o) {
+          continue // standing inside it (loose canopy) - not an approach blocker
+        }
+        if seg_vs_obb({ax, knee, az}, {bx, knee, bz}, o) {
+          return true, o, true
+        }
+      }
+      return false, {}, true
+    }
+  }
 
   // FAST: read the on-screen display list and test each entry until the live prefix ends.
   if L.aobjcull_rva != 0 {
@@ -1093,12 +1122,30 @@ collect_wall_cells :: proc(session: ^Session, world: uintptr, cx, cz, radius: f3
   return out
 }
 
-// OBBs of nearby collidable props (OT_OBJ + OT_CTRL) within `radius` of (cx,cz), from the on-screen cull
-// array - the boxes tdbg draws. Empty when the fast path (aobjcull_rva) isn't set (we never run the slow
-// full scan here). Temp-allocated.
+// OBBs of nearby collidable props (OT_OBJ + OT_CTRL) within `radius` of (cx,cz) - the boxes tdbg draws.
+// Prefers the CAMERA-INDEPENDENT tile-object source (all props, incl. off-screen); falls back to the
+// on-screen cull array only when the tile arrays aren't pinned. Temp-allocated.
 collect_nearby_obbs :: proc(session: ^Session, cx, cz, radius: f32) -> [dynamic]Obb {
   out := make([dynamic]Obb, context.temp_allocator)
-  if session.ptr_size != 4 || session.layout.aobjcull_rva == 0 {
+  if session.ptr_size != 4 {
+    return out
+  }
+  L0 := session.layout
+  if L0.landobj_off != 0 && L0.land_off != 0 && L0.landwidth_off != 0 {
+    world := read_ptr_at(session.proc_info.handle, session.proc_info.base + L0.world_rva, engine.Value_Type.U32)
+    if world != 0 {
+      lim2 := (radius + 24) * (radius + 24)
+      for o in collect_area_colliders(session, world, cx, cz) {
+        dx := o.center[0] - cx
+        dz := o.center[2] - cz
+        if dx * dx + dz * dz <= lim2 {
+          append(&out, o)
+        }
+      }
+      return out
+    }
+  }
+  if L0.aobjcull_rva == 0 {
     return out
   }
   handle := session.proc_info.handle
@@ -1147,9 +1194,146 @@ collect_nearby_obbs :: proc(session: ^Session, cx, cz, radius: f32) -> [dynamic]
     o.axis[0] = {rf(buf[:], oo + 0x18), rf(buf[:], oo + 0x1C), rf(buf[:], oo + 0x20)}
     o.axis[1] = {rf(buf[:], oo + 0x24), rf(buf[:], oo + 0x28), rf(buf[:], oo + 0x2C)}
     o.axis[2] = {rf(buf[:], oo + 0x30), rf(buf[:], oo + 0x34), rf(buf[:], oo + 0x38)}
+    o.decorative = obj_is_decorative(session, p, ty)
     append(&out, o)
   }
   return out
+}
+
+// ---------------------------------------------------------------------------
+// Camera-INDEPENDENT collider source: each CLandscape tile's flat m_apObject arrays (all objects on the
+// tile, not just the render-frustum cull list). Reach walks these so off-camera obstacles count. Cached
+// per player area (static props don't move) so the ~per-tile scan is amortized. See flyff.odin LANDOBJ.
+// ---------------------------------------------------------------------------
+
+COLLIDER_CACHE_MOVE :: f32(16) // refresh the cache once the player moves this far from its center
+COLLIDER_RADIUS :: f32(120) // gather colliders within this of the player (must cover reach segments)
+
+// Read one live CObj into an Obb (m_OBB at pos_off-0x3C) + its position + decorative flag. ok=false if
+// it's not a live CObj (no module vtable) or the read fails.
+obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  po := int(session.layout.pos_off)
+  wlen := po + 0x1C
+  if wlen > 512 {
+    return
+  }
+  buf: [512]byte
+  n, rok := engine.read_into(handle, obj, buf[:wlen])
+  if !rok || int(n) < wlen {
+    return
+  }
+  vt := uintptr(rd_u32le(buf[:], 0))
+  if vt < base || vt >= mod_end {
+    return
+  }
+  ty := rd_u32le(buf[:], po + 0x10)
+  rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
+  pos = {rf(buf[:], po), rf(buf[:], po + 4), rf(buf[:], po + 8)}
+  oo := po - 0x3C
+  o.center = {rf(buf[:], oo), rf(buf[:], oo + 4), rf(buf[:], oo + 8)}
+  o.ext = {rf(buf[:], oo + 0xC), rf(buf[:], oo + 0x10), rf(buf[:], oo + 0x14)}
+  o.axis[0] = {rf(buf[:], oo + 0x18), rf(buf[:], oo + 0x1C), rf(buf[:], oo + 0x20)}
+  o.axis[1] = {rf(buf[:], oo + 0x24), rf(buf[:], oo + 0x28), rf(buf[:], oo + 0x2C)}
+  o.axis[2] = {rf(buf[:], oo + 0x30), rf(buf[:], oo + 0x34), rf(buf[:], oo + 0x38)}
+  o.decorative = obj_is_decorative(session, obj, ty)
+  ok = true
+  return
+}
+
+// Append OT_OBJ + OT_CTRL colliders from one tile's flat m_apObject arrays into `out`, radius-filtered
+// around (cx,cz). Camera-independent: m_apObject[type] holds every object on the tile with a live count.
+gather_tile_colliders :: proc(session: ^Session, pland: uintptr, cx, cz, radius: f32, out: ^[dynamic]Obb) {
+  handle := session.proc_info.handle
+  pt := engine.Value_Type.U32
+  L := session.layout
+  types := [?]i64{0, 3} // OT_OBJ, OT_CTRL
+  for ti in types {
+    arrp := read_ptr_at(handle, pland + uintptr(L.landobj_off + ti * 4), pt)
+    if !is_heap_ptr(session, arrp) {
+      continue
+    }
+    cnt := read_i32_at(handle, pland + uintptr(L.landobj_off + LANDOBJ_MAX_ARRAY * 4 + ti * 4))
+    if cnt <= 0 || cnt > 200000 {
+      continue
+    }
+    ab := make([]byte, int(cnt) * 4, context.temp_allocator)
+    rn, _ := engine.read_into(handle, arrp, ab)
+    r2 := radius * radius
+    for k in 0 ..< int(rn) / 4 {
+      obj := uintptr(rd_u32le(ab, k * 4))
+      if obj < 0x10000 {
+        continue // freed / empty slot
+      }
+      // cheap radius reject on a 12-byte position read before the full OBB read
+      opos, ook := engine.read_vec3(handle, obj + uintptr(L.pos_off))
+      if !ook {
+        continue
+      }
+      dx := opos[0] - cx
+      dz := opos[2] - cz
+      if dx * dx + dz * dz > r2 {
+        continue
+      }
+      if o, _, ok := obj_to_obb(session, obj); ok {
+        append(out, o)
+      }
+    }
+  }
+}
+
+// Gather (and cache) every collidable prop within COLLIDER_RADIUS of the player from the CLandscape tile
+// arrays - the player's tile plus any neighbour tile the radius reaches. Camera-independent. Rebuilt only
+// when the player leaves the cached area, so segment tests hit the cache (pure math, no reads).
+collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32) -> []Obb {
+  L := session.layout
+  if world == 0 || L.landobj_off == 0 || L.land_off == 0 || L.landwidth_off == 0 || session.ptr_size != 4 {
+    return nil
+  }
+  if session.collider_cache_valid {
+    dx := px - session.collider_cache_center[0]
+    dz := pz - session.collider_cache_center[2]
+    if dx * dx + dz * dz <= COLLIDER_CACHE_MOVE * COLLIDER_CACHE_MOVE {
+      return session.collider_cache[:]
+    }
+  }
+  handle := session.proc_info.handle
+  pt := engine.Value_Type.U32
+  mpu := f32(world_mpu(session, world))
+  land_width := read_i32_at(handle, world + uintptr(L.landwidth_off))
+  land_height := read_i32_at(handle, world + uintptr(L.landwidth_off + 4))
+  arr := read_ptr_at(handle, world + uintptr(L.land_off), pt)
+  if !is_heap_ptr(session, arr) || land_width <= 0 || land_height <= 0 {
+    return nil
+  }
+  clear(&session.collider_cache)
+  tile_world := f32(MAP_SIZE) * mpu
+  m_x := int(px / mpu) / MAP_SIZE
+  m_z := int(pz / mpu) / MAP_SIZE
+  for tz := m_z - 1; tz <= m_z + 1; tz += 1 {
+    for tx := m_x - 1; tx <= m_x + 1; tx += 1 {
+      if tx < 0 || tz < 0 || tx >= int(land_width) || tz >= int(land_height) {
+        continue
+      }
+      // include a neighbour tile only if the gather radius actually reaches it
+      lo_x := f32(tx) * tile_world
+      lo_z := f32(tz) * tile_world
+      if px + COLLIDER_RADIUS < lo_x || px - COLLIDER_RADIUS > lo_x + tile_world ||
+         pz + COLLIDER_RADIUS < lo_z || pz - COLLIDER_RADIUS > lo_z + tile_world {
+        continue
+      }
+      pland := read_ptr_at(handle, arr + uintptr((tx + tz * int(land_width)) * session.ptr_size), pt)
+      if !is_heap_ptr(session, pland) {
+        continue
+      }
+      gather_tile_colliders(session, pland, px, pz, COLLIDER_RADIUS, &session.collider_cache)
+    }
+  }
+  session.collider_cache_center = {px, 0, pz}
+  session.collider_cache_valid = true
+  return session.collider_cache[:]
 }
 
 Reach_Status :: enum {
@@ -1181,6 +1365,19 @@ compute_reach :: proc(session: ^Session, world: uintptr, px, py, pz, tx, tz: f32
   }
   oblocked, ohit, oscan := obj_segment_blocked(session, px, py, pz, tx, tz)
   if oblocked {
+    // Two-stage mesh confirm: our OBB is the loose whole-silhouette box, so a "blocked" is often a false
+    // positive on a GMT_NORMAL prop (thin trunk under a wide canopy). Re-test with the client's own
+    // IntersectObjLine (OBB + triangle mesh) and treat as Clear if the client can reach it. OBB-CLEAR is
+    // trusted (validated: the OBB never under-blocks), so an injection only ever happens on an OBB block.
+    // Same knee-height horizontal segment obj_segment_blocked used (player Y for both ends).
+    if session.mesh_reach_on && session.ptr_size == 4 && intersectobjline_rva_sane(session) {
+      knee := f32(0.4)
+      v1 := [3]f32{px, py + knee, pz}
+      v2 := [3]f32{tx, py + knee, tz}
+      if cblocked, cok := remote_intersect_objline(session, world, v1, v2, false, true); cok && !cblocked {
+        return {status = .Clear, d = d, in_range = in_range, oscan = oscan}
+      }
+    }
     return {status = .Blocked_Object, d = d, in_range = in_range, ohit = ohit, oscan = oscan}
   }
   return {status = .Clear, d = d, in_range = in_range, oscan = oscan}
@@ -1344,6 +1541,617 @@ cli_findcull :: proc(session: ^Session, args: []string) {
     }
   } else {
     fmt.println("  => ambiguous (no dominant array). Pick the display list and 'set aobjcull_rva 0x<off>'.")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// collision-mesh probe - read a prop's model filename + m_CollObject.m_Type (the "does this .o3d have a
+// dedicated collision mesh" flag). Recon for the Cloakia decorative-prop filter. See flyff-particle-draw
+// sibling recon + the GMTYPE note below.
+// ---------------------------------------------------------------------------
+
+// GMTYPE (Object3D.h): the collision classification of a CObject3D's m_CollObject. GMT_ERROR = NO
+// dedicated collision mesh, in which case the engine falls back to colliding against the render mesh -
+// so GMT_ERROR is NOT "no collision", just "no purpose-built collider". The others carry a real mesh.
+GMT_ERROR :: i32(-1)
+GMT_NORMAL :: i32(0)
+GMT_SKIN :: i32(1)
+GMT_BONE :: i32(2)
+
+gmt_name :: proc(t: i32) -> string {
+  switch t {
+  case GMT_ERROR:
+    return "ERROR(no-mesh)"
+  case GMT_NORMAL:
+    return "NORMAL"
+  case GMT_SKIN:
+    return "SKIN"
+  case GMT_BONE:
+    return "BONE"
+  }
+  return "?"
+}
+
+MODEL_ELEM_SCAN :: 0x600 // bytes of CModelObject scanned for the m_Element[0].m_pObject3D pointer
+O3D_HEAD_SCAN :: 0x120 // bytes of CObject3D scanned for the m_szFileName string
+
+// Chase CObj -> m_pModel (CModelObject) -> m_Element[0].m_pObject3D (CObject3D) -> m_szFileName +
+// m_CollObject.m_Type. The two inner offsets aren't pinned yet, so we ANCHOR on the ".o3d" filename:
+// scan the model for a heap pointer whose target holds an ".o3d" string, then read the collision type at
+// (string start + 0x40) - m_szFileName is char[64] and m_CollObject.m_Type is GMOBJECT's first field -
+// and require a valid GMTYPE. elem_off/name_off are returned so a caller can vote a consensus to pin.
+probe_model_coll :: proc(session: ^Session, obj: uintptr) -> (fname: string, elem_off: i64, name_off: i64, coll: i32, ok: bool) {
+  handle := session.proc_info.handle
+  pt := engine.Value_Type.U32
+  model := read_ptr_at(handle, obj + uintptr(session.layout.model_off), pt)
+  if !is_heap_ptr(session, model) {
+    return
+  }
+  mbuf: [MODEL_ELEM_SCAN]byte
+  mn, mok := engine.read_into(handle, model, mbuf[:])
+  if !mok {
+    return
+  }
+  for eo := 0; eo + 4 <= int(mn); eo += 4 {
+    p := uintptr(rd_u32le(mbuf[:], eo))
+    if !is_heap_ptr(session, p) {
+      continue
+    }
+    obuf: [O3D_HEAD_SCAN]byte
+    on, ook := engine.read_into(handle, p, obuf[:])
+    if !ook || int(on) < 0x60 {
+      continue
+    }
+    for i := 0; i + 4 <= int(on); i += 1 {
+      // case-insensitive ".o3d"
+      if !(obuf[i] == '.' && (obuf[i + 1] | 0x20) == 'o' && obuf[i + 2] == '3' && (obuf[i + 3] | 0x20) == 'd') {
+        continue
+      }
+      st := i // walk back to the printable-ASCII string (field) start
+      for st > 0 && obuf[st - 1] >= 0x20 && obuf[st - 1] < 0x7f {
+        st -= 1
+      }
+      to := st + 0x40 // m_CollObject.m_Type at m_szFileName + 0x40
+      if to + 4 > int(on) {
+        continue
+      }
+      t := transmute(i32)rd_u32le(obuf[:], to)
+      if t < GMT_ERROR || t > GMT_BONE {
+        continue // not a plausible GMTYPE - this pointer isn't the CObject3D
+      }
+      en := i + 4 // end of the filename run
+      for en < int(on) && obuf[en] >= 0x20 && obuf[en] < 0x7f {
+        en += 1
+      }
+      fname = strings.clone(string(obuf[st:en]), context.temp_allocator)
+      elem_off = i64(eo)
+      name_off = i64(st)
+      coll = t
+      ok = true
+      return
+    }
+  }
+  return
+}
+
+// Fast collision-mesh type via the pinned offsets: CObj.m_pModel -> m_Element[0].m_pObject3D ->
+// m_CollObject.m_Type. Cheap (two pointer reads + one i32) so it can run in the per-segment prop walk,
+// unlike probe_model_coll's string search. ok=false when the offsets aren't pinned or a pointer is dead.
+obj_coll_type :: proc(session: ^Session, obj: uintptr) -> (t: i32, ok: bool) {
+  L := session.layout
+  if L.coll_obj3d_off == 0 || L.coll_type_off == 0 {
+    return
+  }
+  handle := session.proc_info.handle
+  pt := engine.Value_Type.U32
+  model := read_ptr_at(handle, obj + uintptr(L.model_off), pt)
+  if !is_heap_ptr(session, model) {
+    return
+  }
+  obj3d := read_ptr_at(handle, model + uintptr(L.coll_obj3d_off), pt)
+  if !is_heap_ptr(session, obj3d) {
+    return
+  }
+  v, vok := engine.read_value(handle, obj3d + uintptr(L.coll_type_off), .U32)
+  if !vok {
+    return
+  }
+  t = transmute(i32)u32(engine.value_as_u64(.U32, v))
+  ok = true
+  return
+}
+
+// Is this prop decorative (the game's pursuit collision walks straight through it)? Mirrors
+// CWorld::ProcessCollision: OT_OBJ static props are tested with bNeedCollObject=TRUE, which SKIPS any
+// whose m_CollObject.m_Type == GMT_ERROR (no dedicated collision mesh - bushes/grass/butterflies).
+// OT_CTRL (walls/housing) is tested with bNeedCollObject=FALSE and always collides, so it's never
+// decorative. When the coll offsets aren't pinned (ok=false) we can't tell, so we treat it as solid
+// (keep blocking) - the pre-filter behaviour.
+obj_is_decorative :: proc(session: ^Session, obj: uintptr, ty: u32) -> bool {
+  if ty != 0 { // OT_OBJ only; OT_CTRL always blocks
+    return false
+  }
+  if t, ok := obj_coll_type(session, obj); ok && t == GMT_ERROR {
+    return true
+  }
+  return false
+}
+
+// collscan [radius] - for each nearby OT_OBJ / OT_CTRL prop (from the on-screen cull array), read its
+// model filename + collision-mesh type. The decorative-prop recon: it shows, per prop, whether the .o3d
+// has a dedicated collision mesh (NORMAL) or falls back to the render mesh (ERROR). Read-only; also
+// reports a consensus (elem_off, name_off) so those two inner offsets can be pinned for a fast filter.
+cli_collscan :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if session.ptr_size != 4 {
+    fmt.eprintln("collscan: 32-bit Flyff client only.")
+    return
+  }
+  L := session.layout
+  if L.aobjcull_rva == 0 {
+    fmt.eprintln("collscan: needs the on-screen cull array - run 'findcull' first.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  po := int(L.pos_off)
+  wlen := po + 0x1C
+  if wlen > 512 {
+    fmt.eprintln("collscan: implausible pos_off.")
+    return
+  }
+
+  ppos, pok := read_player_pos(session)
+  if !pok {
+    fmt.eprintln("collscan: couldn't read player position.")
+    return
+  }
+  radius := f32(40)
+  if len(args) >= 1 {
+    if r, rok := strconv.parse_f64(args[0]); rok && r > 0 {
+      radius = f32(r)
+    }
+  }
+
+  CAP :: 8192
+  idx := make([]byte, CAP * 4, context.temp_allocator)
+  n, _ := engine.read_into(handle, base + L.aobjcull_rva, idx)
+  buf: [512]byte
+  rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
+
+  Row :: struct {
+    obj:      uintptr,
+    ty:       u32,
+    dist:     f32,
+    coll:     i32,
+    has_coll: bool,
+    fname:    string,
+  }
+  rows := make([dynamic]Row, context.temp_allocator)
+  votes := make(map[[2]i64]int, 8, context.temp_allocator)
+  seen := make(map[uintptr]bool, 512, context.temp_allocator) // m_aobjCull repeats the same CObj* across slots
+  n_props := 0
+  n_probed := 0
+  for k in 0 ..< int(n) / 4 {
+    p := uintptr(rd_u32le(idx, k * 4))
+    if p < 0x10000 {
+      break // null slot = past the live entries
+    }
+    rn, rok := engine.read_into(handle, p, buf[:wlen])
+    if !rok || int(rn) < wlen {
+      break
+    }
+    vt := uintptr(rd_u32le(buf[:], 0))
+    if vt < base || vt >= mod_end {
+      break // end of the live cull prefix
+    }
+    ty := rd_u32le(buf[:], po + 0x10)
+    if ty != 0 && ty != 3 {
+      continue // OT_OBJ / OT_CTRL only (the collidable props)
+    }
+    if seen[p] {
+      continue // already listed this prop
+    }
+    seen[p] = true
+    ocx := rf(buf[:], po)
+    ocz := rf(buf[:], po + 8)
+    dx := ocx - ppos[0]
+    dz := ocz - ppos[2]
+    dist := math.sqrt(dx * dx + dz * dz)
+    if dist > radius {
+      continue
+    }
+    n_props += 1
+    fname, eoff, noff, coll, cok := probe_model_coll(session, p)
+    if cok {
+      n_probed += 1
+      votes[[2]i64{eoff, noff}] += 1
+    }
+    append(&rows, Row{p, ty, dist, coll, cok, fname})
+  }
+
+  // sort by distance (selection sort; small near-set)
+  for i in 0 ..< len(rows) {
+    mn := i
+    for j in i + 1 ..< len(rows) {
+      if rows[j].dist < rows[mn].dist {
+        mn = j
+      }
+    }
+    rows[i], rows[mn] = rows[mn], rows[i]
+  }
+
+  fmt.printfln("collscan: %d props (OT_OBJ/OT_CTRL) within %.0f of player; %d resolved a model+coll type.", n_props, radius, n_probed)
+  fmt.println("  addr        type       dist  coll            model (.o3d)")
+  n_err := 0
+  n_mesh := 0
+  for r in rows {
+    coll_s := r.has_coll ? gmt_name(r.coll) : "?(no model)"
+    if r.has_coll {
+      if r.coll == GMT_ERROR {n_err += 1} else {n_mesh += 1}
+    }
+    fmt.printfln("  0x%08X  %-6s(%d)  %5.1f  %-14s  %s", r.obj, ot_name(r.ty), r.ty, r.dist, coll_s, r.fname)
+  }
+  fmt.printfln("  => %d with a dedicated collision mesh (NORMAL/SKIN/BONE), %d ERROR (render-mesh fallback).", n_mesh, n_err)
+  // Consensus inner offsets (only meaningful if most props agree).
+  best_key: [2]i64
+  best_v := 0
+  for key, v in votes {
+    if v > best_v {
+      best_v = v
+      best_key = key
+    }
+  }
+  if best_v > 0 {
+    type_off := best_key[1] + 0x40
+    fmt.printfln(
+      "  => consensus offsets: m_Element[0].m_pObject3D @ model+0x%X, m_szFileName @ object3D+0x%X (%d/%d props agree). m_CollObject.m_Type @ +0x%X.",
+      best_key[0], best_key[1], best_v, n_probed, type_off,
+    )
+    // Pin + save only on a strong consensus, so a patch-shifted layout can't half-pin a bad offset.
+    if n_probed >= 8 && best_v == n_probed {
+      L.coll_obj3d_off = best_key[0]
+      L.coll_type_off = type_off
+      session.layout = L
+      if flyff_save_cfg(session.layout, flyff_cfg_path()) {
+        fmt.println("  => pinned coll_obj3d_off / coll_type_off -> flyff.cfg. Decorative-prop filter is now ON.")
+      }
+    } else if best_v != n_probed {
+      fmt.println("  => not saved (props disagree on the offsets). Re-run somewhere with more props in view.")
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// linkscan - pin CLandscape::m_apObjLink (the collision spatial index) so reach can enumerate obstacles
+// CAMERA-INDEPENDENTLY (unlike m_aobjCull, which only holds what the render frustum draws). Structure
+// (landscape.h / lod.cpp): CLandscape.m_apObjLink[MAX_LINKTYPE=4][MAX_LINKLEVEL=7], each a CObj** head
+// array of nWidth^2 cells (nWidth = 128>>level); objects chain via CObj::m_pNext (= pos_off+0x20).
+// Cell index (InsertObjLink): nUnit=1<<level; nPos=(localZ/nUnit)*nWidth + localX/nUnit.
+// ---------------------------------------------------------------------------
+
+LINK_MAX_LEVEL :: 7
+LINK_MAX_TYPE :: 4
+
+// Walk one static-link cell chain and report whether `target` is in it (validating a candidate table).
+linkmap_cell_has :: proc(session: ^Session, arr_ptr: uintptr, npos: int, mnext: i64, target: uintptr) -> bool {
+  handle := session.proc_info.handle
+  pt := engine.Value_Type.U32
+  node := read_ptr_at(handle, arr_ptr + uintptr(npos * 4), pt)
+  for steps := 0; node != 0 && steps < 400; steps += 1 {
+    if node == target {
+      return true
+    }
+    if !is_heap_ptr(session, node) {
+      break
+    }
+    node = read_ptr_at(handle, node + uintptr(mnext), pt)
+  }
+  return false
+}
+
+// linkscan - locate m_apObjLink in the player's tile CLandscape by finding the 28-pointer table whose
+// static level arrays actually chain to a known nearby prop, then report how many colliders the linkmap
+// sees around the player vs the render cull list (the camera-hidden count). Read-only.
+cli_linkscan :: proc(session: ^Session, args: []string) {
+  if !session.attached || session.ptr_size != 4 {
+    fmt.eprintln("attach a 32-bit Neuz first.")
+    return
+  }
+  if !terrain_ready(session) {
+    fmt.eprintln("linkscan: needs terrain pinned - run 'worldscan' first.")
+    return
+  }
+  if session.layout.aobjcull_rva == 0 {
+    fmt.eprintln("linkscan: needs the cull array for an anchor prop - run 'findcull' first.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  pt := engine.Value_Type.U32
+  L := session.layout
+  po := int(L.pos_off)
+  mnext := L.pos_off + 0x20 // CObj::m_pNext (verified vs field_off/model_off member chain)
+
+  world := read_ptr_at(handle, base + L.world_rva, pt)
+  player := read_ptr_at(handle, base + L.player_rva, pt)
+  if world == 0 || player == 0 {
+    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    return
+  }
+  ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
+  if !pok {
+    fmt.eprintln("couldn't read player position.")
+    return
+  }
+  mpu := world_mpu(session, world)
+  land_width := read_i32_at(handle, world + uintptr(L.landwidth_off))
+  if land_width <= 0 || land_width > 256 {
+    fmt.eprintln("linkscan: bad land width.")
+    return
+  }
+  arr := read_ptr_at(handle, world + uintptr(L.land_off), pt) // m_apLand
+  pcx := int(ppos[0] / f32(mpu))
+  pcz := int(ppos[2] / f32(mpu))
+  m_x := pcx / MAP_SIZE
+  m_z := pcz / MAP_SIZE
+  ptile := m_x + m_z * int(land_width)
+  pland := read_ptr_at(handle, arr + uintptr(ptile * session.ptr_size), pt)
+  if !is_heap_ptr(session, pland) {
+    fmt.eprintln("linkscan: player tile CLandscape didn't resolve.")
+    return
+  }
+
+  // Anchor: a static OT_OBJ from the cull list that sits in the player's own tile (so pland is its tile).
+  anchor: uintptr = 0
+  ax, az: f32
+  CAP :: 8192
+  idx := make([]byte, CAP * 4, context.temp_allocator)
+  n, _ := engine.read_into(handle, base + L.aobjcull_rva, idx)
+  wlen := po + 0x1C
+  buf: [512]byte
+  for k in 0 ..< int(n) / 4 {
+    p := uintptr(rd_u32le(idx, k * 4))
+    if p < 0x10000 {
+      break
+    }
+    rn, rok := engine.read_into(handle, p, buf[:wlen])
+    if !rok || int(rn) < wlen {
+      break
+    }
+    vt := uintptr(rd_u32le(buf[:], 0))
+    if vt < base || vt >= mod_end {
+      break
+    }
+    ty := rd_u32le(buf[:], po + 0x10)
+    if ty != 0 {
+      continue // OT_OBJ (linkStatic) anchors only
+    }
+    ox := transmute(f32)rd_u32le(buf[:], po)
+    oz := transmute(f32)rd_u32le(buf[:], po + 8)
+    if int(ox / f32(mpu)) / MAP_SIZE != m_x || int(oz / f32(mpu)) / MAP_SIZE != m_z {
+      continue // must be in the player's tile
+    }
+    olx := int(ox / f32(mpu)) - m_x * MAP_SIZE
+    olz := int(oz / f32(mpu)) - m_z * MAP_SIZE
+    if olx < 8 || olx > 119 || olz < 8 || olz > 119 {
+      continue // avoid tile-edge cells (off-by-one origin risk)
+    }
+    model := read_ptr_at(handle, p + uintptr(L.model_off), pt)
+    if !is_heap_ptr(session, model) {
+      continue // unlinked (no model) props aren't inserted
+    }
+    anchor = p
+    ax, az = ox, oz
+    break
+  }
+  if anchor == 0 {
+    fmt.eprintln("linkscan: no static OT_OBJ anchor in your tile is on-screen. Face some trees/rocks and retry.")
+    return
+  }
+
+  lx := int(ax / f32(mpu)) - m_x * MAP_SIZE
+  lz := int(az / f32(mpu)) - m_z * MAP_SIZE
+  fmt.printfln("linkscan: pland=0x%X tile=%d (m_x=%d m_z=%d)  anchor=0x%X pos(%.1f,%.1f) local cell(%d,%d) mpu=%d", pland, ptile, m_x, m_z, anchor, ax, az, lx, lz, mpu)
+  a_world := read_ptr_at(handle, anchor + uintptr(L.field_off), pt)
+  a_type := read_i32_at(handle, anchor + uintptr(po + 0x10))
+  a_model := read_ptr_at(handle, anchor + uintptr(L.model_off), pt)
+  a_prev := read_ptr_at(handle, anchor + uintptr(po + 0x1C), pt)
+  a_next := read_ptr_at(handle, anchor + uintptr(po + 0x20), pt)
+  fmt.printfln("  anchor fields: m_pWorld=0x%X (world=0x%X %s) type=%d model=0x%X m_pPrev=0x%X m_pNext=0x%X", a_world, world, a_world == world ? "OK" : "MISMATCH", a_type, a_model, a_prev, a_next)
+
+  // Definitive: scan memory for addresses that HOLD the anchor pointer. One of them is its cell-head slot
+  // inside an m_apObjLink array. For each, see if a CLandscape pointer (in the first 0x8000) is the base of
+  // an array containing it - that reveals the table offset AND the true cell index (to fix the formula).
+  aval := engine.ptr_to_value(anchor, session.ptr_size)
+  regions := engine.collect_regions(handle, true)
+  defer delete(regions)
+  set := engine.scan_exact_regions(handle, pt, aval, regions[:], nil, context.temp_allocator)
+  fmt.printfln("  anchor pointer is held at %d address(es); locating the one inside a CLandscape array:", len(set.matches))
+  hits := 0
+  for m in set.matches {
+    for o := i64(0); o < 0x8000; o += 4 {
+      B := read_ptr_at(handle, pland + uintptr(o), pt)
+      if !is_heap_ptr(session, B) {
+        continue
+      }
+      if m.addr >= B && m.addr < B + uintptr(MAP_SIZE * MAP_SIZE * 4) {
+        cell := int(m.addr - B) / 4
+        fmt.printfln("  -> slot 0x%X is in array @ CLandscape+0x%X (base 0x%X), cell index %d.", m.addr, o, B, cell)
+        // decode cell for each level: does cell == (lz/nunit)*nwidth + lx/nunit ?
+        for level in 0 ..< LINK_MAX_LEVEL {
+          nwidth := MAP_SIZE >> uint(level)
+          if cell < nwidth * nwidth {
+            cxx := cell % nwidth
+            czz := cell / nwidth
+            nunit := 1 << uint(level)
+            fmt.printfln("       if level %d (nWidth %d): cell=(%d,%d)  expected from pos=(%d,%d)", level, nwidth, cxx, czz, lx / nunit, lz / nunit)
+          }
+        }
+        hits += 1
+        break
+      }
+    }
+    if hits >= 4 {
+      break
+    }
+  }
+  if hits == 0 {
+    fmt.println("  -> anchor pointer not found inside any CLandscape+0..0x8000 array. Table is deeper, or link model differs.")
+  }
+}
+
+// ---------------------------------------------------------------------------
+// objline / reachcmp - validate our OBB oracle against the client's own IntersectObjLine (step 3)
+// ---------------------------------------------------------------------------
+
+// objline [x,z] - call the client's own CWorld::IntersectObjLine (ground-truth OBB + triangle mesh) for
+// the segment player -> point (or -> selected target), printed beside our OBB-oracle verdict. Where our
+// loose OBB says "blocked" but the client says "clear", that's a false block the mesh-accurate path
+// fixes. Object-only (no terrain). Injects a thread that runs game code - see remote_intersect_objline.
+cli_objline :: proc(session: ^Session, args: []string) {
+  if !session.attached || session.ptr_size != 4 {
+    fmt.eprintln("attach a 32-bit Neuz first.")
+    return
+  }
+  if !intersectobjline_rva_sane(session) {
+    fmt.eprintln("objline: intersectobjline_rva unset or its prologue doesn't match (patch moved it?). re-find it.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  ps := session.ptr_size
+  pt := engine.Value_Type.U32
+  L := session.layout
+  world := read_ptr_at(handle, base + L.world_rva, pt)
+  player := read_ptr_at(handle, base + L.player_rva, pt)
+  if world == 0 || player == 0 {
+    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    return
+  }
+  ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
+  if !pok {
+    fmt.eprintln("couldn't read player position.")
+    return
+  }
+  tx, ty, tz: f32
+  label := ""
+  if len(args) >= 1 {
+    x, z, ok := parse_xz(args[0])
+    if !ok {
+      fmt.eprintln("usage: objline [x,z]   (no arg = to the selected target)")
+      return
+    }
+    tx, ty, tz = x, ppos[1], z
+    label = fmt.tprintf("point (%.1f, %.1f)", tx, tz)
+  } else {
+    focus := read_ptr_at(handle, world + uintptr(L.focus_off), pt)
+    if focus == 0 || !in_module_range(read_ptr_at(handle, focus, pt), base, mod_end) {
+      fmt.eprintln("no live target selected. Click a mob (keep it selected), or pass 'objline <x,z>'.")
+      return
+    }
+    tpos, tok := engine.read_vec3(handle, focus + uintptr(L.pos_off))
+    if !tok {
+      fmt.eprintln("couldn't read target position.")
+      return
+    }
+    tx, ty, tz = tpos[0], tpos[1], tpos[2]
+    nm, _ := engine.read_obj_name(handle, ps, focus, L.name_off)
+    label = fmt.tprintf("target '%s' (%.1f, %.1f)", nm, tx, tz)
+  }
+
+  knee := f32(0.4)
+  v1 := [3]f32{ppos[0], ppos[1] + knee, ppos[2]}
+  v2 := [3]f32{tx, ty + knee, tz}
+  d := engine.dist_horizontal({ppos[0], 0, ppos[2]}, {tx, 0, tz})
+
+  ours, _, _ := obj_segment_blocked(session, ppos[0], ppos[1], ppos[2], tx, tz)
+  client, cok := remote_intersect_objline(session, world, v1, v2, false, true)
+  fmt.printfln("objline -> %s (d=%.1f):", label, d)
+  fmt.printfln("  our OBB oracle : %s", ours ? "BLOCKED" : "clear")
+  if cok {
+    fmt.printfln("  client IntersectObjLine: %s%s", client ? "BLOCKED" : "clear", (ours && !client) ? "   <- our loose OBB false-blocks this" : "")
+  } else {
+    fmt.println("  client IntersectObjLine: (call failed / thread didn't finish)")
+  }
+}
+
+// reachcmp [n] - for the nearest n monsters, compare our OBB object-reach oracle against the client's own
+// IntersectObjLine (both object-only). Tallies agreement and, crucially, how many our loose whole-OBB
+// FALSELY blocks (ours=blocked, client=clear) - the step-3 payoff on GMT_NORMAL props. Injects one
+// game-code thread per mob (capped), so keep n modest.
+cli_reachcmp :: proc(session: ^Session, args: []string) {
+  if !session.attached || session.ptr_size != 4 {
+    fmt.eprintln("attach a 32-bit Neuz first.")
+    return
+  }
+  if !intersectobjline_rva_sane(session) {
+    fmt.eprintln("reachcmp: intersectobjline_rva unset or prologue mismatch. re-find it.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  pt := engine.Value_Type.U32
+  L := session.layout
+  world := read_ptr_at(handle, base + L.world_rva, pt)
+  player := read_ptr_at(handle, base + L.player_rva, pt)
+  if world == 0 || player == 0 {
+    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    return
+  }
+  ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
+  if !pok {
+    fmt.eprintln("couldn't read player position.")
+    return
+  }
+  cap_n := 12
+  if len(args) >= 1 {
+    if v, ok := strconv.parse_int(args[0]); ok && v > 0 {
+      cap_n = min(v, 40)
+    }
+  }
+  cands := tc_collect_cands(session, nil, world, player, ppos) // nearest-first, any-monster
+  if len(cands) == 0 {
+    fmt.println("reachcmp: no monster candidates in view.")
+    return
+  }
+  n := min(cap_n, len(cands))
+  knee := f32(0.4)
+  both_clear, both_blk, ours_only, client_only, failed := 0, 0, 0, 0, 0
+  fmt.printfln("reachcmp: nearest %d monsters, our OBB oracle vs client IntersectObjLine (object-only):", n)
+  fmt.println("   #   dist   ours    client   name")
+  for i in 0 ..< n {
+    c := cands[i]
+    ours, _, _ := obj_segment_blocked(session, ppos[0], ppos[1], ppos[2], c.pos[0], c.pos[2])
+    v1 := [3]f32{ppos[0], ppos[1] + knee, ppos[2]}
+    v2 := [3]f32{c.pos[0], c.pos[1] + knee, c.pos[2]}
+    client, cok := remote_intersect_objline(session, world, v1, v2, false, true)
+    nm, _ := read_mover_name(session, c.obj)
+    cs := "?"
+    if cok {
+      cs = client ? "BLOCKED" : "clear"
+      if ours && client {both_blk += 1}
+      if !ours && !client {both_clear += 1}
+      if ours && !client {ours_only += 1}
+      if !ours && client {client_only += 1}
+    } else {
+      failed += 1
+    }
+    flag := (cok && ours && !client) ? "  <- false block" : ((cok && !ours && client) ? "  <- WE MISS this" : "")
+    fmt.printfln("  %2d  %5.1f   %-7s  %-7s  %s%s", i + 1, c.d, ours ? "BLOCKED" : "clear", cs, nm, flag)
+  }
+  fmt.printfln(
+    "  => agree clear %d, agree blocked %d | ours-only (loose-OBB false blocks) %d | client-only (we miss) %d | call-failed %d",
+    both_clear, both_blk, ours_only, client_only, failed,
+  )
+  if ours_only > 0 {
+    fmt.printfln("  => %d mob(s) our OBB blocks but the client can reach - the mesh-accurate path would recover them.", ours_only)
   }
 }
 

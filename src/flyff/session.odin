@@ -63,6 +63,14 @@ Session :: struct {
   // it never triggers the slow scan in the pick loop. Default on; 'reachgate off' disables.
   reach_gate_on:    bool,
 
+  // Mesh-accurate reach confirm (see compute_reach / remote_intersect_objline). When on, a candidate the
+  // loose OBB marks BLOCKED is re-tested with the client's own IntersectObjLine (OBB + triangle mesh) and
+  // treated as Clear if the client can reach it - recovers mobs the whole-silhouette OBB false-blocks.
+  // Injects a game-code thread per OBB-blocked candidate (OBB-clear is trusted, so no injection there).
+  // Inert unless intersectobjline_rva is set + its prologue matches. Default OFF - the injected call walks
+  // the live collision linkmaps and correlated with more crashes under sustained farming; 'meshreach on'.
+  mesh_reach_on:    bool,
+
   // Bow-range retarget anchor (see tc_select). While a shootable mob is in bow range, the auto picker
   // ranks by nearest-to-the-last-kill's-spot instead of nearest-to-you, so a ranger stays on the pack.
   auto_sel_pos:     [3]f32, // world pos of the current auto target when it was selected (pending anchor)
@@ -101,6 +109,18 @@ Session :: struct {
   spawn_page:      uintptr,
   spawn_page_size: uint,
 
+  // Cached RWX page for the client-IntersectObjLine remote call (remote_intersect_objline). Layout is
+  // fixed-size (input vecs + result slot + shim), so it's allocated once and reused per query. 0 = none.
+  objline_page: uintptr,
+
+  // Camera-independent nearby-collider cache (see collect_area_colliders). Built by walking the player's
+  // tile + neighbours' flat CLandscape object arrays (m_apObject), so reach sees off-camera obstacles the
+  // render cull list misses. Static props don't move, so it's refreshed only when the player leaves the
+  // cached area (moves > COLLIDER_CACHE_MOVE from center). Reach then tests segments against these OBBs.
+  collider_cache:        [dynamic]Obb,
+  collider_cache_center: [3]f32,
+  collider_cache_valid:  bool,
+
   // Global hotkeys (see hotkey.odin). exec_mutex serializes command execution between the REPL
   // thread and the hotkey watcher thread. exec_line runs a CLI line (set by main to the REPL's
   // dispatcher); the watcher calls it through this pointer so flyff never imports the cli/main
@@ -120,6 +140,11 @@ session_init :: proc(session: ^Session) -> bool {
   session.writable_only = true
   session.auto_stuck_on = true // obstacle/stuck detection on by default (see auto_monitor)
   session.reach_gate_on = true // proactive reach gate on by default (inert until findcull sets aobjcull_rva)
+  // Mesh-accurate reach confirm defaults OFF: it injects a game-code thread (IntersectObjLine) per
+  // OBB-blocked candidate, which walks the live collision linkmaps concurrently with the main thread -
+  // a real race that correlated with more client crashes during sustained farming. The zero-injection
+  // decorative filter (collscan) delivers most of the benefit safely. Opt in per session with 'meshreach on'.
+  session.mesh_reach_on = false
   session.layout = flyff_layout_default()
   if err := virtual.arena_init_growing(&session.scan_arena); err != .None {
     fmt.eprintln("failed to initialise scan arena")

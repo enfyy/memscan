@@ -102,6 +102,122 @@ remote_free_shim :: proc(session: ^Session) {
   session.srv_shim = 0
 }
 
+// --- Mesh-accurate reach via the client's own CWorld::IntersectObjLine -------------------------
+// Fixed page layout (allocated once, reused per query): input vectors, a callee-written intersect
+// point, our captured return slot, then the shim.
+OBJLINE_VPOS_OFF :: 0x00 // D3DXVECTOR3 vPos (input, segment start)
+OBJLINE_VEND_OFF :: 0x0C // D3DXVECTOR3 vEnd (input, segment end)
+OBJLINE_POUT_OFF :: 0x18 // D3DXVECTOR3 pOut (callee writes the hit point; we don't read it)
+OBJLINE_RES_OFF :: 0x24 // u32 result: the BOOL eax (TRUE = segment hit something)
+OBJLINE_CODE_OFF :: 0x28 // shim code start
+OBJLINE_PAGE_LEN :: 0x80
+
+// Verify the function prologue at intersectobjline_rva before calling it, so a patch-shifted (stale)
+// RVA refuses instead of jumping into wrong code and crashing the client. Prologue is
+// `55 8B EC 83 E4 F0 B8` (push ebp; mov ebp,esp; and esp,-16; mov eax,imm) - the aligned-frame +
+// __chkstk opener; the imm (frame size) is left out since it can shift build-to-build.
+intersectobjline_rva_sane :: proc(session: ^Session) -> bool {
+  if session.layout.intersectobjline_rva == 0 || session.ptr_size != 4 {
+    return false
+  }
+  want := [?]byte{0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0xB8}
+  buf: [7]byte
+  n, ok := engine.read_into(session.proc_info.handle, session.proc_info.base + session.layout.intersectobjline_rva, buf[:])
+  if !ok || int(n) < len(want) {
+    return false
+  }
+  for b, i in want {
+    if buf[i] != b {
+      return false
+    }
+  }
+  return true
+}
+
+// Call the client's own CWorld::IntersectObjLine(pOut,&v1,&v2,FALSE,bWithTerrain,bWithObject) from an
+// injected thread: ground-truth OBB + triangle-mesh line test, the exact routine the game uses. Returns
+// blocked=TRUE when the segment v1->v2 hits terrain/object per the flags. ok=false when disabled/unsafe
+// (RVA unset or prologue mismatch) or the thread didn't finish. Serialise via exec_mutex. WARNING: runs
+// game code that walks the world linkmaps from another thread - the same small main-thread race as the
+// settarget/particle injections.
+remote_intersect_objline :: proc(session: ^Session, world: uintptr, v1, v2: [3]f32, with_terrain, with_object: bool) -> (blocked: bool, ok: bool) {
+  if world == 0 || !intersectobjline_rva_sane(session) {
+    return
+  }
+  handle := session.proc_info.handle
+  fn := u32(session.proc_info.base + session.layout.intersectobjline_rva)
+
+  if session.objline_page == 0 {
+    page := win.VirtualAllocEx(handle, nil, OBJLINE_PAGE_LEN, win.MEM_COMMIT | win.MEM_RESERVE, win.PAGE_EXECUTE_READWRITE)
+    if page == nil {
+      fmt.eprintfln("VirtualAllocEx (objline) failed (error %d)", win.GetLastError())
+      return
+    }
+    session.objline_page = uintptr(page)
+  }
+  page := session.objline_page
+  P := u32(page)
+
+  buf: [OBJLINE_PAGE_LEN]byte
+  put32_le(buf[OBJLINE_VPOS_OFF:], transmute(u32)v1[0])
+  put32_le(buf[OBJLINE_VPOS_OFF + 4:], transmute(u32)v1[1])
+  put32_le(buf[OBJLINE_VPOS_OFF + 8:], transmute(u32)v1[2])
+  put32_le(buf[OBJLINE_VEND_OFF:], transmute(u32)v2[0])
+  put32_le(buf[OBJLINE_VEND_OFF + 4:], transmute(u32)v2[1])
+  put32_le(buf[OBJLINE_VEND_OFF + 8:], transmute(u32)v2[2])
+  // OBJLINE_RES_OFF stays 0 (buf is zero-initialised) until the shim stores eax.
+
+  // Args are pushed right-to-left; the callee (ret 0x18) cleans its own 6 args, then our `ret 4` cleans
+  // the thread's lpParameter. ecx = CWorld* this.
+  c := OBJLINE_CODE_OFF
+  buf[c] = 0xB9;put32_le(buf[c + 1:], u32(world));c += 5 // mov ecx, world
+  buf[c] = 0x6A;buf[c + 1] = with_object ? 1 : 0;c += 2 // push bWithObject
+  buf[c] = 0x6A;buf[c + 1] = with_terrain ? 1 : 0;c += 2 // push bWithTerrain
+  buf[c] = 0x6A;buf[c + 1] = 0x00;c += 2 // push bSkipTrans = FALSE
+  buf[c] = 0x68;put32_le(buf[c + 1:], P + OBJLINE_VEND_OFF);c += 5 // push &vEnd
+  buf[c] = 0x68;put32_le(buf[c + 1:], P + OBJLINE_VPOS_OFF);c += 5 // push &vPos
+  buf[c] = 0x68;put32_le(buf[c + 1:], P + OBJLINE_POUT_OFF);c += 5 // push pOut
+  buf[c] = 0xB8;put32_le(buf[c + 1:], fn);c += 5 // mov eax, IntersectObjLine
+  buf[c] = 0xFF;buf[c + 1] = 0xD0;c += 2 // call eax
+  buf[c] = 0xA3;put32_le(buf[c + 1:], P + OBJLINE_RES_OFF);c += 5 // mov [result], eax
+  buf[c] = 0xC2;buf[c + 1] = 0x04;buf[c + 2] = 0x00 // ret 4
+
+  written: uint
+  if win.WriteProcessMemory(handle, rawptr(page), raw_data(buf[:]), OBJLINE_PAGE_LEN, &written) == win.FALSE ||
+     written != OBJLINE_PAGE_LEN {
+    fmt.eprintfln("WriteProcessMemory (objline) failed (error %d)", win.GetLastError())
+    return
+  }
+  start := transmute(proc "system" (rawptr) -> win.DWORD)rawptr(page + uintptr(OBJLINE_CODE_OFF))
+  th := win.CreateRemoteThread(handle, nil, 0, start, nil, 0, nil)
+  if th == nil {
+    fmt.eprintfln("CreateRemoteThread (objline) failed (error %d)", win.GetLastError())
+    return
+  }
+  wait := win.WaitForSingleObject(th, 5000)
+  win.CloseHandle(th)
+  if wait != win.WAIT_OBJECT_0 {
+    fmt.eprintln("objline thread did not finish in 5s; leaking its page for safety.")
+    session.objline_page = 0
+    return
+  }
+  rv, rok := engine.read_value(handle, page + uintptr(OBJLINE_RES_OFF), .U32)
+  if !rok {
+    return
+  }
+  blocked = engine.value_as_u64(.U32, rv) != 0
+  ok = true
+  return
+}
+
+// Free the cached IntersectObjLine page (call while attached, handle valid). Idempotent.
+remote_free_objline_page :: proc(session: ^Session) {
+  if session.objline_page != 0 && session.attached {
+    win.VirtualFreeEx(session.proc_info.handle, rawptr(session.objline_page), 0, win.MEM_RELEASE)
+  }
+  session.objline_page = 0
+}
+
 // --- In-world debug markers via the client's own particle system -------------------------------
 // CParticleMng layout (from disasm of CParticleMng::CreateParticle, see flyff-particle-draw.md):
 //   m_pd3dDevice at g_ParticleMng+0x0, m_Particles[0] at +0x8, sizeof(CParticles)=0x3C, m_bActive +0x2C.

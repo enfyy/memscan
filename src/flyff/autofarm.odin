@@ -461,6 +461,32 @@ cli_reachgate :: proc(session: ^Session, args: []string) {
   fmt.printfln("reach-gate %s.%s", session.reach_gate_on ? "ON" : "OFF", hint)
 }
 
+// meshreach | meshreach on|off -> toggle the mesh-accurate reach confirm. When on, a candidate our loose
+// OBB marks blocked is re-tested with the client's own IntersectObjLine (OBB + triangle mesh) and kept if
+// the client can reach it - recovers mobs the whole-silhouette OBB false-blocks. Injects a game-code
+// thread per OBB-blocked candidate. On by default, inert until intersectobjline_rva is set + prologue-valid.
+cli_meshreach :: proc(session: ^Session, args: []string) {
+  switch {
+  case len(args) == 0:
+    session.mesh_reach_on = !session.mesh_reach_on
+  case len(args) == 1 && args[0] == "on":
+    session.mesh_reach_on = true
+  case len(args) == 1 && args[0] == "off":
+    session.mesh_reach_on = false
+  case:
+    fmt.eprintln("usage: meshreach [on|off]")
+    return
+  }
+  inert := !intersectobjline_rva_sane(session)
+  hint := (session.mesh_reach_on && inert) ? "  (inert: intersectobjline_rva unset or prologue mismatch)" : ""
+  fmt.printfln("mesh-reach confirm %s.%s", session.mesh_reach_on ? "ON" : "OFF", hint)
+  if session.mesh_reach_on && !inert {
+    fmt.println("  WARNING: this injects a game-code thread per OBB-blocked pick (walks the live collision lists).")
+    fmt.println("           it recovers loose-OBB false blocks but has correlated with more client crashes under")
+    fmt.println("           sustained farming. The decorative filter (collscan) is the safe, no-injection win.")
+  }
+}
+
 // pause -> toggle the auto-farm pause (default key: F10). Paused = auto stays on but stops advancing;
 // killing the targeted mob resumes it. Does nothing if auto is off (won't start it).
 cli_pause :: proc(session: ^Session, args: []string) {

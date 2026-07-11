@@ -78,6 +78,14 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.aobjcull_rva = uintptr(v)
   case "camera_rva":
     layout.camera_rva = uintptr(v)
+  case "coll_obj3d_off":
+    layout.coll_obj3d_off = i64(v)
+  case "coll_type_off":
+    layout.coll_type_off = i64(v)
+  case "intersectobjline_rva":
+    layout.intersectobjline_rva = uintptr(v)
+  case "landobj_off":
+    layout.landobj_off = i64(v)
   case:
     return false
   }
@@ -113,6 +121,10 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "attack_range=%v", layout.attack_range)
   fmt.sbprintfln(&b, "aobjcull_rva=0x%X", layout.aobjcull_rva)
   fmt.sbprintfln(&b, "camera_rva=0x%X", layout.camera_rva)
+  fmt.sbprintfln(&b, "coll_obj3d_off=0x%X", layout.coll_obj3d_off)
+  fmt.sbprintfln(&b, "coll_type_off=0x%X", layout.coll_type_off)
+  fmt.sbprintfln(&b, "intersectobjline_rva=0x%X", layout.intersectobjline_rva)
+  fmt.sbprintfln(&b, "landobj_off=0x%X", layout.landobj_off)
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
   return err == nil
 }
@@ -237,6 +249,59 @@ cli_status :: proc(session: ^Session) {
     L.aobjcull_rva != 0 ? "FAST (m_aobjCull)" : "SLOW full-scan - run 'findcull'",
     session.reach_gate_on ? (L.aobjcull_rva != 0 ? "ON" : "on but inert (needs findcull)") : "OFF",
   )
+  coll_set := L.coll_obj3d_off != 0 && L.coll_type_off != 0
+  fmt.printfln(
+    "  coll_obj3d_off=0x%X coll_type_off=0x%X  decorative-prop filter: %s",
+    L.coll_obj3d_off, L.coll_type_off,
+    coll_set ? "ON (skips no-mesh OT_OBJ)" : "OFF (run 'collscan' to pin)",
+  )
+  if coll_set && player != 0 {
+    // Live probe: the player is a mover with a model, so chasing the pinned coll chain should decode a
+    // valid GMTYPE. Garbage here = the offsets shifted (a patch); re-run 'collscan' to re-pin.
+    if t, tok := obj_coll_type(session, player); tok && t >= GMT_ERROR && t <= GMT_BONE {
+      fmt.printfln("    [OK] player model coll type reads %s - coll offsets valid.", gmt_name(t))
+    } else {
+      fmt.println("    [SUSPECT] player model coll type won't decode - re-run 'collscan' (a patch shifted the offsets).")
+    }
+  }
+  meshreach_inert := !intersectobjline_rva_sane(session)
+  fmt.printfln(
+    "  intersectobjline_rva=0x%X  mesh-reach confirm: %s",
+    L.intersectobjline_rva,
+    session.mesh_reach_on ? (meshreach_inert ? "on but inert (RVA unset / prologue mismatch)" : "ON (injects; crash-prone)") : "OFF (default; safe - decorative filter above needs no injection)",
+  )
+  if L.intersectobjline_rva != 0 && !meshreach_inert {
+    fmt.println("    [OK] IntersectObjLine prologue verified - safe to CALL, but the injection races the game's world lists; leave OFF for farming.")
+  } else if L.intersectobjline_rva != 0 {
+    fmt.println("    [note] IntersectObjLine prologue doesn't match - a patch moved it; re-find its RVA before 'meshreach on'.")
+  }
+  // Camera-independent obstacle source (CLandscape.m_apObject flat arrays). Live-probe the player tile's
+  // OT_OBJ count; a plausible value confirms landobj_off. This is what makes reach see off-camera props.
+  camindep := L.landobj_off != 0 && L.land_off != 0 && L.landwidth_off != 0
+  fmt.printfln(
+    "  landobj_off=0x%X  reach object source: %s",
+    L.landobj_off,
+    camindep ? "CAMERA-INDEPENDENT (tile object arrays - sees off-screen props)" : "camera-culled (m_aobjCull only) - run 'worldscan'",
+  )
+  if camindep && world != 0 {
+    mpu := f32(world_mpu(session, world))
+    lw := read_i32_at(handle, world + uintptr(L.landwidth_off))
+    arr := read_ptr_at(handle, world + uintptr(L.land_off), pt)
+    if lw > 0 && is_heap_ptr(session, arr) {
+      ppos, pok2 := engine.read_vec3(handle, player + uintptr(L.pos_off))
+      if pok2 {
+        m_x := int(ppos[0] / mpu) / MAP_SIZE
+        m_z := int(ppos[2] / mpu) / MAP_SIZE
+        pland := read_ptr_at(handle, arr + uintptr((m_x + m_z * int(lw)) * session.ptr_size), pt)
+        cnt := read_i32_at(handle, pland + uintptr(L.landobj_off + LANDOBJ_MAX_ARRAY * 4)) // m_adwObjNum[OT_OBJ]
+        if is_heap_ptr(session, pland) && cnt > 0 && cnt < 200000 {
+          fmt.printfln("    [OK] your tile lists %d static objects (m_apObject[OT_OBJ]) - landobj_off valid.", cnt)
+        } else {
+          fmt.println("    [SUSPECT] tile object count won't decode - landobj_off may have shifted (a patch).")
+        }
+      }
+    }
+  }
   if !terrain_ready(session) {
     fmt.println("  [OFF] terrain grid not calibrated - 'attr' / 'reach' are inert.")
     fmt.println("    fix: stand on solid flat ground and run 'worldscan' (repeat at a clearly")
@@ -262,7 +327,16 @@ cli_status :: proc(session: ^Session) {
   }
 
   fmt.println("")
-  fmt.println("edit any field with 'set <field> <value>' (auto-saves flyff.cfg).")
+  fmt.println("SETUP CHECKLIST - the one-time commands that pin each group (re-run the relevant one after a game patch):")
+  fmt.println("  calibrate <pos> <name> [hp]  core targeting + srvsync   (select a mob first to also pin focus_off)")
+  fmt.println("  findprop                     any-monster gate (target your pet with monsters on screen)")
+  fmt.println("  worldscan                    terrain grid (stand on solid flat ground; repeat at a different height if ambiguous)")
+  fmt.println("  findcull                     on-screen object array (object reach + collscan need it)")
+  fmt.println("  findcam                      render camera (lets tdbg draw the cull cone)")
+  fmt.println("  collscan                     decorative-prop filter offsets (coll_obj3d_off / coll_type_off)")
+  fmt.println("  (intersectobjline_rva is a defaulted RVA; if a patch moves it, doctor flags [SUSPECT] - re-find + 'set' it)")
+  fmt.println("")
+  fmt.println("edit any field with 'set <field> <value>' (auto-saves flyff.cfg). 'calibrate' preserves every non-core pin.")
 }
 
 // offsets              -> show the health-check ('status')

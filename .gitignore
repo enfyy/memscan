@@ -8,3 +8,4 @@ BACKLOG.md
 *.log
 # tdbg debug maps (target-selection snapshots) - local analysis output, regenerated on demand.
 tc_map*.html
+CLAUDE.md

@@ -153,6 +153,8 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_stuck(session, args)
   case "reachgate":
     flyff.cli_reachgate(session, args)
+  case "meshreach":
+    flyff.cli_meshreach(session, args)
   case "pause":
     flyff.cli_pause(session, args)
   case "calibrate", "cal":
@@ -225,12 +227,20 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_attrmap(session, args)
   case "objects":
     flyff.cli_objects(session, args)
+  case "collscan":
+    flyff.cli_collscan(session, args)
+  case "linkscan":
+    flyff.cli_linkscan(session, args)
   case "reach":
     flyff.cli_reach(session, args)
   case "attackable", "canhit":
     flyff.cli_attackable(session, args)
   case "reachdbg":
     flyff.cli_reachdbg(session, args)
+  case "objline":
+    flyff.cli_objline(session, args)
+  case "reachcmp":
+    flyff.cli_reachcmp(session, args)
   case "findcull":
     flyff.cli_findcull(session, args)
   case "findcam":
@@ -303,6 +313,7 @@ farming (day to day)
   kills <n>                  auto-disable 'auto' after N confirmed kills (e.g. 'kills 100'); 'kills off' cancels
   stuck [on|off]             toggle reactive obstacle skip-detection (on by default; 'stuck off' for ranged/standing)
   reachgate [on|off]         proactively skip mobs behind walls/trees/buildings when auto-picks a target
+  meshreach [on|off]         confirm OBB-blocked mobs with the client's IntersectObjLine (default OFF; injects, crash-prone)
                              (on by default; needs 'worldscan' + 'findcull' once to take effect)
   mobs <name>                list nearby <name> movers by distance (hp, model, address)
   tdbg [label] [zoom] (tmap)  write a top-down radar map of the PREDICTED auto kill-order
@@ -344,9 +355,12 @@ terrain / obstacle reach oracle (one-time setup: worldscan + findcull)
   attr [x,z]                 terrain attribute at your feet (or a world point): NONE/NOWALK/NOMOVE/DIE
   attrmap [radius] [step]    ASCII map of terrain attributes around you (reveals invisible walls)
   objects [radius]           list nearby CObj of any type + locate m_OBB (props the grid misses)
+  collscan [radius]          per nearby prop: model .o3d filename + collision-mesh type (NORMAL vs ERROR)
   reach [x,z]                is the straight path player->point (or ->selected target) walkable?
   attackable          (canhit)  is the SELECTED mob reachable to attack? (terrain + object obstacles,
                              within attack_range). select a mob, stand behind cover, run it.
+  objline [x,z]              client's own IntersectObjLine (mesh-accurate) vs our OBB oracle for one segment
+  reachcmp [n]               compare OBB oracle vs client IntersectObjLine over the nearest n mobs (finds false blocks)
 
 deep recon (rarely needed)
   findpos <x,y,z> [eps]      addresses whose 3 f32 match a position
@@ -424,6 +438,8 @@ cli_attach :: proc(session: ^flyff.Session, args: []string) {
   if session.attached {
     flyff.remote_free_shim(session) // release the old process's cached shim page before re-attaching
     flyff.remote_free_spawn_page(session)
+    flyff.remote_free_objline_page(session)
+    session.collider_cache_valid = false // stale across processes
     win.CloseHandle(session.proc_info.handle)
   }
   flyff.session_reset_scan(session)
@@ -485,6 +501,7 @@ cli_detach :: proc(session: ^flyff.Session) {
   session.srvsync_on = false
   flyff.remote_free_shim(session)
   flyff.remote_free_spawn_page(session)
+  flyff.remote_free_objline_page(session)
   win.CloseHandle(session.proc_info.handle)
   flyff.session_reset_scan(session)
   session.attached = false

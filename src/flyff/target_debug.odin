@@ -467,6 +467,7 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
   .toggles label{cursor:pointer;user-select:none} .toggles input{vertical-align:-1px;margin-right:4px}
   .wall{position:absolute;background:rgba(231,126,52,.28);pointer-events:none}
   .obb{position:absolute;border:1px solid rgba(155,89,182,.65);background:rgba(155,89,182,.1);box-sizing:border-box;pointer-events:none}
+  .obb.dec{border:1px dashed rgba(120,130,145,.35);background:transparent}
   .rline{position:absolute;height:2px;pointer-events:none;opacity:.5}
   body:has(#t-wall:not(:checked)) .wall{display:none}
   body:has(#t-obb:not(:checked)) .obb{display:none}
@@ -598,7 +599,8 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
       continue
     }
     ang := math.atan2(o.axis[0][2], o.axis[0][0]) * 180 / math.PI
-    fmt.sbprintf(&b, "<div class=obb style='left:%.1fpx;top:%.1fpx;width:%.1fpx;height:%.1fpx;transform:translate(-50%%,-50%%) rotate(%.1fdeg)'></div>\n", sx, sy, wpx, hpx, ang)
+    cls := o.decorative ? "obb dec" : "obb"
+    fmt.sbprintf(&b, "<div class='%s' style='left:%.1fpx;top:%.1fpx;width:%.1fpx;height:%.1fpx;transform:translate(-50%%,-50%%) rotate(%.1fdeg)'></div>\n", cls, sx, sy, wpx, hpx, ang)
   }
 
   // Concentric distance rings at a nice interval, each labelled with its world distance.
@@ -716,7 +718,7 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
   fmt.sbprint(&b, "<div class=card lg><h2>legend</h2>\n")
   fmt.sbprint(&b, "<div><span style='background:#2ecc71'></span>nearest <span style='background:#3498db'></span>pocket <span style='background:#1abc9c'></span>melee <span style='background:#e67e22'></span>avoid</div>\n")
   fmt.sbprint(&b, "<div><span style='background:#e74c3c'></span>stuck-blacklist <span style='background:#e67e22'></span>walled <span style='background:#9b59b6'></span>blocked by object <span style='background:#b8912f'></span>cooldown</div>\n")
-  fmt.sbprintf(&b, "<div style='margin-top:4px;color:#7f8c98'>dot colour = predicted kill order: <b style='color:#ffec82'>warm/bright = next</b> &rarr; cool/dim = later. Numbers mark the first %d picks; small dots are later picks. Faint grey rings = distance markers (world units); cyan ring = attack_range; gold &times; = anchor. <b style='color:#9b59b6'>Purple boxes</b> = object collision (trees/buildings), <b style='color:#e67e22'>orange squares</b> = terrain walls; a line from you to an excluded mob shows what its straight path clips. Toggle any layer with the checkboxes above the map.</div>\n", TDBG_NUM)
+  fmt.sbprintf(&b, "<div style='margin-top:4px;color:#7f8c98'>dot colour = predicted kill order: <b style='color:#ffec82'>warm/bright = next</b> &rarr; cool/dim = later. Numbers mark the first %d picks; small dots are later picks. Faint grey rings = distance markers (world units); cyan ring = attack_range; gold &times; = anchor. <b style='color:#9b59b6'>Solid purple boxes</b> = real object collision (trees/rocks/buildings), <b style='color:#8a95a5'>faint dashed boxes</b> = decorative props (bushes/grass) the game walks through, <b style='color:#e67e22'>orange squares</b> = terrain walls; a line from you to an excluded mob shows what its straight path clips. Toggle any layer with the checkboxes above the map.</div>\n", TDBG_NUM)
   fmt.sbprint(&b, "</div>\n")
 
   fmt.sbprint(&b, "<div class=card style='margin-top:12px'><h2>map profile (diff this across maps)</h2>\n")
