@@ -6,3 +6,5 @@ BACKLOG.md
 # first build; never hand-edited, so kept out of version control to avoid churn.
 /src/build_hash.g.odin
 *.log
+# tdbg debug maps (target-selection snapshots) - local analysis output, regenerated on demand.
+tc_map*.html

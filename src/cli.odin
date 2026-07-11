@@ -141,6 +141,8 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     cli_find(session, args)
   case "target_closest", "tc", "get":
     flyff.cli_target_closest(session, args)
+  case "tdbg", "tmap":
+    flyff.cli_tdbg(session, args)
   case "auto":
     flyff.cli_auto(session, args)
   case "timer":
@@ -153,8 +155,6 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_reachgate(session, args)
   case "pause":
     flyff.cli_pause(session, args)
-  case "refocus":
-    flyff.cli_refocus(session, args)
   case "calibrate", "cal":
     flyff.cli_calibrate(session, args)
   case "calibrate_house", "calh":
@@ -207,6 +207,10 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_mobs(session, args)
   case "mark":
     flyff.cli_mark(session, args)
+  case "ring":
+    flyff.cli_ring(session, args)
+  case "draw_range", "drawrange":
+    flyff.cli_draw_range(session, args)
   case "markmobs":
     flyff.cli_markmobs(session, args)
   case "findparticle":
@@ -229,6 +233,8 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_reachdbg(session, args)
   case "findcull":
     flyff.cli_findcull(session, args)
+  case "findcam":
+    flyff.cli_findcam(session, args)
   case:
     fmt.eprintfln("unknown command: %s (try 'help')", cmd)
   }
@@ -299,6 +305,14 @@ farming (day to day)
   reachgate [on|off]         proactively skip mobs behind walls/trees/buildings when auto-picks a target
                              (on by default; needs 'worldscan' + 'findcull' once to take effect)
   mobs <name>                list nearby <name> movers by distance (hp, model, address)
+  tdbg [label] [zoom] (tmap)  write a top-down radar map of the PREDICTED auto kill-order
+                             (tc_map[_label].html) + a console factor table; diagnoses target order.
+                             label tags the file ('tdbg cloakia' vs 'tdbg tower'); a trailing number is
+                             the view radius in world units ('tdbg tower 30' to zoom in)
+  ring [radius] [Ns]         draw your attack_range as a cyan circle on the ground (follows you, ~30s,
+                             non-blocking); attack a mob to see if the ring reaches it. 'ring off' stops
+  draw_range                 toggle a PERSISTENT range circle that live-tracks attack_range (so
+                             'set attack_range 1.75' updates it instantly); run again to stop
   srvsync [on|off]           mirror each select to the server (stops the after-N-kills DC);
                              ON by default on attach
   srvtest                    fire one server SendSetTarget at the current target
@@ -326,6 +340,7 @@ terrain / obstacle reach oracle (one-time setup: worldscan + findcull)
   worldscan [reset]          pin the terrain-grid offsets from your ground height (stand on solid
                              ground; if ambiguous, walk to a different-height spot and re-run)
   findcull                   locate the on-screen object array (makes reach checks ~instant; re-run after a patch)
+  findcam                    locate the render camera (CWorld::m_pCamera); lets tdbg draw the cull cone / blind spot
   attr [x,z]                 terrain attribute at your feet (or a world point): NONE/NOWALK/NOMOVE/DIE
   attrmap [radius] [step]    ASCII map of terrain attributes around you (reveals invisible walls)
   objects [radius]           list nearby CObj of any type + locate m_OBB (props the grid misses)
@@ -341,7 +356,6 @@ deep recon (rarely needed)
   packetwatch                snapshot, click a mob, catch the fresh SETTARGET packet
   deathscan <name>           find a corpse despawn-countdown field
   objscan <value> <name>     find offsets holding <value> across <name> movers
-  refocus                    detection test: rewrite focus to itself every ~200ms
 
 ============================================================================
   version (ver)  print the version + build hash (compare the hash to the one build.bat
@@ -466,16 +480,8 @@ cli_detach :: proc(session: ^flyff.Session) {
     return
   }
   pid := session.proc_info.pid
-  session.auto_on = false // stop auto-farm when the process goes away
-  session.auto_timer_at = 0
-  session.auto_focus_obj = 0
-  session.auto_avoid_on = false
-  session.auto_sel_set = false
-  session.last_kill_set = false
-  session.auto_paused = false
-  session.pause_obj = 0
-  clear(&session.auto_blocked)
-  session.refocus_on = false
+  flyff.auto_stop(session) // stop auto-farm + clear its run state when the process goes away
+  flyff.range_ring_stop(session) // stop the attack-range overlay
   session.srvsync_on = false
   flyff.remote_free_shim(session)
   flyff.remote_free_spawn_page(session)

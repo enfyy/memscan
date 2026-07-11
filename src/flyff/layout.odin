@@ -44,6 +44,8 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.hp_off = i64(v)
   case "model_off":
     layout.model_off = i64(v)
+  case "angle_off":
+    layout.angle_off = i64(v)
   case "mover_type":
     layout.mover_type = u32(v)
   case "objid_off":
@@ -71,9 +73,11 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
   case "hmap_off":
     layout.hmap_off = i64(v)
   case "attack_range":
-    layout.attack_range = i64(v)
+    layout.attack_range = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
   case "aobjcull_rva":
     layout.aobjcull_rva = uintptr(v)
+  case "camera_rva":
+    layout.camera_rva = uintptr(v)
   case:
     return false
   }
@@ -92,6 +96,7 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "name_off=0x%X", layout.name_off)
   fmt.sbprintfln(&b, "hp_off=0x%X", layout.hp_off)
   fmt.sbprintfln(&b, "model_off=0x%X", layout.model_off)
+  fmt.sbprintfln(&b, "angle_off=0x%X", layout.angle_off)
   fmt.sbprintfln(&b, "mover_type=%d", layout.mover_type)
   fmt.sbprintfln(&b, "objid_off=0x%X", layout.objid_off)
   fmt.sbprintfln(&b, "propmover_rva=0x%X", layout.propmover_rva)
@@ -105,8 +110,9 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "landwidth_off=0x%X", layout.landwidth_off)
   fmt.sbprintfln(&b, "mpu_off=0x%X", layout.mpu_off)
   fmt.sbprintfln(&b, "hmap_off=0x%X", layout.hmap_off)
-  fmt.sbprintfln(&b, "attack_range=%d", layout.attack_range)
+  fmt.sbprintfln(&b, "attack_range=%v", layout.attack_range)
   fmt.sbprintfln(&b, "aobjcull_rva=0x%X", layout.aobjcull_rva)
+  fmt.sbprintfln(&b, "camera_rva=0x%X", layout.camera_rva)
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
   return err == nil
 }
@@ -129,6 +135,12 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     }
     key := strings.trim_space(line[:eq])
     val := strings.trim_space(line[eq + 1:])
+    if key == "attack_range" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.attack_range = f32(fv) // the one fractional field (e.g. 1.75 melee)
+      }
+      continue
+    }
     v, vok := engine.parse_addr(val)
     if !vok {
       continue
@@ -217,7 +229,8 @@ cli_status :: proc(session: ^Session) {
   // --- Terrain reachability oracle (worldscan) ---
   fmt.println("")
   fmt.println("TERRAIN reachability oracle (from 'worldscan') - reach-gated target selection - OPTIONAL:")
-  fmt.printfln("  land_off=0x%X landwidth_off=0x%X hmap_off=0x%X mpu_off=0x%X  attack_range=%d", L.land_off, L.landwidth_off, L.hmap_off, L.mpu_off, L.attack_range)
+  fmt.printfln("  land_off=0x%X landwidth_off=0x%X hmap_off=0x%X mpu_off=0x%X", L.land_off, L.landwidth_off, L.hmap_off, L.mpu_off)
+  fmt.printfln("  attack_range=%v  <- your reach; drives target selection (the picker's engage range) AND 'reach'. 'set attack_range <n>' (floats ok, e.g. 1.75).", L.attack_range)
   fmt.printfln(
     "  aobjcull_rva=0x%X  object reach: %s   auto reach-gate: %s",
     L.aobjcull_rva,
@@ -300,6 +313,20 @@ cli_set :: proc(session: ^Session, args: []string) {
   }
   if len(args) < 2 {
     fmt.eprintln("usage: set <field> <value>   (field names: see 'offsets')")
+    return
+  }
+  // attack_range is the one fractional field (e.g. 1.75 melee) - parse it as a float, not an integer.
+  if args[0] == "attack_range" {
+    fv, ok := strconv.parse_f64(args[1])
+    if !ok || fv < 0 {
+      fmt.eprintfln("invalid value: %s (want a number >= 0, e.g. 1.75)", args[1])
+      return
+    }
+    session.layout.attack_range = f32(fv)
+    fmt.printfln("set attack_range = %v", session.layout.attack_range)
+    if flyff_save_cfg(session.layout, flyff_cfg_path()) {
+      fmt.printfln("saved -> %s", flyff_cfg_path())
+    }
     return
   }
   v, vok := engine.parse_addr(args[1])

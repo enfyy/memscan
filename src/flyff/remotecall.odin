@@ -125,6 +125,45 @@ particle_type_active :: proc(session: ^Session, ntype: int) -> bool {
   return ok && engine.value_as_u64(.U32, v) != 0
 }
 
+// Cheap validity check for the particle RVAs, run BEFORE any injected CreateParticle call. A game patch
+// shifts particlemng_rva / createparticle_rva, and calling a stale createparticle_rva jumps into a wrong
+// address = instant client crash (a real incident). A patch moves both together, so we validate the
+// cheap, read-only one, particlemng_rva, two ways (a zeroed stale region passes the m_bActive test alone,
+// so the device-pointer check is the real guard). Returns false when unconfigured. Fix: findparticle.
+particle_rvas_sane :: proc(session: ^Session) -> bool {
+  if session.layout.particlemng_rva == 0 || session.layout.createparticle_rva == 0 {
+    return false
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  // 1. m_pd3dDevice (g_ParticleMng+0) must be a live heap pointer: non-null, outside the module, and
+  //    itself pointing at readable memory. A stale/zeroed particlemng reads 0 here - the reliable tell.
+  dv, dok := engine.read_value(handle, base + session.layout.particlemng_rva, .U32)
+  if !dok {
+    return false
+  }
+  dev := uintptr(engine.value_as_u64(.U32, dv))
+  if dev < 0x10000 || (dev >= base && dev < mod_end) {
+    return false
+  }
+  if _, ok := engine.read_value(handle, dev, .U32); !ok {
+    return false // the device pointer doesn't resolve -> particlemng_rva is wrong
+  }
+  // 2. Every particle type's m_bActive must read as a clean 0/1 boolean; anything else = wrong struct.
+  for t in 0 ..< PARTICLE_MAX_TYPE {
+    v, ok := engine.read_value(
+      handle,
+      base + session.layout.particlemng_rva + uintptr(PARTICLE_MPARTICLES_OFF + t * PARTICLE_CPARTICLES_SIZE + PARTICLE_BACTIVE_OFF),
+      .U32,
+    )
+    if !ok || engine.value_as_u64(.U32, v) > 1 {
+      return false
+    }
+  }
+  return true
+}
+
 // Bytes of shim code emitted per particle (see the unrolled block below).
 SPAWN_CODE_PER :: 32
 // Minimum cached page size, so typical batches reuse the page instead of realloc'ing every refresh.

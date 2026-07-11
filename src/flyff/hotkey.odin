@@ -58,7 +58,7 @@ hotkey_watch_loop :: proc(session: ^Session) {
       hk.was_down = down
     }
     auto_tick(session) // hands-free farm: advance focus when the target dies
-    refocus_tick(session) // detection experiment: consistent focus write-back
+    range_ring_tick(session) // attack-range circle overlay (ring / draw_range) - non-blocking
     sync.mutex_unlock(&session.exec_mutex)
     win.Sleep(20)
   }

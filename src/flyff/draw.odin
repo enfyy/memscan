@@ -1,6 +1,7 @@
 package flyff
 
 import "core:fmt"
+import "core:math"
 import "core:strconv"
 import "core:strings"
 import "core:time"
@@ -21,6 +22,24 @@ MARK_HOLD_INTERVAL_MS :: 600
 // Preference order when auto-picking a warm type for a bare `mark` (visible colours first).
 mark_type_prefs := [?]int{16, 17, 18, 19, 20, 21, 13, 14, 15, 22, 23, 24, 2, 3, 4}
 
+// Early bail for any particle-drawing command: refuses (with guidance) when the particle RVAs are
+// missing or STALE, because injecting a CreateParticle through a stale address crashes the client
+// (it happened). Every particle command calls this after the attached / 32-bit checks.
+particle_guard :: proc(session: ^Session, cmd: string) -> bool {
+  if session.layout.particlemng_rva == 0 || session.layout.createparticle_rva == 0 {
+    fmt.eprintfln("%s: particle addresses not set - run 'findparticle' once (with an effect on screen).", cmd)
+    return false
+  }
+  if !particle_rvas_sane(session) {
+    fmt.eprintfln(
+      "%s: particle addresses look STALE (a game patch moved them) - injecting would CRASH the client. run 'findparticle' once to re-derive them, then retry.",
+      cmd,
+    )
+    return false
+  }
+  return true
+}
+
 // mark [x,y,z] [type] - drop one billboard-sprite dot in the world for debugging.
 //   no coords  -> at the player's current position
 //   x,y,z      -> at that world position (as printed by the in-game /position command)
@@ -35,8 +54,7 @@ cli_mark :: proc(session: ^Session, args: []string) {
     fmt.eprintln("mark: 32-bit Flyff client only.")
     return
   }
-  if session.layout.particlemng_rva == 0 || session.layout.createparticle_rva == 0 {
-    fmt.eprintln("mark: particlemng_rva/createparticle_rva not set (check flyff.cfg).")
+  if !particle_guard(session, "mark") {
     return
   }
 
@@ -140,6 +158,168 @@ cli_mark :: proc(session: ^Session, args: []string) {
     }
   }
   fmt.println("mark: hold done.")
+}
+
+// --- range circle overlay: draw your attack_range (or a given radius) as a cyan ring on the ground so ---
+// you can calibrate attack_range by eye. Drawn by the WATCHER thread each tick (pure overlay writes, no
+// injection), so it never blocks the REPL. See range_ring_tick / cli_ring / cli_draw_range.
+
+RING_POINTS :: 64 // dots around the circle
+RING_HOLD_DEFAULT :: 30 // seconds a temporary `ring` stays up
+RING_REFRESH_NS :: i64(40_000_000) // ~25 Hz redraw (throttle inside the ~20ms watcher tick)
+RING_Y_OFF :: f32(0.4) // just above the feet
+RING_SIZE :: f32(0.35)
+RING_COLOR := [4]f32{0.25, 0.85, 1.0, 1.0} // cyan (matches the tdbg range ring)
+
+// Watcher-thread tick: while the range circle is on, redraw it around the player (throttled). radius 0
+// live-tracks attack_range (draw_range) so editing it updates the circle; a non-zero deadline (ring [Ns])
+// auto-stops. Pure overlay_drive_type writes - no injection - and a stack buffer, so it's cheap and safe
+// to run every tick regardless of the watcher's temp allocator.
+range_ring_tick :: proc(session: ^Session) {
+  if !session.range_ring_on || !session.attached {
+    return
+  }
+  now := time.now()._nsec
+  if session.range_ring_until != 0 && now >= session.range_ring_until {
+    range_ring_stop(session)
+    return
+  }
+  if now - session.range_ring_last < RING_REFRESH_NS {
+    return
+  }
+  session.range_ring_last = now
+  radius := session.range_ring_radius
+  if radius <= 0 {
+    radius = session.layout.attack_range // live-track attack_range
+    if radius <= 0 {
+      radius = 16
+    }
+  }
+  ppos, ok := read_player_pos(session)
+  if !ok {
+    return
+  }
+  positions: [RING_POINTS][3]f32
+  colors: [RING_POINTS][4]f32
+  step := math.TAU / f32(RING_POINTS)
+  for i in 0 ..< RING_POINTS {
+    ang := f32(i) * step
+    positions[i] = {ppos[0] + radius * math.cos(ang), ppos[1] + RING_Y_OFF, ppos[2] + radius * math.sin(ang)}
+    colors[i] = RING_COLOR
+  }
+  overlay_drive_type(session, MARKMOBS_OVERLAY_TYPE, positions[:], colors[:], RING_SIZE)
+}
+
+// Turn the range circle off and clear its dots. Idempotent; safe on detach.
+range_ring_stop :: proc(session: ^Session) {
+  if !session.range_ring_on {
+    return
+  }
+  session.range_ring_on = false
+  if session.attached {
+    overlay_clear_type(session, MARKMOBS_OVERLAY_TYPE)
+  }
+}
+
+// Shared start: warm the overlay type once (the only injection) then arm the watcher-drawn circle. radius
+// 0 => live-track attack_range; until 0 => indefinite. Returns false (already reported) on warm failure.
+range_ring_start :: proc(session: ^Session, radius: f32, until: i64) -> bool {
+  if !overlay_warm_type(session, MARKMOBS_OVERLAY_TYPE) {
+    fmt.eprintfln("couldn't warm overlay particle type %d.", MARKMOBS_OVERLAY_TYPE)
+    return false
+  }
+  session.range_ring_radius = radius
+  session.range_ring_until = until
+  session.range_ring_last = 0
+  session.range_ring_on = true
+  ensure_hotkey_thread(session)
+  return true
+}
+
+// ring [radius] [Ns] | ring off - draw a cyan circle at `radius` world units (default = attack_range)
+// around you for ~N seconds (default 30), following you. NON-BLOCKING: the watcher draws it, so the REPL
+// stays free. Attack a mob and see if the ring reaches it, then 'set attack_range <n>' to match.
+cli_ring :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if len(args) == 1 && (args[0] == "off" || args[0] == "stop") {
+    range_ring_stop(session)
+    fmt.println("ring off.")
+    return
+  }
+  if session.ptr_size != 4 {
+    fmt.eprintln("ring: 32-bit Flyff client only.")
+    return
+  }
+  if !particle_guard(session, "ring") {
+    return
+  }
+  radius := session.layout.attack_range
+  from_cfg := true
+  hold_secs := RING_HOLD_DEFAULT
+  for a in args {
+    if strings.has_suffix(a, "s") && len(a) > 1 {
+      if s, ok := strconv.parse_int(a[:len(a) - 1]); ok && s > 0 {
+        hold_secs = s
+        continue
+      }
+    }
+    if v, ok := strconv.parse_f64(a); ok && v > 0 {
+      radius = f32(v)
+      from_cfg = false
+    }
+  }
+  if radius <= 0 {
+    radius = 16
+    from_cfg = false
+    fmt.println("ring: attack_range is 0 - showing a 16-unit ring. set a real value with 'set attack_range <n>'.")
+  }
+  // Handy numeric cross-check: how far away is the mob you currently have selected?
+  if focus, fok := read_focus_ptr(session); fok && focus != 0 && focus_obj_live(session, focus) {
+    if ppos, pok := read_player_pos(session); pok {
+      if tpos, tok := engine.read_vec3(session.proc_info.handle, focus + uintptr(session.layout.pos_off)); tok {
+        fmt.printfln("  your selected target is %.1f units away (horizontal).", engine.dist_horizontal(ppos, tpos))
+      }
+    }
+  }
+  if !range_ring_start(session, radius, time.now()._nsec + i64(hold_secs) * 1_000_000_000) {
+    return
+  }
+  fmt.printfln(
+    "ring: drawing a %.2f-unit%s circle for ~%ds (non-blocking; 'ring off' to stop early).",
+    radius,
+    from_cfg ? " (your attack_range)" : "",
+    hold_secs,
+  )
+}
+
+// draw_range | draw_range off - TOGGLE a persistent circle at your attack_range around you (no time limit;
+// live-tracks attack_range, so 'set attack_range 1.75' updates it instantly). Non-blocking. Good on a
+// hotkey. Run again (or 'draw_range off') to turn it off.
+cli_draw_range :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if session.range_ring_on || (len(args) == 1 && (args[0] == "off" || args[0] == "stop")) {
+    range_ring_stop(session)
+    fmt.println("draw_range OFF.")
+    return
+  }
+  if session.ptr_size != 4 {
+    fmt.eprintln("draw_range: 32-bit Flyff client only.")
+    return
+  }
+  if !particle_guard(session, "draw_range") {
+    return
+  }
+  if !range_ring_start(session, 0, 0) { // radius 0 = live attack_range; until 0 = indefinite
+    return
+  }
+  note := session.layout.attack_range > 0 ? fmt.tprintf("%.2f", session.layout.attack_range) : "16 (attack_range is 0 - 'set attack_range <n>')"
+  fmt.printfln("draw_range ON: cyan circle at attack_range=%s, live. 'set attack_range <n>' updates it; 'draw_range' again to stop.", note)
 }
 
 // --- markmobs: drop a marker on every enumerated mob (verify `mobs` catches them all) ------------
@@ -443,8 +623,7 @@ cli_markmobs :: proc(session: ^Session, args: []string) {
     fmt.eprintln("markmobs: 32-bit Flyff client only.")
     return
   }
-  if session.layout.particlemng_rva == 0 || session.layout.createparticle_rva == 0 {
-    fmt.eprintln("markmobs: particlemng_rva/createparticle_rva not set (check flyff.cfg).")
+  if !particle_guard(session, "markmobs") {
     return
   }
 
@@ -646,6 +825,9 @@ cli_findparticle :: proc(session: ^Session, args: []string) {
 cli_warmtype :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
+    return
+  }
+  if !particle_guard(session, "warmtype") {
     return
   }
   if len(args) < 1 {

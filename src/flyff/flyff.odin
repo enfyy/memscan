@@ -16,6 +16,7 @@ FLYFF_NAME_OFF :: 0x1DB8 // CMover inline name char buffer
 FLYFF_MOVER_TYPE :: 5 // m_dwType for movers (players, pets, NPCs, monsters)
 FLYFF_HP_OFF :: 0x281C // CMover current HP (LONG); 0 => dead/despawning (don't target)
 FLYFF_MODEL_OFF :: 0x178 // CObj.m_pModel; NULL => not rendered/selectable (crashes on select)
+FLYFF_ANGLE_OFF :: 0x18 // CObj.m_fAngle (Y-yaw, DEGREES). Obj.cpp: RotationY(-m_fAngle) => forward=(-sin,0,cos)
 
 // Server target-sync (PACKETTYPE_SETTARGET via the client's own SendSetTarget). All three
 // are located at runtime in the live modded Neuz.exe - see net-package-targeting.md Phase 0
@@ -44,12 +45,18 @@ FLYFF_HMAP_OFF :: 0x0 // CLandscape.m_pHeightMap (float*, 129x129 corner grid)
 // target selection only needs the straight path to within this distance of the mob to be walkable
 // (you close to range, then attack - ranged has no LOS check on the shot). Per-character; `set
 // attack_range <n>`. 0 => test the full path to the mob's cell.
-FLYFF_ATTACK_RANGE :: 16
+FLYFF_ATTACK_RANGE :: 1.7
 
 // Static CObj* CWorld::m_aobjCull[] - the render on-screen display array (World.cpp:69). The object
 // reach test reads this (fast, ~on-screen count) instead of scanning all of memory for CObj. Found by
 // `findcull` (which saves it here); PATCH-SPECIFIC. 0 => fall back to the slow full-memory scan.
 FLYFF_AOBJCULL_RVA :: 0x0
+
+// Static CCamera* CWorld::m_pCamera (World3D.cpp:34) - the active render camera. m_aobjCull (above) is
+// exactly what this camera's frustum draws, so the object-reach check is blind to anything off-camera.
+// Found by `findcam`; PATCH-SPECIFIC. Camera layout: vtable +0x0, m_vPos(eye) +0x4, m_vLookAt +0x90.
+// Frustum: vFOV pi/4 (45deg) at default zoom, far plane 512, near 0.5 (World3D.cpp). 0 => not found.
+FLYFF_CAMERA_RVA :: 0x0
 
 // Attackable-monster gate - the SOLE target filter for any-monster ("auto any") mode. The client
 // doesn't store a usable AI type on the mover OBJECT (per-object m_dwAIInterface is only set for
@@ -84,6 +91,7 @@ Flyff_Layout :: struct {
   name_off:          i64,
   hp_off:            i64,
   model_off:         i64,
+  angle_off:         i64,
   mover_type:        u32,
   objid_off:         i64,
   propmover_rva:     uintptr,
@@ -97,8 +105,9 @@ Flyff_Layout :: struct {
   landwidth_off:     i64,
   mpu_off:           i64,
   hmap_off:          i64,
-  attack_range:      i64,
+  attack_range:      f32,
   aobjcull_rva:      uintptr,
+  camera_rva:        uintptr,
 }
 
 flyff_layout_default :: proc() -> Flyff_Layout {
@@ -111,6 +120,7 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     name_off          = FLYFF_NAME_OFF,
     hp_off            = FLYFF_HP_OFF,
     model_off         = FLYFF_MODEL_OFF,
+    angle_off         = FLYFF_ANGLE_OFF,
     mover_type        = FLYFF_MOVER_TYPE,
     objid_off         = FLYFF_OBJID_OFF,
     propmover_rva     = FLYFF_PROPMOVER_RVA,
@@ -126,5 +136,6 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     hmap_off          = FLYFF_HMAP_OFF,
     attack_range      = FLYFF_ATTACK_RANGE,
     aobjcull_rva      = FLYFF_AOBJCULL_RVA,
+    camera_rva        = FLYFF_CAMERA_RVA,
   }
 }

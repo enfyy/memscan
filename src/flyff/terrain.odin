@@ -555,7 +555,7 @@ cli_attackable :: proc(session: ^Session, args: []string) {
   res := compute_reach(session, world, ppos[0], ppos[1], ppos[2], tpos[0], tpos[2])
   switch res.status {
   case .Clear:
-    rng_note := res.in_range ? fmt.tprintf("in range (%d) - shoot now", L.attack_range) : "out of range - walk up first"
+    rng_note := res.in_range ? fmt.tprintf("in range (%.1f) - shoot now", L.attack_range) : "out of range - walk up first"
     fmt.printfln("ATTACKABLE: '%s' (d=%.1f) - straight line clear (terrain + objects); %s.", nm, res.d, rng_note)
   case .Blocked_Terrain:
     fmt.printfln("NOT attackable: '%s' (d=%.1f) - blocked by terrain (%s) at tile %d cell %d.", nm, res.d, hattr_name(res.thit.attr), res.thit.tile, res.thit.cell)
@@ -1054,6 +1054,102 @@ obj_segment_blocked :: proc(session: ^Session, ax, ay, az, bx, bz: f32) -> (bloc
     }
   }
   return false, {}, true
+}
+
+// --- obstacle enumeration for the tdbg overlay (draw the same walls/boxes reach uses) --------------
+
+Wall_Cell :: struct {
+  pos:  [2]f32, // world x,z
+  attr: int, // HATTR_*
+}
+
+// Blocked terrain cells (NOWALK/NOMOVE/DIE) within `radius` of (cx,cz), sampled at grid (MPU) resolution -
+// the invisible walls tdbg draws. Empty when terrain isn't calibrated. Temp-allocated (capped).
+collect_wall_cells :: proc(session: ^Session, world: uintptr, cx, cz, radius: f32) -> [dynamic]Wall_Cell {
+  out := make([dynamic]Wall_Cell, context.temp_allocator)
+  if world == 0 || !terrain_ready(session) {
+    return out
+  }
+  step := f32(world_mpu(session, world))
+  if step <= 0 {
+    step = f32(MPU_DEFAULT)
+  }
+  MAXCELLS :: 1500
+  for wz := cz - radius; wz <= cz + radius; wz += step {
+    for wx := cx - radius; wx <= cx + radius; wx += step {
+      dx := wx - cx
+      dz := wz - cz
+      if dx * dx + dz * dz > radius * radius {
+        continue
+      }
+      if wa, ok := world_attr_at(session, world, wx, wz); ok && hattr_blocks_walk(wa.attr) {
+        append(&out, Wall_Cell{pos = {wx, wz}, attr = wa.attr})
+        if len(out) >= MAXCELLS {
+          return out
+        }
+      }
+    }
+  }
+  return out
+}
+
+// OBBs of nearby collidable props (OT_OBJ + OT_CTRL) within `radius` of (cx,cz), from the on-screen cull
+// array - the boxes tdbg draws. Empty when the fast path (aobjcull_rva) isn't set (we never run the slow
+// full scan here). Temp-allocated.
+collect_nearby_obbs :: proc(session: ^Session, cx, cz, radius: f32) -> [dynamic]Obb {
+  out := make([dynamic]Obb, context.temp_allocator)
+  if session.ptr_size != 4 || session.layout.aobjcull_rva == 0 {
+    return out
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  L := session.layout
+  po := int(L.pos_off)
+  wlen := po + 0x1C
+  if wlen > 512 {
+    return out
+  }
+  CAP :: 8192
+  idx := make([]byte, CAP * 4, context.temp_allocator)
+  n, _ := engine.read_into(handle, base + L.aobjcull_rva, idx)
+  buf: [512]byte
+  rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
+  lim := radius + 24 // slack for the box's own extent
+  for k in 0 ..< int(n) / 4 {
+    p := uintptr(rd_u32le(idx, k * 4))
+    if p < 0x10000 {
+      break
+    }
+    rn, rok := engine.read_into(handle, p, buf[:wlen])
+    if !rok || int(rn) < wlen {
+      break
+    }
+    vt := uintptr(rd_u32le(buf[:], 0))
+    if vt < base || vt >= mod_end {
+      break // end of the live cull prefix
+    }
+    ty := rd_u32le(buf[:], po + 0x10)
+    if ty != 0 && ty != 3 {
+      continue // OT_OBJ / OT_CTRL only
+    }
+    ocx := rf(buf[:], po)
+    ocz := rf(buf[:], po + 8)
+    dx := ocx - cx
+    dz := ocz - cz
+    if dx * dx + dz * dz > lim * lim {
+      continue
+    }
+    oo := po - 0x3C
+    o: Obb
+    o.center = {rf(buf[:], oo), rf(buf[:], oo + 4), rf(buf[:], oo + 8)}
+    o.ext = {rf(buf[:], oo + 0xC), rf(buf[:], oo + 0x10), rf(buf[:], oo + 0x14)}
+    o.axis[0] = {rf(buf[:], oo + 0x18), rf(buf[:], oo + 0x1C), rf(buf[:], oo + 0x20)}
+    o.axis[1] = {rf(buf[:], oo + 0x24), rf(buf[:], oo + 0x28), rf(buf[:], oo + 0x2C)}
+    o.axis[2] = {rf(buf[:], oo + 0x30), rf(buf[:], oo + 0x34), rf(buf[:], oo + 0x38)}
+    append(&out, o)
+  }
+  return out
 }
 
 Reach_Status :: enum {

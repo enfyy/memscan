@@ -80,17 +80,20 @@ Session :: struct {
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
   world_cal:     [dynamic]World_Cal_Cand,
 
-  // Detection experiment (see refocus_tick in target.odin): write the current m_pObjFocus value
-  // back to itself periodically - a consistent external write that matches the client's input.
-  refocus_on:    bool,
-  refocus_last:  i64,
-
   // Server target-sync (see notify_server_target / cli_srvsync). When on, each focus select
   // also fires the client's own SendSetTarget(objid, 2) so the server's m_idSetTarget matches
   // what we attack - the anti-DC fix. Defaults ON on attach (inert until configured); cleared on
   // detach/close and re-enabled on the next attach. 'srvsync off' disables it for the session.
   srvsync_on:    bool,
   srv_shim:      uintptr, // cached RWX shim page in the target (remote_send_settarget); 0 = none
+
+  // Attack-range circle overlay (see range_ring_tick / cli_ring / cli_draw_range). The watcher thread
+  // redraws it around the player each tick (pure overlay writes), so it never blocks the REPL. radius 0
+  // live-tracks attack_range (draw_range); until 0 = indefinite toggle, else a deadline (ring [Ns]).
+  range_ring_on:     bool,
+  range_ring_until:  i64,
+  range_ring_radius: f32,
+  range_ring_last:   i64,
 
   // Cached RWX page for particle-marker injection (remote_spawn_particles). Reused across refreshes
   // so a fast tracking overlay doesn't VirtualAllocEx/Free every tick; grown when a batch needs more.
