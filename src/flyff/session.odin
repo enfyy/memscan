@@ -71,6 +71,12 @@ Session :: struct {
   // the live collision linkmaps and correlated with more crashes under sustained farming; 'meshreach on'.
   mesh_reach_on:    bool,
 
+  // Geo-fence target boundary (see fence.odin / cli_fence). A flat list of +/- shapes; when active the
+  // picker gates candidate mobs on fence_contains (tc_cand_skip) so the player never targets outside the
+  // area. Authored by the radar mouse editor or the 'fence' text commands; serialized to fences/*.fence.
+  // Mutated only under exec_mutex (REPL/radar) and read only under it (watcher picker) - no extra lock.
+  fence:            Fence,
+
   // Bow-range retarget anchor (see tc_select). While a shootable mob is in bow range, the auto picker
   // ranks by nearest-to-the-last-kill's-spot instead of nearest-to-you, so a ranger stays on the pack.
   auto_sel_pos:     [3]f32, // world pos of the current auto target when it was selected (pending anchor)
@@ -197,5 +203,6 @@ session_close :: proc(session: ^Session) {
   delete(session.tc_recent)
   delete(session.auto_blocked)
   delete(session.world_cal)
+  fence_destroy(&session.fence)
   auto_free_names(session)
 }

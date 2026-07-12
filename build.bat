@@ -11,6 +11,11 @@ set "DEBUG_DIR=%OUTPUT_DIR%\debug"
 set "RELEASE_DIR=%OUTPUT_DIR%\release"
 set "COMPILER=odin"
 set "COMMON_FLAGS=-ignore-unknown-attributes -vet-shadowing -error-pos-style:unix"
+REM raylib is STATICALLY linked. raylib.lib and Win32 User32.lib (pulled in for the global hotkeys) both
+REM define CloseWindow/ShowCursor; without help the linker binds them to user32's (wrong - the raylib
+REM window then never closes). /WHOLEARCHIVE:raylib.lib forces raylib's whole archive in first so its
+REM own CloseWindow wins and user32's is never pulled. No raylib.dll needed at runtime.
+set "LINK_FLAGS=-extra-linker-flags:/WHOLEARCHIVE:raylib.lib"
 set "DEBUG_FLAGS=-debug"
 set "RELEASE_FLAGS=-o:speed -disable-assert -no-bounds-check"
 
@@ -56,11 +61,11 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo %BLUE%^> %COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS%%RESET%
+echo %BLUE%^> %COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS%%RESET%
 REM Stream odin's output straight to the console (preserves newlines/indentation and any '!' in
 REM messages - the old redirect-into-a-delayed-expansion-variable approach mangled all three) and
 REM capture only its exit code.
-%COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS%
+%COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS%
 set "BUILD_ERROR=%ERRORLEVEL%"
 
 if not "%BUILD_ERROR%"=="0" (

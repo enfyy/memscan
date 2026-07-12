@@ -245,6 +245,10 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_findcull(session, args)
   case "findcam":
     flyff.cli_findcam(session, args)
+  case "radar":
+    flyff.cli_radar(session, args)
+  case "fence":
+    flyff.cli_fence(session, args)
   case:
     fmt.eprintfln("unknown command: %s (try 'help')", cmd)
   }
@@ -320,6 +324,14 @@ farming (day to day)
                              (tc_map[_label].html) + a console factor table; diagnoses target order.
                              label tags the file ('tdbg cloakia' vs 'tdbg tower'); a trailing number is
                              the view radius in world units ('tdbg tower 30' to zoom in)
+  radar [seconds]            open a LIVE top-down radar window (player + mobs + obstacles); wheel=zoom,
+                             ESC=close. raylib is statically linked (no dll). seconds>0 auto-closes.
+                             press E in-window to draw a geo-fence (see 'fence').
+  fence [sub]                geo-fence: never target mobs outside a drawn area. no arg = status. subs:
+                             add circle <r>|<x,z> <r> [-] / add rect <halfx,halfz>|<min> <max> [-] /
+                             poly start|point|end / undo / erase <x,z> / clear / on / off / test <x,z> /
+                             save <name> / load <name> / list. a trailing '-' makes a carve-out (exclude).
+                             adding a shape auto-activates the gate; 'fence off' overrides without clearing.
   ring [radius] [Ns]         draw your attack_range as a cyan circle on the ground (follows you, ~30s,
                              non-blocking); attack a mob to see if the ring reaches it. 'ring off' stops
   draw_range                 toggle a PERSISTENT range circle that live-tracks attack_range (so

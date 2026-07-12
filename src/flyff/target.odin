@@ -107,6 +107,7 @@ Pick_Ctx :: struct {
   name_filtered: bool, // len(names) > 0 -> the melee fast-path is enabled
   require_fresh: bool, // auto (true) vs manual target_closest (false)
   gate:          bool, // proactive reach filter on
+  fence_on:      bool, // geo-fence gate on (session.fence.active) - skip mobs outside the fenced area
   avoid_on:      bool, // one-shot: prefer the opposite side from the last stuck mob
   avoid_dir:     [2]f32,
   last_kill_set: bool,
@@ -134,6 +135,9 @@ tc_cand_skip :: proc(session: ^Session, ctx: Pick_Ctx, cands: []TC_Cand, i: int,
   }
   if ctx.gate && !cand_reachable(session, ctx.world, ctx.player_pos, c.pos) {
     return true
+  }
+  if ctx.fence_on && !fence_contains(session.fence, c.pos[0], c.pos[2]) {
+    return true // outside the configured geo-fence area
   }
   return false
 }
@@ -485,6 +489,7 @@ tc_select :: proc(
     name_filtered = len(names) > 0,
     require_fresh = require_fresh,
     gate          = require_fresh && session.reach_gate_on, // reach filter (auto only; inert w/o aobjcull_rva)
+    fence_on      = session.fence.active, // geo-fence gate (auto + manual when active; 'fence off' to override)
     avoid_on      = session.auto_avoid_on,
     avoid_dir     = session.auto_avoid_dir,
     last_kill_set = session.last_kill_set,
