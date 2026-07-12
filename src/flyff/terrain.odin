@@ -1230,6 +1230,9 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
     return
   }
   ty := rd_u32le(buf[:], po + 0x10)
+  if ty != 0 && ty != 3 {
+    return // OT_OBJ (trees/rocks/buildings) or OT_CTRL (walls/housing) only - the collidable props
+  }
   rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
   pos = {rf(buf[:], po), rf(buf[:], po + 4), rf(buf[:], po + 8)}
   oo := po - 0x3C
@@ -1243,53 +1246,17 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
   return
 }
 
-// Append OT_OBJ + OT_CTRL colliders from one tile's flat m_apObject arrays into `out`, radius-filtered
-// around (cx,cz). Camera-independent: m_apObject[type] holds every object on the tile with a live count.
-gather_tile_colliders :: proc(session: ^Session, pland: uintptr, cx, cz, radius: f32, out: ^[dynamic]Obb) {
-  handle := session.proc_info.handle
-  pt := engine.Value_Type.U32
-  L := session.layout
-  types := [?]i64{0, 3} // OT_OBJ, OT_CTRL
-  for ti in types {
-    arrp := read_ptr_at(handle, pland + uintptr(L.landobj_off + ti * 4), pt)
-    if !is_heap_ptr(session, arrp) {
-      continue
-    }
-    cnt := read_i32_at(handle, pland + uintptr(L.landobj_off + LANDOBJ_MAX_ARRAY * 4 + ti * 4))
-    if cnt <= 0 || cnt > 200000 {
-      continue
-    }
-    ab := make([]byte, int(cnt) * 4, context.temp_allocator)
-    rn, _ := engine.read_into(handle, arrp, ab)
-    r2 := radius * radius
-    for k in 0 ..< int(rn) / 4 {
-      obj := uintptr(rd_u32le(ab, k * 4))
-      if obj < 0x10000 {
-        continue // freed / empty slot
-      }
-      // cheap radius reject on a 12-byte position read before the full OBB read
-      opos, ook := engine.read_vec3(handle, obj + uintptr(L.pos_off))
-      if !ook {
-        continue
-      }
-      dx := opos[0] - cx
-      dz := opos[2] - cz
-      if dx * dx + dz * dz > r2 {
-        continue
-      }
-      if o, _, ok := obj_to_obb(session, obj); ok {
-        append(out, o)
-      }
-    }
-  }
-}
-
-// Gather (and cache) every collidable prop within COLLIDER_RADIUS of the player from the CLandscape tile
-// arrays - the player's tile plus any neighbour tile the radius reaches. Camera-independent. Rebuilt only
-// when the player leaves the cached area, so segment tests hit the cache (pure math, no reads).
+// Gather (and cache) every collidable prop within COLLIDER_RADIUS of the player. Uses a FULL writable-
+// memory scan for the world pointer (each CObj holds m_pWorld at field_off), then keeps OT_OBJ/OT_CTRL
+// with a live OBB. Complete by construction: it finds every prop the game collides against regardless of
+// which spatial list holds it. This matters on maps like Azria, where big static ice rocks live only in
+// the CLandscape LINK MAP (m_apObjLink[linkStatic], what CWorld::ProcessCollision walks) and are ABSENT
+// from the flat per-tile m_apObject array the old walk read - so reach/radar saw straight through them
+// (path in, get stuck; not drawn). The picker already full-scans every tick, so this is the same cost
+// class. Rebuilt only when the player leaves the cached area, so segment tests hit the cache (pure math).
 collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32) -> []Obb {
   L := session.layout
-  if world == 0 || L.landobj_off == 0 || L.land_off == 0 || L.landwidth_off == 0 || session.ptr_size != 4 {
+  if world == 0 || session.ptr_size != 4 {
     return nil
   }
   if session.collider_cache_valid {
@@ -1301,35 +1268,32 @@ collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32) -
   }
   handle := session.proc_info.handle
   pt := engine.Value_Type.U32
-  mpu := f32(world_mpu(session, world))
-  land_width := read_i32_at(handle, world + uintptr(L.landwidth_off))
-  land_height := read_i32_at(handle, world + uintptr(L.landwidth_off + 4))
-  arr := read_ptr_at(handle, world + uintptr(L.land_off), pt)
-  if !is_heap_ptr(session, arr) || land_width <= 0 || land_height <= 0 {
-    return nil
-  }
   clear(&session.collider_cache)
-  tile_world := f32(MAP_SIZE) * mpu
-  m_x := int(px / mpu) / MAP_SIZE
-  m_z := int(pz / mpu) / MAP_SIZE
-  for tz := m_z - 1; tz <= m_z + 1; tz += 1 {
-    for tx := m_x - 1; tx <= m_x + 1; tx += 1 {
-      if tx < 0 || tz < 0 || tx >= int(land_width) || tz >= int(land_height) {
-        continue
-      }
-      // include a neighbour tile only if the gather radius actually reaches it
-      lo_x := f32(tx) * tile_world
-      lo_z := f32(tz) * tile_world
-      if px + COLLIDER_RADIUS < lo_x || px - COLLIDER_RADIUS > lo_x + tile_world ||
-         pz + COLLIDER_RADIUS < lo_z || pz - COLLIDER_RADIUS > lo_z + tile_world {
-        continue
-      }
-      pland := read_ptr_at(handle, arr + uintptr((tx + tz * int(land_width)) * session.ptr_size), pt)
-      if !is_heap_ptr(session, pland) {
-        continue
-      }
-      gather_tile_colliders(session, pland, px, pz, COLLIDER_RADIUS, &session.collider_cache)
+  wval := engine.ptr_to_value(world, session.ptr_size)
+  regions := engine.collect_regions(handle, true)
+  defer delete(regions)
+  set := engine.scan_exact_parallel(handle, pt, wval, regions[:], context.temp_allocator)
+  r2 := COLLIDER_RADIUS * COLLIDER_RADIUS
+  seen := make(map[uintptr]bool, 2048, context.temp_allocator) // an object holds m_pWorld once, but guard anyway
+  for m in set.matches {
+    obj := uintptr(i64(m.addr) - L.field_off)
+    if obj in seen {
+      continue
     }
+    seen[obj] = true
+    o, _, ok := obj_to_obb(session, obj) // vtable-checked + type-filtered to OT_OBJ/OT_CTRL
+    if !ok {
+      continue
+    }
+    if o.ext[0] <= 0.01 && o.ext[2] <= 0.01 {
+      continue // degenerate / uninitialised OBB - nothing to test or draw
+    }
+    dx := o.center[0] - px
+    dz := o.center[2] - pz
+    if dx * dx + dz * dz > r2 {
+      continue
+    }
+    append(&session.collider_cache, o)
   }
   session.collider_cache_center = {px, 0, pz}
   session.collider_cache_valid = true
@@ -1677,10 +1641,10 @@ obj_is_decorative :: proc(session: ^Session, obj: uintptr, ty: u32) -> bool {
   return false
 }
 
-// collscan [radius] - for each nearby OT_OBJ / OT_CTRL prop (from the on-screen cull array), read its
-// model filename + collision-mesh type. The decorative-prop recon: it shows, per prop, whether the .o3d
-// has a dedicated collision mesh (NORMAL) or falls back to the render mesh (ERROR). Read-only; also
-// reports a consensus (elem_off, name_off) so those two inner offsets can be pinned for a fast filter.
+// collscan [radius] - for each nearby OT_OBJ / OT_CTRL prop (found by a full memory scan, so all props
+// count, not just the on-screen ones), read its model filename + collision-mesh type. The decorative-prop
+// recon: it shows, per prop, whether the .o3d has a dedicated collision mesh (NORMAL) or falls back to the
+// render mesh (ERROR). Read-only; auto-pins the consensus (coll_obj3d_off, coll_type_off) for the filter.
 cli_collscan :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
@@ -1691,10 +1655,6 @@ cli_collscan :: proc(session: ^Session, args: []string) {
     return
   }
   L := session.layout
-  if L.aobjcull_rva == 0 {
-    fmt.eprintln("collscan: needs the on-screen cull array - run 'findcull' first.")
-    return
-  }
   handle := session.proc_info.handle
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
@@ -1702,6 +1662,11 @@ cli_collscan :: proc(session: ^Session, args: []string) {
   wlen := po + 0x1C
   if wlen > 512 {
     fmt.eprintln("collscan: implausible pos_off.")
+    return
+  }
+  world := read_ptr_at(handle, base + L.world_rva, engine.Value_Type.U32)
+  if world == 0 {
+    fmt.eprintln("collscan: world not resolved - run 'setup' / 'calibrate' first.")
     return
   }
 
@@ -1717,9 +1682,6 @@ cli_collscan :: proc(session: ^Session, args: []string) {
     }
   }
 
-  CAP :: 8192
-  idx := make([]byte, CAP * 4, context.temp_allocator)
-  n, _ := engine.read_into(handle, base + L.aobjcull_rva, idx)
   buf: [512]byte
   rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
 
@@ -1733,45 +1695,46 @@ cli_collscan :: proc(session: ^Session, args: []string) {
   }
   rows := make([dynamic]Row, context.temp_allocator)
   votes := make(map[[2]i64]int, 8, context.temp_allocator)
-  seen := make(map[uintptr]bool, 512, context.temp_allocator) // m_aobjCull repeats the same CObj* across slots
+  seen := make(map[uintptr]bool, 512, context.temp_allocator)
   n_props := 0
   n_probed := 0
-  for k in 0 ..< int(n) / 4 {
-    p := uintptr(rd_u32le(idx, k * 4))
-    if p < 0x10000 {
-      break // null slot = past the live entries
+  // Full writable-memory scan for the world pointer -> every CObj (holds m_pWorld at field_off), so we
+  // see all nearby props (better consensus + no findcull/aobjcull dependency), not just the on-screen set.
+  wval := engine.ptr_to_value(world, session.ptr_size)
+  regions := engine.collect_regions(handle, true)
+  defer delete(regions)
+  set := engine.scan_exact_parallel(handle, engine.Value_Type.U32, wval, regions[:], context.temp_allocator)
+  for m in set.matches {
+    obj := uintptr(i64(m.addr) - L.field_off)
+    if seen[obj] {
+      continue
     }
-    rn, rok := engine.read_into(handle, p, buf[:wlen])
+    rn, rok := engine.read_into(handle, obj, buf[:wlen])
     if !rok || int(rn) < wlen {
-      break
+      continue
     }
     vt := uintptr(rd_u32le(buf[:], 0))
     if vt < base || vt >= mod_end {
-      break // end of the live cull prefix
+      continue // not a live CObj
     }
     ty := rd_u32le(buf[:], po + 0x10)
     if ty != 0 && ty != 3 {
       continue // OT_OBJ / OT_CTRL only (the collidable props)
     }
-    if seen[p] {
-      continue // already listed this prop
-    }
-    seen[p] = true
-    ocx := rf(buf[:], po)
-    ocz := rf(buf[:], po + 8)
-    dx := ocx - ppos[0]
-    dz := ocz - ppos[2]
+    seen[obj] = true
+    dx := rf(buf[:], po) - ppos[0]
+    dz := rf(buf[:], po + 8) - ppos[2]
     dist := math.sqrt(dx * dx + dz * dz)
     if dist > radius {
       continue
     }
     n_props += 1
-    fname, eoff, noff, coll, cok := probe_model_coll(session, p)
+    fname, eoff, noff, coll, cok := probe_model_coll(session, obj)
     if cok {
       n_probed += 1
       votes[[2]i64{eoff, noff}] += 1
     }
-    append(&rows, Row{p, ty, dist, coll, cok, fname})
+    append(&rows, Row{obj, ty, dist, coll, cok, fname})
   }
 
   // sort by distance (selection sort; small near-set)

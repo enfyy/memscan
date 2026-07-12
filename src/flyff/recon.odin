@@ -617,9 +617,16 @@ cli_findprop :: proc(session: ^Session, args: []string) {
       break anchors
     }
   }
-  min_score := max(8, len(ids) / 4)
+  // Acceptance floor. Each match is an EXACT record[i].dwID == i at a computed offset, and the (r0,stride)
+  // already forces 2 anchors + a pre-checked third to match, so 4 total is a confident lock - a wrong
+  // stride matching 4 distinct ids exactly is astronomically unlikely. Only scale the floor up for large
+  // id sets (where the real array scores far higher anyway); farm spots often have just 4-6 species.
+  min_score := max(4, len(ids) / 4)
   if best_score < min_score {
-    fmt.printfln("couldn't lock the prop array (best %d/%d ids matched). Retry with more monster species on screen.", best_score, len(ids))
+    fmt.printfln(
+      "couldn't lock the prop array (best %d/%d species matched; need >=%d). Get a few more DISTINCT monster species on screen and retry.",
+      best_score, len(ids), min_score,
+    )
     return
   }
   r0 := best_r0

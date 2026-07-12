@@ -400,6 +400,17 @@ cli_auto :: proc(session: ^Session, args: []string) {
     fmt.eprintln("not attached.")
     return
   }
+  // Preflight: warn (don't block) if required setup is missing, so a broken config doesn't silently farm
+  // nothing. Non-fatal - auto still ARMs (you engage the first mob yourself). See `setup` / `status`.
+  {
+    miss := make([dynamic]string, context.temp_allocator)
+    for g in setup_groups(session) {
+      if g.required && !g.ok {append(&miss, g.label)}
+    }
+    if len(miss) > 0 {
+      fmt.eprintfln("[!] setup incomplete: %s - run `setup <name>` for reliable farming (`status` for detail).", strings.join(miss[:], ", ", context.temp_allocator))
+    }
+  }
   auto_set_names(session, names[:])
   session.auto_last = 0
   session.auto_count = 0
@@ -442,8 +453,8 @@ cli_stuck :: proc(session: ^Session, args: []string) {
 
 // reachgate | reachgate on|off -> toggle the PROACTIVE reach filter for auto: skip candidate mobs whose
 // straight approach is blocked by terrain or a placed-object OBB, before selecting (the reactive
-// stuck-monitor still catches the rest). On by default, but inert until 'findcull' sets aobjcull_rva (so
-// it can't accidentally starve target selection or fall back to the slow scan in the pick loop).
+// stuck-monitor still catches the rest). On by default; active once the world resolves (calibrated) -
+// object colliders come from the cached full-scan, so it no longer needs findcull/aobjcull_rva.
 cli_reachgate :: proc(session: ^Session, args: []string) {
   switch {
   case len(args) == 0:
@@ -456,9 +467,7 @@ cli_reachgate :: proc(session: ^Session, args: []string) {
     fmt.eprintln("usage: reachgate [on|off]")
     return
   }
-  inert := session.layout.aobjcull_rva == 0
-  hint := (session.reach_gate_on && inert) ? "  (inert: run 'findcull' once in-game to enable it)" : ""
-  fmt.printfln("reach-gate %s.%s", session.reach_gate_on ? "ON" : "OFF", hint)
+  fmt.printfln("reach-gate %s.", session.reach_gate_on ? "ON" : "OFF")
 }
 
 // meshreach | meshreach on|off -> toggle the mesh-accurate reach confirm. When on, a candidate our loose

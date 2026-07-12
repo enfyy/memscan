@@ -157,6 +157,8 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_meshreach(session, args)
   case "pause":
     flyff.cli_pause(session, args)
+  case "setup":
+    flyff.cli_setup(session, args)
   case "calibrate", "cal":
     flyff.cli_calibrate(session, args)
   case "calibrate_house", "calh":
@@ -169,6 +171,8 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_set(session, args)
   case "findpos":
     flyff.cli_findpos(session, args)
+  case "findplayer":
+    flyff.cli_findplayer(session, args)
   case "findfocus":
     flyff.cli_findfocus(session, args)
   case "findhp":
@@ -306,7 +310,7 @@ automation
                              also: hotkey list | hotkey clear
 
 ============ FLYFF (Neuz.exe - offsets live in flyff.cfg, loaded on attach) ============
-typical use: attach Neuz -> auto -> hold your attack key.   after a patch: select a mob, calibrate.
+typical use: attach Neuz -> auto -> hold your attack key.   after a patch: 'setup <name>' in the field.
 check the setup anytime with 'status'.
 
 farming (day to day)
@@ -344,8 +348,13 @@ farming (day to day)
   srvtest                    fire one server SendSetTarget at the current target
 
 setup & health (run once after a game patch)
+  setup <name> [hp]          ONE-STEP setup: stand in a field on the ground, target your PET with
+                             monsters on screen, then run it. Anchors on your character NAME (no
+                             /position to type) and runs the whole pipeline (core + srvsync + focus +
+                             prop-gate + coll-filter + terrain), ending with a checklist of anything
+                             that still needs a different spot. Re-runnable. saves flyff.cfg
   status              (doctor)  health-check: what's configured, what's missing, and how to fix it
-  calibrate <x,y,z> <name> [hp]  (cal) re-derive the whole layout from /position + your
+  calibrate <x,y,z> <name> [hp]  (cal) manual/fallback: re-derive the layout from /position + your
                              character name; also finds srvsync offsets, and focus_off if a mob
                              is selected. select a mob first for full setup. saves flyff.cfg
   calibrate_house <name> [hp]  (calh) same, from your house's fixed spawn (no /position; but no
@@ -362,10 +371,10 @@ offset finders (one-time; each fills part of the layout)
                              eggs / NPCs / players / bosses. One-time; re-run after a game patch.
   findaii                    diagnostic: dump a mover's AI-region fields / find pet tags (RE only)
 
-terrain / obstacle reach oracle (one-time setup: worldscan + findcull)
+terrain / obstacle reach oracle ('setup' pins these; commands below are for standalone use / diagnostics)
   worldscan [reset]          pin the terrain-grid offsets from your ground height (stand on solid
                              ground; if ambiguous, walk to a different-height spot and re-run)
-  findcull                   locate the on-screen object array (makes reach checks ~instant; re-run after a patch)
+  findcull                   locate the on-screen object array (legacy; reach no longer needs it - colliders full-scan)
   findcam                    locate the render camera (CWorld::m_pCamera); lets tdbg draw the cull cone / blind spot
   attr [x,z]                 terrain attribute at your feet (or a world point): NONE/NOWALK/NOMOVE/DIE
   attrmap [radius] [step]    ASCII map of terrain attributes around you (reveals invisible walls)

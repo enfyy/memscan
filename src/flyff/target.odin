@@ -71,12 +71,14 @@ mark_blocked :: proc(session: ^Session, obj: uintptr, now: i64) {
 }
 
 // Proactive reach gate: is the straight approach to <cand_pos> clear (terrain grid + object OBBs)?
-// Stays inert (returns true) when the FAST object path (aobjcull_rva) isn't set, so the gate never runs
-// the slow full-memory scan inside the pick loop; compute_reach's terrain part self-noops if terrain
-// isn't calibrated. Selecting an unreachable mob just makes the character jam - this skips it up front.
+// Object colliders come from collect_area_colliders, which full-scans and CACHES (rebuilt only when the
+// player moves), so the pick loop hits pure math after one scan - no per-candidate cost and no dependence
+// on aobjcull_rva / findcull. compute_reach's terrain part self-noops if terrain isn't calibrated. Only
+// inert when the world hasn't resolved (uncalibrated). Selecting an unreachable mob jams the character -
+// this skips it up front.
 cand_reach_status :: proc(session: ^Session, world: uintptr, player_pos, cand_pos: [3]f32) -> Reach_Status {
-  if session.layout.aobjcull_rva == 0 {
-    return .Clear // inert without the fast object path - never run the slow scan in the pick loop
+  if world == 0 {
+    return .Clear // uncalibrated / not in-game - nothing to test against
   }
   res := compute_reach(session, world, player_pos[0], player_pos[1], player_pos[2], cand_pos[0], cand_pos[2])
   return res.status

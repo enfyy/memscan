@@ -189,6 +189,9 @@ cli_status :: proc(session: ^Session) {
     fmt.println("  WARNING : Flyff automation targets the 32-bit Neuz.exe - this process is 64-bit.")
   }
 
+  // Prescriptive top-line: how far setup is + the single next action (the detail sections below are why).
+  fmt.printfln(">> %s", setup_status_line(session))
+
   // --- Core layout (calibrate) ---
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
@@ -244,10 +247,8 @@ cli_status :: proc(session: ^Session) {
   fmt.printfln("  land_off=0x%X landwidth_off=0x%X hmap_off=0x%X mpu_off=0x%X", L.land_off, L.landwidth_off, L.hmap_off, L.mpu_off)
   fmt.printfln("  attack_range=%v  <- your reach; drives target selection (the picker's engage range) AND 'reach'. 'set attack_range <n>' (floats ok, e.g. 1.75).", L.attack_range)
   fmt.printfln(
-    "  aobjcull_rva=0x%X  object reach: %s   auto reach-gate: %s",
-    L.aobjcull_rva,
-    L.aobjcull_rva != 0 ? "FAST (m_aobjCull)" : "SLOW full-scan - run 'findcull'",
-    session.reach_gate_on ? (L.aobjcull_rva != 0 ? "ON" : "on but inert (needs findcull)") : "OFF",
+    "  object reach: cached full-scan (finds every collidable prop; no findcull needed)   auto reach-gate: %s",
+    session.reach_gate_on ? (world != 0 ? "ON" : "on (activates once in-game)") : "OFF",
   )
   coll_set := L.coll_obj3d_off != 0 && L.coll_type_off != 0
   fmt.printfln(
@@ -327,16 +328,18 @@ cli_status :: proc(session: ^Session) {
   }
 
   fmt.println("")
-  fmt.println("SETUP CHECKLIST - the one-time commands that pin each group (re-run the relevant one after a game patch):")
-  fmt.println("  calibrate <pos> <name> [hp]  core targeting + srvsync   (select a mob first to also pin focus_off)")
-  fmt.println("  findprop                     any-monster gate (target your pet with monsters on screen)")
-  fmt.println("  worldscan                    terrain grid (stand on solid flat ground; repeat at a different height if ambiguous)")
-  fmt.println("  findcull                     on-screen object array (object reach + collscan need it)")
-  fmt.println("  findcam                      render camera (lets tdbg draw the cull cone)")
-  fmt.println("  collscan                     decorative-prop filter offsets (coll_obj3d_off / coll_type_off)")
-  fmt.println("  findobjline                  mesh-reach RVA (intersectobjline_rva) - only needed if you use 'meshreach on'")
+  fmt.println("SETUP - the whole thing is one command (re-run after a game patch):")
+  fmt.println("  setup <name> [hp]            stand in a field on the ground, target your PET with monsters on screen, then")
+  fmt.println("                               run it. Anchors on your character NAME (no /position) and pins EVERYTHING:")
+  fmt.println("                               core + srvsync + focus + prop-gate + coll-filter + terrain. Re-runnable.")
+  fmt.println("  the finish checklist (above / the >> line) tells you exactly what still needs a different spot.")
   fmt.println("")
-  fmt.println("edit any field with 'set <field> <value>' (auto-saves flyff.cfg). 'calibrate' preserves every non-core pin.")
+  fmt.println("manual / advanced pins (setup runs these for you; use standalone if something needs a specific spot):")
+  fmt.println("  calibrate <pos> <name> [hp]  core + srvsync from /position (name-anchor fallback for a recompiled client)")
+  fmt.println("  findprop / collscan / worldscan   the prop-gate / walk-through filter / terrain pins individually")
+  fmt.println("  findcam / findobjline        optional: render camera (tdbg cone) / mesh-reach RVA (only for 'meshreach on')")
+  fmt.println("")
+  fmt.println("edit any field with 'set <field> <value>' (auto-saves flyff.cfg). 'setup'/'calibrate' preserve every non-core pin.")
 }
 
 // offsets              -> show the health-check ('status')
@@ -448,6 +451,38 @@ cli_findpos :: proc(session: ^Session, args: []string) {
       break
     }
     fmt.printfln("  0x%X", h)
+  }
+}
+
+// findplayer <name> -> locate the player object by NAME (the position-free anchor `setup` uses). Prints
+// the resolved object + name_off + position and cross-checks it against [base+player_rva] so you can see
+// they agree. Read-only; validation aid for the name-anchored setup.
+cli_findplayer :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if len(args) < 1 {
+    fmt.eprintln("usage: findplayer <name>")
+    return
+  }
+  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  pt := session.ptr_size == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  obj, noff, ok := find_player_by_name(session, name)
+  if !ok {
+    fmt.eprintfln("findplayer: no mover named '%s' resolved (struct offsets may have moved - use 'calibrate <pos> <name>').", name)
+    return
+  }
+  pos, _ := engine.read_vec3(handle, obj + uintptr(session.layout.pos_off))
+  nm, _ := engine.read_obj_name(handle, session.ptr_size, obj, noff)
+  fmt.printfln("findplayer '%s' -> obj=0x%X name_off=0x%X pos=(%.1f, %.1f, %.1f) readback='%s'", name, obj, noff, pos[0], pos[1], pos[2], nm)
+  rva_player := read_ptr_at(handle, base + session.layout.player_rva, pt)
+  if rva_player == obj {
+    fmt.printfln("  [OK] matches [base+player_rva]=0x%X - name-anchor agrees with the known player pointer.", rva_player)
+  } else {
+    fmt.printfln("  [note] [base+player_rva]=0x%X differs (rva stale/patched or ambiguous name); the name-anchor stands on its own.", rva_player)
   }
 }
 
@@ -579,15 +614,29 @@ run_calibrate :: proc(session: ^Session, pos: [3]f32, name: string, has_hp: bool
     return
   }
 
+  calibrate_derive(session, player, pos_off, name_off, has_hp, hp)
+}
+
+// Derive & save the full layout from an already-found player object: field_off/world/world_rva,
+// player_rva, hp_off, focus_off (if a mob is selected), and srvsync. Position-INDEPENDENT - shared by the
+// position-anchored `run_calibrate` and the name-anchored `setup`. Prints the report + writes flyff.cfg.
+// Returns the resolved world (0 if unresolved) so a caller can gate follow-on steps that need it.
+calibrate_derive :: proc(session: ^Session, player: uintptr, pos_off, name_off: i64, has_hp: bool, hp: i64) -> (world: uintptr, world_ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  size := session.proc_info.module_size
+  mod_end := base + uintptr(size)
+  ps := session.ptr_size
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  L := session.layout
+
   // 3. Derive m_pWorld / world / world_rva together. The world is the object field whose pointer
   //    is ALSO held by a static global in the image - unlike per-instance pointers such as
   //    m_pModel, and regardless of whether CWorld starts with a vtable (it doesn't in this build).
   //    Try the contiguous default (pos_off+0xC) first, then sweep, so it survives the field moving.
   model_off := pos_off + 0x18
   field_off := pos_off + 0xC
-  world: uintptr = 0
   world_rva := L.world_rva
-  world_ok := false
 
   fos := make([dynamic]i64, context.temp_allocator)
   append(&fos, pos_off + 0xC)
@@ -688,6 +737,7 @@ run_calibrate :: proc(session: ^Session, pos: [3]f32, name: string, has_hp: bool
     fmt.eprintfln("WARNING: could not write %s (offsets applied in memory only).", path)
   }
   fmt.println("confirm with 'mobs <a nearby mob name>', then use 'target_closest' / 'auto' as usual.")
+  return
 }
 
 // Candidate for focus_off: a CWorld slot pointing at a live non-player mover (the selected target).
@@ -1300,6 +1350,105 @@ find_u32_offset :: proc(handle: win.HANDLE, obj: uintptr, val: u32, span: int, p
     return 0, false
   }
   return best, true
+}
+
+// Plausible world position: finite coords in a sane Flyff range. Sanity-gates a name-anchored object
+// before we trust the assumed pos_off (a wrong base rarely has 3 plausible position floats at +pos_off).
+plausible_world_pos :: proc(p: [3]f32) -> bool {
+  for c in p {
+    if c != c || c > 1e7 || c < -1e7 { // NaN or absurd magnitude
+      return false
+    }
+  }
+  return p[0] >= 0 && p[2] >= 0 && p[0] < 1e6 && p[2] < 1e6 && p[1] > -1e5 && p[1] < 1e5
+}
+
+// find_player_by_name - locate the player CMover by scanning memory for the character NAME (ASCII or
+// UTF-16LE) and resolving the enclosing mover object. Position-free anchor for `setup`: in run_calibrate
+// only object-FINDING needs the typed /position; the name is short to type and everything downstream is
+// position-independent. Uses the CURRENT pos_off (stable across config patches) for the mover-type check;
+// name_off is re-derived canonically via find_name_offset (matches calibrate). Among matches, prefers the
+// one a static global points at (the true player). ok=false => nothing resolved (struct offsets likely
+// moved: fall back to `calibrate <pos> <name>`).
+find_player_by_name :: proc(session: ^Session, name: string) -> (player: uintptr, name_off: i64, ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  size := session.proc_info.module_size
+  mod_end := base + uintptr(size)
+  ps := session.ptr_size
+  L := session.layout
+  nb := transmute([]byte)name
+  if len(nb) == 0 || ps != 4 {
+    return
+  }
+
+  // Candidate name-string addresses: ASCII, then UTF-16LE.
+  hits := make([dynamic]uintptr, context.temp_allocator)
+  for h in engine.scan_bytes(handle, nb, context.temp_allocator) {append(&hits, h)}
+  wbytes := make([]byte, len(nb) * 2, context.temp_allocator)
+  for i in 0 ..< len(nb) {
+    wbytes[i * 2] = nb[i]
+  }
+  for h in engine.scan_bytes(handle, wbytes, context.temp_allocator) {append(&hits, h)}
+
+  WINDOW :: 0x4000 // max name_off (name buffer sits within this of the object base)
+  seen := make(map[uintptr]bool, 256, context.temp_allocator)
+  cands := make([dynamic]uintptr, context.temp_allocator)
+  noffs := make([dynamic]i64, context.temp_allocator)
+  processed := 0
+  for N in hits {
+    processed += 1
+    if processed > 400 {
+      break // bound the work; the real object is among the near hits
+    }
+    lo := N > uintptr(WINDOW) ? N - uintptr(WINDOW) : uintptr(0)
+    wlen := int(N - lo)
+    if wlen < 4 {
+      continue
+    }
+    buf := make([]byte, wlen, context.temp_allocator)
+    rn, _ := engine.read_into(handle, lo, buf)
+    if int(rn) < 4 {
+      continue
+    }
+    // Scan backward from the name for the nearest preceding module-vtable that begins a named mover.
+    for off := ((int(rn) - 4) / 4) * 4; off >= 0; off -= 4 {
+      v := uintptr(rd_u32le(buf, off))
+      if v < base || v >= mod_end {
+        continue // not an in-module vtable
+      }
+      B := lo + uintptr(off)
+      if u32(read_i32_at(handle, B + uintptr(L.pos_off + 0x10))) != L.mover_type {
+        continue // m_dwType != mover
+      }
+      pos, pok := engine.read_vec3(handle, B + uintptr(L.pos_off))
+      if !pok || !plausible_world_pos(pos) {
+        continue
+      }
+      noff, nok := find_name_offset(handle, B, name, 0x4000)
+      if !nok {
+        continue
+      }
+      if !seen[B] {
+        seen[B] = true
+        append(&cands, B)
+        append(&noffs, noff)
+      }
+      break // nearest containing mover for this name hit
+    }
+  }
+  if len(cands) == 0 {
+    return
+  }
+  // Disambiguate: the true player is held by a static global (like player_rva). Prefer such a candidate.
+  chosen := 0
+  for c, i in cands {
+    if len(engine.scan_image_for_ptr(handle, base, size, c, ps, context.temp_allocator)) > 0 {
+      chosen = i
+      break
+    }
+  }
+  return cands[chosen], noffs[chosen], true
 }
 
 parse_vec3_literal :: proc(s: string) -> (pos: [3]f32, ok: bool) {
