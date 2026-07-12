@@ -2007,6 +2007,125 @@ cli_linkscan :: proc(session: ^Session, args: []string) {
 }
 
 // ---------------------------------------------------------------------------
+// findobjline - re-pin intersectobjline_rva after a patch (the one-command meshreach setup)
+// ---------------------------------------------------------------------------
+
+// findobjline - re-derive intersectobjline_rva after a game patch. A patch shifts the function; the
+// defaulted RVA then points at wrong code, so its prologue no longer matches and meshreach / objline /
+// reachcmp all go inert (the "on but inert" you see in status). This is the missing "just works" finder:
+// it needs no manual codescan/disasm.
+//
+// How it pins the function (mirrors findparticle, plus a hard prologue gate):
+//  1. scan_bytes for the unique anchor string "CWorld::IntersectObjLine" - the Error() text in the
+//     object-cull overflow guard inside the function body (verified single occurrence in the client).
+//  2. codescan_u32 for code that pushes that string's absolute VA (the `push offset; call Error`).
+//  3. walk back over MSVC int3 inter-function padding to the entry of the function containing that push.
+//  4. verify the entry's prologue is the aligned-frame + __chkstk opener 55 8B EC 83 E4 F0 B8 (the huge
+//     CObj* pNonCullObjs[10000] stack array forces exactly this). The prologue gate both confirms we
+//     landed on the right function and is the same check intersectobjline_rva_sane uses before every call.
+// Read-only recon (no injection). On success it sets + saves intersectobjline_rva; after that 'meshreach
+// on' takes effect. It does NOT enable meshreach - that stays opt-in (it injects, crash-prone).
+cli_findobjline :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if session.ptr_size != 4 {
+    fmt.eprintln("IntersectObjLine lives in the 32-bit Flyff client; attach the WOW64 Neuz.exe.")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+
+  // 1) Locate the anchor string. ASCII-only prefix (the literal continues in Korean, which is
+  //    code-page-dependent); "CWorld::IntersectObjLine" occurs exactly once in the client.
+  anchor := "CWorld::IntersectObjLine"
+  pat := make([]byte, len(anchor), context.temp_allocator)
+  copy(pat, anchor)
+  straddrs := engine.scan_bytes(handle, pat, context.temp_allocator)
+  if len(straddrs) == 0 {
+    fmt.eprintln("findobjline: anchor string not found (a patch changed it?). Fall back to the manual disasm route.")
+    return
+  }
+
+  // 2-4) For each string address, find the code refs, walk each back to a function entry, and keep the
+  //       first entry whose prologue matches. The prologue gate disambiguates multiple refs/strings.
+  want := [?]byte{0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0xB8}
+  PRE :: 0x1000 // walk-back window: entry is well within this of the in-body Error() push
+  found: uintptr = 0
+  n_refs := 0
+  for sa in straddrs {
+    refs := engine.codescan_u32(handle, u32(sa), context.temp_allocator)
+    n_refs += len(refs)
+    for ref in refs {
+      pre := make([]byte, PRE + 16, context.temp_allocator)
+      rn, _ := engine.read_into(handle, ref - PRE, pre)
+      if int(rn) < PRE {
+        continue
+      }
+      // entry = nearest addr <= ref preceded by >=2 int3 (MSVC inter-function padding).
+      entry: uintptr = 0
+      for j := PRE; j >= 2; j -= 1 {
+        if pre[j - 1] == 0xCC && pre[j - 2] == 0xCC {
+          entry = ref - PRE + uintptr(j)
+          break
+        }
+      }
+      if entry == 0 {
+        continue
+      }
+      pb: [len(want)]byte
+      en, eok := engine.read_into(handle, entry, pb[:])
+      if !eok || int(en) < len(want) {
+        continue
+      }
+      match := true
+      for b, i in want {
+        if pb[i] != b {
+          match = false
+          break
+        }
+      }
+      if match {
+        found = entry
+        break
+      }
+    }
+    if found != 0 {
+      break
+    }
+  }
+
+  if found == 0 {
+    fmt.eprintfln(
+      "findobjline: located the anchor + %d code ref(s), but none walked back to a function with the",
+      n_refs,
+    )
+    fmt.eprintln("  expected prologue 55 8B EC 83 E4 F0 B8. The compiler may have reshaped it - disasm around the")
+    fmt.eprintln("  ref and 'set intersectobjline_rva 0x<entry>' by hand.")
+    return
+  }
+
+  new_rva := found - base
+  old := session.layout.intersectobjline_rva
+  session.layout.intersectobjline_rva = new_rva
+  if new_rva == old {
+    fmt.printfln("findobjline: intersectobjline_rva=0x%X - already correct (prologue verified).", new_rva)
+  } else {
+    fmt.printfln("findobjline: intersectobjline_rva=0x%X (was 0x%X). prologue verified.", new_rva, old)
+  }
+  // Authoritative re-check against live memory - the exact gate every objline call runs.
+  if intersectobjline_rva_sane(session) {
+    fmt.println("  [OK] prologue re-checks in place. 'meshreach on' will now take effect (objline / reachcmp too).")
+  } else {
+    fmt.println("  [!!] unexpected: sane-check still fails after set - do NOT enable meshreach; disasm by hand.")
+  }
+  if flyff_save_cfg(session.layout, flyff_cfg_path()) {
+    fmt.println("  saved to flyff.cfg.")
+  }
+}
+
+// ---------------------------------------------------------------------------
 // objline / reachcmp - validate our OBB oracle against the client's own IntersectObjLine (step 3)
 // ---------------------------------------------------------------------------
 

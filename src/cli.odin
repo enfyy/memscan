@@ -237,6 +237,8 @@ cli_dispatch :: proc(session: ^flyff.Session, cmd: string, args: []string) -> (q
     flyff.cli_attackable(session, args)
   case "reachdbg":
     flyff.cli_reachdbg(session, args)
+  case "findobjline":
+    flyff.cli_findobjline(session, args)
   case "objline":
     flyff.cli_objline(session, args)
   case "reachcmp":
@@ -317,8 +319,9 @@ farming (day to day)
   kills <n>                  auto-disable 'auto' after N confirmed kills (e.g. 'kills 100'); 'kills off' cancels
   stuck [on|off]             toggle reactive obstacle skip-detection (on by default; 'stuck off' for ranged/standing)
   reachgate [on|off]         proactively skip mobs behind walls/trees/buildings when auto-picks a target
-  meshreach [on|off]         confirm OBB-blocked mobs with the client's IntersectObjLine (default OFF; injects, crash-prone)
-                             (on by default; needs 'worldscan' + 'findcull' once to take effect)
+  meshreach [on|off]         confirm OBB-blocked mobs with the client's IntersectObjLine (opt-in; injects, crash-prone)
+                             inert until 'findobjline' pins intersectobjline_rva (re-run it after a game patch)
+  findobjline                re-pin intersectobjline_rva by signature so meshreach / objline / reachcmp work again
   mobs <name>                list nearby <name> movers by distance (hp, model, address)
   tdbg [label] [zoom] (tmap)  write a top-down radar map of the PREDICTED auto kill-order
                              (tc_map[_label].html) + a console factor table; diagnoses target order.

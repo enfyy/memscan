@@ -464,7 +464,7 @@ cli_reachgate :: proc(session: ^Session, args: []string) {
 // meshreach | meshreach on|off -> toggle the mesh-accurate reach confirm. When on, a candidate our loose
 // OBB marks blocked is re-tested with the client's own IntersectObjLine (OBB + triangle mesh) and kept if
 // the client can reach it - recovers mobs the whole-silhouette OBB false-blocks. Injects a game-code
-// thread per OBB-blocked candidate. On by default, inert until intersectobjline_rva is set + prologue-valid.
+// thread per OBB-blocked candidate. Off by default (opt-in); inert until 'findobjline' pins intersectobjline_rva.
 cli_meshreach :: proc(session: ^Session, args: []string) {
   switch {
   case len(args) == 0:

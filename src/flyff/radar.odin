@@ -38,6 +38,128 @@ FENCE_INC :: rl.Color{46, 204, 113, 255} // + inclusion shape (green)
 FENCE_EXC :: rl.Color{231, 126, 34, 255} // - exclusion / carve-out shape (orange)
 CAM_COL :: rl.Color{90, 200, 225, 255} // camera eye + frustum cone (cyan; toggled with F)
 
+MOB_COL :: rl.Color{231, 76, 60, 255} // attackable monster (red)
+PLAYER_COL :: rl.Color{80, 150, 255, 255} // another player (azure; drawn larger, with a facing arrow)
+OTHER_COL :: rl.Color{130, 140, 150, 220} // pet / egg / NPC (neutral grey)
+UNCLASS_COL :: rl.Color{231, 76, 60, 255} // any mover, when the AI gate isn't configured (falls back to red)
+SEL_COL :: rl.Color{241, 196, 15, 255} // selected-target highlight ring (yellow)
+RANGE_COL :: rl.Color{46, 204, 113, 130} // attack_range ring around the player (soft green)
+
+// One blip on the radar: a live mover with its world position, kind (for colour/size), the object
+// pointer (to match the selected target), and - for players - a facing angle drawn like our own arrow.
+Radar_Blip_Kind :: enum {
+  Unclassified, // AI gate not configured - drawn like the old red mob dot
+  Monster, // GetProp()->dwAI == AII_MONSTER
+  Player, // species AI matches the local player's
+  Other, // pet / egg / NPC
+}
+Radar_Blip :: struct {
+  pos:          [3]f32,
+  obj:          uintptr,
+  kind:         Radar_Blip_Kind,
+  angle:        f32,
+  has_angle:    bool,
+  reach_tested: bool, // did the reach pass evaluate this blip (monsters only, bounded set)
+  reachable:    bool, // straight-line reach to it is clear (terrain + object OBBs) - else drawn faded
+}
+
+REACH_VIS_R :: f32(60) // only reach-test monsters within this of the player (relevance + per-frame cost bound)
+REACH_VIS_MAX :: 48 // cap reach raycasts per frame (terrain raycast does per-cell reads; keep the loop smooth)
+
+// Classify a mover for the radar from its species AI (GetProp()->dwAI). <propbase> is the resolved
+// MoverProp array base (0 => gate off, everything is Unclassified). <player_ai> is the local player's
+// own species AI, read live so player detection stays build-independent; 0xFFFFFFFF => don't flag
+// players (couldn't resolve it, or it collided with a pet/egg/NPC/monster class - see cli_radar).
+radar_classify :: proc(session: ^Session, propbase: uintptr, obj: uintptr, player_ai: u32) -> Radar_Blip_Kind {
+  if propbase == 0 {
+    return .Unclassified
+  }
+  ai := species_ai(session, propbase, obj)
+  if ai == AII_MONSTER {
+    return .Monster
+  }
+  if player_ai != 0xFFFFFFFF && ai == player_ai {
+    return .Player
+  }
+  return .Other
+}
+
+// Radar dot colour + radius for a blip kind. Players are drawn a touch larger than mobs so they stand
+// out; pets/eggs/NPCs are a muted grey; an unclassified mover falls back to the old red mob dot.
+radar_blip_style :: proc(k: Radar_Blip_Kind) -> (col: rl.Color, radius: f32) {
+  switch k {
+  case .Player:
+    return PLAYER_COL, 5
+  case .Monster:
+    return MOB_COL, 3
+  case .Other:
+    return OTHER_COL, 3
+  case .Unclassified:
+    return UNCLASS_COL, 3
+  }
+  return MOB_COL, 3
+}
+
+// Resolve the MoverProp array base + the local player's own species AI, for radar classification.
+// propbase = [base+propmover_rva] (0 when the AI gate isn't configured -> everything Unclassified).
+// player_ai is the local player's GetProp()->dwAI, read live so other players (same AI) are flagged
+// without a build-specific constant; forced to 0xFFFFFFFF (players not flagged) when it can't be read
+// or would collide with a monster/pet/egg/NPC class (so those crowds can never be mislabelled players).
+radar_prop_ctx :: proc(session: ^Session, player: uintptr) -> (propbase: uintptr, player_ai: u32) {
+  player_ai = 0xFFFFFFFF
+  if !prop_gate_ready(session) {
+    return
+  }
+  handle := session.proc_info.handle
+  pt := engine.Value_Type.U32
+  if pb, ok := engine.read_value(handle, session.proc_info.base + session.layout.propmover_rva, pt); ok {
+    propbase = uintptr(engine.value_as_u64(pt, pb))
+  }
+  if propbase == 0 || player == 0 {
+    propbase = 0
+    return
+  }
+  ai := species_ai(session, propbase, player)
+  if ai != 0xFFFFFFFF && ai != AII_MONSTER && ai != AII_PET && ai != AII_EGG && ai != AII_NONE {
+    player_ai = ai
+  }
+  return
+}
+
+// Reachability pass for the radar: flag which nearby monster blips are blocked (terrain grid + object
+// OBBs) using the SAME compute_reach the target picker's gate consults, so a dot fades exactly when the
+// picker would consider it unreachable. Bounded for the 30fps loop - only the nearest REACH_VIS_MAX
+// monsters within REACH_VIS_R are tested (far mobs aren't actionable and the terrain raycast reads
+// per-cell). Players/others are never tested. Runs under exec_mutex (reads game memory).
+radar_reach_pass :: proc(session: ^Session, world: uintptr, ppos: [3]f32, mobs: []Radar_Blip) {
+  if world == 0 {
+    return
+  }
+  Reach_Idx :: struct {
+    i: int,
+    d: f32,
+  }
+  cand := make([dynamic]Reach_Idx, context.temp_allocator)
+  for m, i in mobs {
+    if m.kind != .Monster && m.kind != .Unclassified {
+      continue
+    }
+    d := engine.dist_horizontal(m.pos, ppos)
+    if d > REACH_VIS_R {
+      continue
+    }
+    append(&cand, Reach_Idx{i, d})
+  }
+  slice.sort_by(cand[:], proc(a, b: Reach_Idx) -> bool {return a.d < b.d})
+  n := min(len(cand), REACH_VIS_MAX)
+  for k in 0 ..< n {
+    m := &mobs[cand[k].i]
+    res := compute_reach(session, world, ppos[0], ppos[1], ppos[2], m.pos[0], m.pos[2])
+    m.reach_tested = true
+    m.reachable = res.status == .Clear
+  }
+}
+
 // Radar editor tool. The three draw tools map 1:1 to Fence_Kind; Eraser deletes the shape under the cursor.
 Radar_Tool :: enum {
   Circle,
@@ -46,9 +168,12 @@ Radar_Tool :: enum {
   Eraser,
 }
 
-// Gather live mover positions from the player's tile + neighbours' m_apObject[OT_MOVER] arrays, within
-// `radius` of (px,pz). Camera-independent and cheap (movers per tile are few). Appends world positions.
-radar_gather_movers :: proc(session: ^Session, world: uintptr, px, pz, radius: f32, out: ^[dynamic][3]f32) {
+// Gather live movers from the player's tile + neighbours' m_apObject[OT_MOVER] arrays, within `radius`
+// of (px,pz). Camera-independent and cheap (movers per tile are few). Each is classified (monster /
+// player / other) via its species AI: <propbase> is the resolved MoverProp array base (0 => everything
+// Unclassified) and <player_ai> the local player's species AI (0xFFFFFFFF => don't flag players). The
+// <player> object itself is skipped (it's drawn separately as the white arrow). Appends Radar_Blips.
+radar_gather_movers :: proc(session: ^Session, world, player: uintptr, propbase: uintptr, player_ai: u32, px, pz, radius: f32, out: ^[dynamic]Radar_Blip) {
   handle := session.proc_info.handle
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
@@ -91,6 +216,9 @@ radar_gather_movers :: proc(session: ^Session, world: uintptr, px, pz, radius: f
         if obj < 0x10000 {
           continue
         }
+        if obj == player {
+          continue // our own object is drawn separately (the white facing arrow)
+        }
         vt := read_ptr_at(handle, obj, pt)
         if vt < base || vt >= mod_end {
           continue // not a live CObj
@@ -102,7 +230,25 @@ radar_gather_movers :: proc(session: ^Session, world: uintptr, px, pz, radius: f
         dx := pos[0] - px
         dz := pos[2] - pz
         if dx * dx + dz * dz <= r2 {
-          append(out, pos)
+          kind := radar_classify(session, propbase, obj, player_ai)
+          // Drop dead-but-not-despawned monsters immediately (currentHP <= 0) so a corpse's dot vanishes on
+          // death instead of lingering through the despawn animation. Same death signal obj_is_selectable
+          // uses; a failed HP read leaves it drawn. Only monsters/unclassified movers corpse this way.
+          if (kind == .Monster || kind == .Unclassified) && L.hp_off != 0 {
+            if hpv, hok := engine.read_value(handle, obj + uintptr(L.hp_off), .U32); hok {
+              if i32(u32(engine.value_as_u64(.U32, hpv))) <= 0 {
+                continue
+              }
+            }
+          }
+          blip := Radar_Blip{pos = pos, obj = obj, kind = kind}
+          if blip.kind == .Player && L.angle_off != 0 { // draw other players' facing like our own
+            if a, aok := read_f32_at(handle, obj + uintptr(L.angle_off)); aok {
+              blip.angle = a
+              blip.has_angle = true
+            }
+          }
+          append(out, blip)
         }
       }
     }
@@ -125,6 +271,20 @@ radar_rot2 :: proc(v: [2]f32, a_rad: f32) -> [2]f32 {
   c := math.cos(a_rad)
   s := math.sin(a_rad)
   return {v[0] * c - v[1] * s, v[0] * s + v[1] * c}
+}
+
+// Draw a facing arrow at screen point <sp> for m_fAngle <a_deg> (on-screen dir = angle+180, same
+// convention as the tdbg HTML). <length> = tip distance, <half> = base half-width. Shared by the local
+// player (large, white) and other-player blips (small, azure).
+radar_draw_arrow :: proc(sp: rl.Vector2, a_deg, length, half: f32, col: rl.Color) {
+  theta := math.to_radians(a_deg + 180)
+  fx := -math.sin(theta) // screen-x component
+  fz := math.cos(theta) // screen-y component (+ = down = +world z)
+  tip := rl.Vector2{sp.x + fx * length, sp.y + fz * length}
+  bl := rl.Vector2{sp.x + fz * half, sp.y - fx * half} // base corners (perp to the heading)
+  br := rl.Vector2{sp.x - fz * half, sp.y + fx * half}
+  rl.DrawTriangle(tip, bl, br, col) // fill (winding may cull; outline below always shows)
+  rl.DrawTriangleLines(tip, bl, br, col)
 }
 
 // Draw one committed fence shape (green for +, orange for -). Polygons are outlined (fill needs
@@ -233,10 +393,26 @@ cli_radar :: proc(session: ^Session, args: []string) {
     fmt.eprintln("radar: world/player not resolved - run 'calibrate'.")
     return
   }
-  probe := make([dynamic][3]f32, context.temp_allocator)
-  radar_gather_movers(session, world, ppos[0], ppos[2], view_r + 20, &probe)
+  probe_player := read_ptr_at(handle, base + L.player_rva, pt)
+  probe_pb, probe_pai := radar_prop_ctx(session, probe_player)
+  probe := make([dynamic]Radar_Blip, context.temp_allocator)
+  radar_gather_movers(session, world, probe_player, probe_pb, probe_pai, ppos[0], ppos[2], view_r + 20, &probe)
   probe_obbs := collect_area_colliders(session, world, ppos[0], ppos[2])
-  fmt.printfln("radar: player (%.1f, %.1f), %d movers, %d obstacles in view. opening window%s...", ppos[0], ppos[2], len(probe), len(probe_obbs), dur > 0 ? fmt.tprintf(" for %.0fs", dur) : "")
+  nmon, nply, noth := 0, 0, 0
+  for b in probe {
+    switch b.kind {
+    case .Monster:
+      nmon += 1
+    case .Player:
+      nply += 1
+    case .Other, .Unclassified:
+      noth += 1
+    }
+  }
+  fmt.printfln(
+    "radar: player (%.1f, %.1f), %d movers (%d mob, %d player, %d other), %d obstacles in view. opening window%s...",
+    ppos[0], ppos[2], len(probe), nmon, nply, noth, len(probe_obbs), dur > 0 ? fmt.tprintf(" for %.0fs", dur) : "",
+  )
   free_all(context.temp_allocator)
 
   rl.SetConfigFlags({.WINDOW_RESIZABLE})
@@ -247,6 +423,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
   scale := f32(3.0) // pixels per world unit; mouse wheel zooms
   cam := [2]f32{ppos[0], ppos[2]} // world point at screen center; right-drag pans, C recenters on player
   show_cam := false // F toggles the render-camera eye + frustum overlay
+  show_reach := true // R toggles fading of monsters the collision check can't reach (off = less per-frame work)
   start := rl.GetTime()
 
   // Fence editor state - all local. session.fence is mutated only here (and by the `fence` commands),
@@ -277,7 +454,8 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // --- live player pos + facing (single player resolve) ---
     pangle: f32
     has_angle := false
-    if player := read_ptr_at(handle, base + L.player_rva, pt); player != 0 {
+    player := read_ptr_at(handle, base + L.player_rva, pt)
+    if player != 0 {
       if p, ok := engine.read_vec3(handle, player + uintptr(L.pos_off)); ok {
         ppos = p
       }
@@ -300,6 +478,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
     }
     if rl.IsKeyPressed(.E) {edit = !edit}
     if rl.IsKeyPressed(.F) {show_cam = !show_cam}
+    if rl.IsKeyPressed(.R) {show_reach = !show_reach}
     if rl.IsKeyPressed(.C) || rl.IsKeyPressed(.HOME) {cam = {ppos[0], ppos[2]}}
 
     // --- input: fence editor (edit mode) ---
@@ -378,13 +557,30 @@ cli_radar :: proc(session: ^Session, args: []string) {
 
     // --- live data (snapshot shared state before releasing the lock) ---
     w := read_ptr_at(handle, base + L.world_rva, pt)
-    mobs := make([dynamic][3]f32, context.temp_allocator)
+    mobs := make([dynamic]Radar_Blip, context.temp_allocator)
     obbs: []Obb
+    focus: uintptr // currently selected target (m_pObjFocus); 0 = nothing selected
+    focus_pos: [3]f32
+    focus_pos_ok := false
     if w != 0 {
-      radar_gather_movers(session, w, ppos[0], ppos[2], view_r + 20, &mobs)
+      propbase, player_ai := radar_prop_ctx(session, player)
+      radar_gather_movers(session, w, player, propbase, player_ai, ppos[0], ppos[2], view_r + 20, &mobs)
+      if show_reach {
+        radar_reach_pass(session, w, ppos, mobs[:]) // fade monsters the collision check can't reach
+      }
       // collect_area_colliders returns session.collider_cache[:], which the watcher's reach gate also
       // rewrites - clone it into temp so drawing after we unlock can't touch a slice being reallocated.
       obbs = slice.clone(collect_area_colliders(session, w, ppos[0], ppos[2]), context.temp_allocator)
+      // Selected target: read m_pObjFocus + its position so we can ring it (it may sit outside the
+      // gathered radius, so we resolve its position directly rather than relying on the mob list).
+      focus = read_ptr_at(handle, w + uintptr(L.focus_off), pt)
+      if focus != 0 {
+        if fvt := read_ptr_at(handle, focus, pt); fvt >= base && fvt < base + uintptr(session.proc_info.module_size) {
+          focus_pos, focus_pos_ok = engine.read_vec3(handle, focus + uintptr(L.pos_off))
+        } else {
+          focus = 0 // stale/freed pointer - don't ring it
+        }
+      }
     }
     ceye, clook: [3]f32
     cam_ok := false
@@ -404,13 +600,24 @@ cli_radar :: proc(session: ^Session, args: []string) {
     rl.DrawLineV({center.x, 0}, {center.x, fh}, rl.Color{28, 38, 50, 255})
     rl.DrawLineV({0, center.y}, {fw, center.y}, rl.Color{28, 38, 50, 255})
 
-    // obstacles (axis-aligned box from the OBB extent; rotation comes later)
+    // obstacles: solid blockers (real collision mesh / OT_CTRL) as a filled purple box + bright outline;
+    // walk-through props (GMT_ERROR - the game paths straight through them) as a faint grey outline only.
+    // Both are shown so you can see the field, but the fill tells you which actually blocks. A minimum
+    // on-screen size keeps small rocks from vanishing. (Axis-aligned from the OBB extent; rotation TODO.)
     for o in obbs {
+      if o.ext[0] <= 0.01 && o.ext[2] <= 0.01 {
+        continue // degenerate / uninitialised OBB (nothing to draw; would be a stray dot at the origin)
+      }
       p := radar_w2s(cam, scale, center, o.center[0], o.center[2])
-      bw := 2 * o.ext[0] * scale
-      bh := 2 * o.ext[2] * scale
-      col := o.decorative ? rl.Color{120, 130, 145, 60} : rl.Color{155, 89, 182, 120}
-      rl.DrawRectangleV({p.x - bw / 2, p.y - bh / 2}, {bw, bh}, col)
+      bw := max(2 * o.ext[0] * scale, 5)
+      bh := max(2 * o.ext[2] * scale, 5)
+      rect := rl.Rectangle{p.x - bw / 2, p.y - bh / 2, bw, bh}
+      if o.decorative {
+        rl.DrawRectangleLinesEx(rect, 1, rl.Color{130, 140, 155, 95}) // walk-through -> outline only
+      } else {
+        rl.DrawRectangleV({rect.x, rect.y}, {bw, bh}, rl.Color{155, 89, 182, 70}) // blocker fill
+        rl.DrawRectangleLinesEx(rect, 1.5, rl.Color{175, 115, 205, 205}) // + bright outline
+      }
     }
 
     // render-camera overlay (F)
@@ -455,37 +662,53 @@ cli_radar :: proc(session: ^Session, args: []string) {
       }
     }
 
-    // mobs (shaded by fence membership so the editor previews the target gate)
+    // attack_range ring - your configured reach around the player (drives the picker; 'set attack_range')
+    if L.attack_range > 0 {
+      pc := radar_w2s(cam, scale, center, ppos[0], ppos[2])
+      rl.DrawCircleLinesV(pc, L.attack_range * scale, RANGE_COL)
+    }
+
+    // movers: coloured/sized by kind (red mob, azure player w/ facing arrow, grey pet/npc). Gate-eligible
+    // mobs (monsters / unclassified) outside the fence are dimmed so the editor previews the target gate;
+    // ones the reach check can't reach are drawn faded (R toggles).
     have_fence := len(session.fence.shapes) > 0
     for m in mobs {
-      p := radar_w2s(cam, scale, center, m[0], m[2])
-      col := rl.Color{231, 76, 60, 255}
-      if have_fence && !fence_geom_contains(session.fence, m[0], m[2]) {
+      p := radar_w2s(cam, scale, center, m.pos[0], m.pos[2])
+      col, radius := radar_blip_style(m.kind)
+      gate_eligible := m.kind == .Monster || m.kind == .Unclassified
+      if have_fence && gate_eligible && !fence_geom_contains(session.fence, m.pos[0], m.pos[2]) {
         col = rl.Color{90, 96, 105, 200} // outside the fence -> dimmed (would be skipped)
+      } else if m.reach_tested && !m.reachable {
+        col.a = 70 // unreachable per the collision check (terrain/obstacle in the way) -> faded
       }
-      rl.DrawCircleV(p, 3, col)
+      rl.DrawCircleV(p, radius, col)
+      if m.kind == .Player && m.has_angle {
+        radar_draw_arrow(p, m.angle, 11, 4, col) // other players get a facing arrow too
+      }
+    }
+
+    // selected target (m_pObjFocus) - a bright yellow ring so you can see what's currently locked
+    if focus != 0 && focus_pos_ok {
+      fp := radar_w2s(cam, scale, center, focus_pos[0], focus_pos[2])
+      rl.DrawCircleLinesV(fp, 9, SEL_COL)
+      rl.DrawCircleLinesV(fp, 11, SEL_COL)
     }
 
     // player dot + facing arrow (m_fAngle; same convention as the tdbg HTML: on-screen dir = angle+180)
     pp := radar_w2s(cam, scale, center, ppos[0], ppos[2])
     if has_angle {
-      theta := math.to_radians(pangle + 180)
-      fx := -math.sin(theta) // screen-x component
-      fz := math.cos(theta) // screen-y component (+ = down = +world z)
-      tip := rl.Vector2{pp.x + fx * 17, pp.y + fz * 17}
-      bl := rl.Vector2{pp.x + fz * 6, pp.y - fx * 6} // base corners (perp to the heading)
-      br := rl.Vector2{pp.x - fz * 6, pp.y + fx * 6}
-      rl.DrawTriangle(tip, bl, br, rl.RAYWHITE) // fill (winding may cull; outline below always shows)
-      rl.DrawTriangleLines(tip, bl, br, rl.RAYWHITE)
+      radar_draw_arrow(pp, pangle, 17, 6, rl.RAYWHITE)
     }
     rl.DrawCircleV(pp, 5, rl.WHITE)
 
     // HUD
     toolname: cstring = tool == .Circle ? "circle" : tool == .Rect ? "rect" : tool == .Polygon ? "polygon" : "eraser"
-    rl.DrawText(fmt.ctprintf("%s | fence %s | %d shapes | tool:%s tag:%s | cam:%s | %.1f px/u", edit ? "EDIT" : "view", session.fence.active ? "ON" : "off", len(session.fence.shapes), toolname, include ? "+" : "-", show_cam ? "on" : "off", scale), 10, 10, 18, rl.RAYWHITE)
-    hint: cstring = "E:edit fence   F:camera   wheel:zoom   Rdrag:pan   C:recenter   ESC:close"
+    rl.DrawText(fmt.ctprintf("%s | fence %s | %d shapes | tool:%s tag:%s | cam:%s | reach:%s | %.1f px/u", edit ? "EDIT" : "view", session.fence.active ? "ON" : "off", len(session.fence.shapes), toolname, include ? "+" : "-", show_cam ? "on" : "off", show_reach ? "on" : "off", scale), 10, 10, 18, rl.RAYWHITE)
+    legend: cstring = prop_gate_ready(session) ? "red:mob  blue:player  grey:pet/npc  faded:unreachable  yellow ring:target  green ring:attack_range" : "movers:red (run 'findprop' to tell players/pets apart)  faded:unreachable  yellow ring:target"
+    rl.DrawText(legend, 10, 32, 14, rl.Color{150, 160, 172, 255})
+    hint: cstring = "E:edit fence   F:camera   R:reach   wheel:zoom   RMB-drag:pan   C:recenter   ESC:close"
     if edit {
-      hint = "E:view  1/2/3:draw  4:erase  Tab:+/-  Ldrag/click  Enter:close-poly  Bksp:undo  Del:clear  A:on/off  Rdrag:pan  F:cam  C:recenter"
+      hint = "E:view  1/2/3:draw  4:erase  Tab:+/-  Ldrag/click  Enter:close-poly  Bksp:undo  Del:clear  A:on/off  R:reach  RMB-drag:pan  F:cam  C:recenter"
     }
     rl.DrawText(hint, 10, i32(fh) - 24, 16, rl.Color{150, 160, 172, 255})
     rl.EndDrawing()

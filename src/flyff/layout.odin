@@ -273,7 +273,7 @@ cli_status :: proc(session: ^Session) {
   if L.intersectobjline_rva != 0 && !meshreach_inert {
     fmt.println("    [OK] IntersectObjLine prologue verified - safe to CALL, but the injection races the game's world lists; leave OFF for farming.")
   } else if L.intersectobjline_rva != 0 {
-    fmt.println("    [note] IntersectObjLine prologue doesn't match - a patch moved it; re-find its RVA before 'meshreach on'.")
+    fmt.println("    [note] IntersectObjLine prologue doesn't match - a patch moved it; run 'findobjline' to re-pin it before 'meshreach on'.")
   }
   // Camera-independent obstacle source (CLandscape.m_apObject flat arrays). Live-probe the player tile's
   // OT_OBJ count; a plausible value confirms landobj_off. This is what makes reach see off-camera props.
@@ -334,7 +334,7 @@ cli_status :: proc(session: ^Session) {
   fmt.println("  findcull                     on-screen object array (object reach + collscan need it)")
   fmt.println("  findcam                      render camera (lets tdbg draw the cull cone)")
   fmt.println("  collscan                     decorative-prop filter offsets (coll_obj3d_off / coll_type_off)")
-  fmt.println("  (intersectobjline_rva is a defaulted RVA; if a patch moves it, doctor flags [SUSPECT] - re-find + 'set' it)")
+  fmt.println("  findobjline                  mesh-reach RVA (intersectobjline_rva) - only needed if you use 'meshreach on'")
   fmt.println("")
   fmt.println("edit any field with 'set <field> <value>' (auto-saves flyff.cfg). 'calibrate' preserves every non-core pin.")
 }

@@ -105,6 +105,14 @@ FLYFF_PROPMOVER_RVA :: 0x0
 FLYFF_MOVERPROP_STRIDE :: 0x0
 FLYFF_MOVERPROP_AI_OFF :: 0x0
 AII_MONSTER :: u32(2) // Resource/defineNeuz.h: AII_MONSTER (pets=5, eggs=9, none/NPC=0)
+// Other GetProp()->dwAI classes we reference to colour the radar (players draw as AII_MOVER). We don't
+// hard-code the player value: the local player's own species AI is read live and matched, so it stays
+// correct across builds. These are only used to sanity-gate that computed value (a player AI must not
+// collide with a pet/egg/NPC/monster class). See recon.odin aii_verdict.
+AII_NONE :: u32(0) // NPC
+AII_MOVER :: u32(1) // player / generic mover
+AII_PET :: u32(5)
+AII_EGG :: u32(9)
 SPECIES_REL :: 0x14   // m_dwIndex (species id) offset relative to pos_off (m_vPos)
 MOVERPROP_NAME_OFF :: 4 // MoverProp.szName sits right after the 4-byte dwID at record start
 
