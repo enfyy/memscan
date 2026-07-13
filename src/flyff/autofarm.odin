@@ -425,7 +425,7 @@ cli_auto :: proc(session: ^Session, args: []string) {
   session.auto_paused = true
   session.pause_obj = 0
   session.auto_on = true
-  ensure_hotkey_thread(session)
+  engine.ensure_hotkey_thread(&session.eng)
   fmt.printfln(
     "auto-farm ARMED: %s. target a mob and kill it to start; then it advances on each kill. F10 to pause, 'auto off' to stop.",
     auto_target_desc(session.auto_names[:]),
@@ -558,7 +558,7 @@ cli_timer :: proc(session: ^Session, args: []string) {
   }
 
   session.auto_timer_at = now + i64(mins * 60_000_000_000.0)
-  ensure_hotkey_thread(session) // keep the watcher alive so the deadline is serviced
+  engine.ensure_hotkey_thread(&session.eng) // keep the watcher alive so the deadline is serviced
   note := session.auto_on ? "" : "  (auto is off now - it will only stop a run that's in progress then.)"
   fmt.printfln("auto-off timer armed: auto-farm OFF in %s.%s", fmt_elapsed(session.auto_timer_at - now), note)
 }
@@ -601,7 +601,7 @@ cli_kills :: proc(session: ^Session, args: []string) {
   }
 
   session.auto_count_limit = n
-  ensure_hotkey_thread(session) // keep the watcher alive so the quota is serviced
+  engine.ensure_hotkey_thread(&session.eng) // keep the watcher alive so the quota is serviced
   // Arming at or below the current run count -> the quota is already met; stop now.
   if session.auto_on && auto_count_reached(session, time.now()._nsec) {
     return

@@ -1,38 +1,17 @@
 package flyff
 
-import "core:fmt"
-import "core:mem"
-import "core:mem/virtual"
-import "core:sync"
-import win "core:sys/windows"
 import "../engine"
 
-Attached_Process :: struct {
-  pid:          u32,
-  name:         string,
-  window_title: string,
-  handle:       win.HANDLE,
-  base:         uintptr,
-  module_size:  u32,
-  is_wow64:     bool,
-}
-
+// The flyff automation session. It EMBEDS the generic engine.Session as its first field so all
+// the generic scan/process/watcher state is shared, and adds the Flyff-specific automation state
+// on top. engine.Session must stay first (offset 0): the module hooks are handed a ^engine.Session
+// and recover this struct with an offset-0 cast (see flyff_of in module.odin).
 Session :: struct {
-  attached:      bool,
-  proc_info:     Attached_Process,
-  vtype:         engine.Value_Type,
-  ptr_size:      int,
-  writable_only: bool,
+  using eng: engine.Session,
 
   // Live Flyff memory layout (RVAs + offsets). Seeded from flyff_layout_default(), overwritten
   // by flyff.cfg on attach, re-derived by `calibrate`. See flyff.odin Flyff_Layout / layout.odin.
   layout:        Flyff_Layout,
-  scan_arena:    virtual.Arena,
-  has_snapshot:  bool,
-  snapshot:      engine.Mem_Snapshot,
-  has_matches:   bool,
-  matches:       engine.Match_Set,
-  targets:       [dynamic]engine.Nearest_Entry, // last 'nearest' result, sorted by distance
   tc_recent:     [dynamic]TC_Recent, // objs target_closest picked recently (skip just-killed)
 
   // Auto-farm mode (see auto_tick / cli_auto in target.odin). When on, the watcher thread
@@ -89,6 +68,7 @@ Session :: struct {
   // watched mob resumes it. 'auto' starts paused (armed), so the first kill kicks off farming.
   auto_paused:      bool,
   pause_obj:        uintptr, // mob watched for a kill while paused (0 = none)
+  pause_key_prev:   bool, // F10 edge-detection state for the default pause binding (see module_tick)
 
   // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
@@ -126,24 +106,16 @@ Session :: struct {
   collider_cache:        [dynamic]Obb,
   collider_cache_center: [3]f32,
   collider_cache_valid:  bool,
-
-  // Global hotkeys (see hotkey.odin). exec_mutex serializes command execution between the REPL
-  // thread and the hotkey watcher thread. exec_line runs a CLI line (set by main to the REPL's
-  // dispatcher); the watcher calls it through this pointer so flyff never imports the cli/main
-  // package (breaks what would otherwise be a flyff<->main cycle).
-  hotkeys:       [dynamic]Hotkey,
-  exec_mutex:    sync.Mutex,
-  hk_thread:     win.HANDLE,
-  hk_running:    bool,
-  hk_stop:       bool,
-  exec_line:     proc(^Session, string) -> bool,
 }
 
-// Initialise a fresh Session (defaults + scan arena). Returns false if the arena can't be created.
+#assert(offset_of(Session, eng) == 0) // module hooks recover ^Session from ^engine.Session (offset-0 cast)
+
+// Initialise a fresh Session: the generic engine state, then the Flyff automation defaults, then
+// register the flyff module (hooks). Returns false if the engine arena can't be created.
 session_init :: proc(session: ^Session) -> bool {
-  session.vtype = .U32
-  session.ptr_size = 8
-  session.writable_only = true
+  if !engine.session_init(&session.eng) {
+    return false
+  }
   session.auto_stuck_on = true // obstacle/stuck detection on by default (see auto_monitor)
   session.reach_gate_on = true // proactive reach gate on by default (inert until findcull sets aobjcull_rva)
   // Mesh-accurate reach confirm defaults OFF: it injects a game-code thread (IntersectObjLine) per
@@ -152,57 +124,12 @@ session_init :: proc(session: ^Session) -> bool {
   // decorative filter (collscan) delivers most of the benefit safely. Opt in per session with 'meshreach on'.
   session.mesh_reach_on = false
   session.layout = flyff_layout_default()
-  if err := virtual.arena_init_growing(&session.scan_arena); err != .None {
-    fmt.eprintln("failed to initialise scan arena")
-    return false
-  }
+  flyff_register(session)
   return true
 }
 
-session_scan_allocator :: proc(session: ^Session) -> mem.Allocator {
-  return virtual.arena_allocator(&session.scan_arena)
-}
-
-// Drops the current match set but keeps any snapshot alive.
-session_clear_matches :: proc(session: ^Session) {
-  session.has_matches = false
-  session.matches = {}
-}
-
-// Fully resets the scan working set (matches + snapshot) and reclaims arena memory.
-session_reset_scan :: proc(session: ^Session) {
-  free_all(virtual.arena_allocator(&session.scan_arena))
-  session.has_snapshot = false
-  session.has_matches = false
-  session.snapshot = {}
-  session.matches = {}
-  delete(session.targets)
-  session.targets = nil
-  delete(session.tc_recent)
-  session.tc_recent = nil
-}
-
+// Thin wrapper: engine.session_close stops the watcher, runs the module on_close hook (which frees
+// the flyff remote pages + lifetime-owned data), closes the handle, and frees generic state.
 session_close :: proc(session: ^Session) {
-  // Stop the hotkey watcher before closing the process handle it may be using.
-  if session.hk_running {
-    sync.mutex_lock(&session.exec_mutex)
-    session.hk_stop = true
-    sync.mutex_unlock(&session.exec_mutex)
-    win.WaitForSingleObject(session.hk_thread, 1000)
-    win.CloseHandle(session.hk_thread)
-    session.hk_running = false
-  }
-  if session.attached {
-    remote_free_shim(session)
-    remote_free_spawn_page(session)
-    win.CloseHandle(session.proc_info.handle)
-  }
-  free_all(virtual.arena_allocator(&session.scan_arena))
-  delete(session.targets)
-  delete(session.hotkeys)
-  delete(session.tc_recent)
-  delete(session.auto_blocked)
-  delete(session.world_cal)
-  fence_destroy(&session.fence)
-  auto_free_names(session)
+  engine.session_close(&session.eng)
 }

@@ -1,15 +1,20 @@
 package main
 
+import "engine"
 import "flyff"
 
 main :: proc() {
+  // The concrete storage is a flyff.Session (it embeds engine.Session as its first field). We init
+  // the flyff module - which inits the engine + registers the flyff hooks - then hand the generic
+  // engine session to the REPL. The REPL is Flyff-agnostic; it reaches flyff through the hooks.
   session: flyff.Session
   if !flyff.session_init(&session) {
     return
   }
-  // The hotkey watcher (in package flyff) runs bound commands through this pointer, so flyff
-  // never needs to import the cli/main package.
-  session.exec_line = cli_execute_line
+  // Inject app identity so the generic `version` command can print it without engine depending on
+  // main's generated VERSION / BUILD_HASH constants.
+  session.app_version = VERSION
+  session.app_build_hash = BUILD_HASH
   defer flyff.session_close(&session)
-  run_cli(&session)
+  engine.run_repl(&session.eng)
 }

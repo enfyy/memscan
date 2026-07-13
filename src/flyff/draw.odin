@@ -232,7 +232,7 @@ range_ring_start :: proc(session: ^Session, radius: f32, until: i64) -> bool {
   session.range_ring_until = until
   session.range_ring_last = 0
   session.range_ring_on = true
-  ensure_hotkey_thread(session)
+  engine.ensure_hotkey_thread(&session.eng)
   return true
 }
 

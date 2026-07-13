@@ -102,10 +102,22 @@ setup_groups :: proc(session: ^Session) -> [6]Setup_Group {
   return [6]Setup_Group {
     {core_ok, true, "core (see/select targets)", "be fully in-game, then `setup <name>` (else `calibrate <pos> <name>`)"},
     {L.objid_off != 0 && L.sendsettarget_rva != 0, true, "srvsync (anti-disconnect)", "select a mob and re-run `setup` (or `findsettarget`)"},
-    {prop_gate_ready(session), true, "attackable-monster gate", "target your PET with monsters on screen, re-run `setup`"},
+    {prop_gate_live_ok(session), true, "attackable-monster gate", "target your PET with monsters on screen, re-run `setup`"},
     {L.coll_obj3d_off != 0 && L.coll_type_off != 0, false, "walk-through-prop filter", "stand where props are on screen, re-run `setup`"},
     {terrain_ready(session), false, "terrain reachability", "stand on flat solid ground, re-run `setup` (or `worldscan`)"},
     {L.attack_range > 0, false, "attack range", "`set attack_range <n>` to your reach"},
+  }
+}
+
+// Optional layout pins that `setup` does NOT cover - each just enables an extra feature and is pinned by
+// its own finder (re-pin after a game patch). None is required for `auto`; surfaced under `status` so
+// they're discoverable. Reuses Setup_Group: `label` = the feature, `need` = the finder that pins it.
+optional_pins :: proc(session: ^Session) -> [3]Setup_Group {
+  L := session.layout
+  return [3]Setup_Group {
+    {L.camera_rva != 0, false, "camera / tdbg cull-cone", "findcam"},
+    {intersectobjline_rva_sane(session), false, "mesh-reach / objline / reachcmp", "findobjline"},
+    {L.particlemng_rva != 0 && L.createparticle_rva != 0, false, "in-world markers / mark / ring", "findparticle"},
   }
 }
 

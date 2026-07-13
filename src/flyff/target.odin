@@ -283,6 +283,20 @@ prop_gate_ready :: proc(session: ^Session) -> bool {
   return session.layout.propmover_rva != 0 && session.layout.moverprop_stride != 0
 }
 
+// Live-validated prop gate for the setup / status babysitter (NOT the per-frame hot path): besides the
+// offsets being set, actually resolve the MoverProp array pointer through propmover_rva and confirm it's
+// non-zero. This catches a STALE non-zero propmover_rva carried over from a previous build after a game
+// patch - the cheap prop_gate_ready would wrongly report that as configured, so `status` used to say
+// "SETUP 6/6 COMPLETE" while the detail line said "[BROKEN] array pointer doesn't resolve".
+prop_gate_live_ok :: proc(session: ^Session) -> bool {
+  if !prop_gate_ready(session) || !session.attached {
+    return false
+  }
+  pt := session.ptr_size == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  v, ok := engine.read_value(session.proc_info.handle, session.proc_info.base + session.layout.propmover_rva, pt)
+  return ok && uintptr(engine.value_as_u64(pt, v)) != 0
+}
+
 // Read a mover's species AI class the way the client does: GetProp()->dwAI, i.e.
 // [propbase + m_dwIndex*stride + moverprop_ai_off]. <propbase> is the already-resolved MoverProp
 // array base. Returns 0xFFFFFFFF on any read failure or an out-of-range species id, so the caller

@@ -166,10 +166,49 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
 // status / offsets / set / findpos commands
 // ---------------------------------------------------------------------------
 
-// status / doctor -> health-check of the live setup: what's configured, what's missing, what each
+// status -> compact glance: one line per setup step, [OK] / [MISSING] (+ the command to fix a miss).
+// `status full` (or `offsets`) dumps the raw offsets + live-probe detail. Both read the same shared
+// setup_groups checklist, so the glance and the detail never disagree.
+cli_status :: proc(session: ^Session, args: []string) {
+  if len(args) >= 1 {
+    switch args[0] {
+    case "full", "-v", "verbose", "all", "detail", "offsets":
+      cli_status_full(session)
+      return
+    }
+  }
+  fmt.println("=== memscan status ===")
+  if !session.attached {
+    fmt.println("process : NOT attached   fix: attach <Neuz|pid>")
+    return
+  }
+  pname := session.proc_info.name == "" ? "Neuz" : session.proc_info.name
+  fmt.printfln(
+    "process : %s pid %d (%s)",
+    pname, session.proc_info.pid, session.ptr_size == 4 ? "32-bit" : "64-bit - WRONG, need 32-bit Neuz",
+  )
+  fmt.printfln("%s", setup_status_line(session))
+  for g in setup_groups(session) {
+    if g.ok {
+      fmt.printfln("  [OK]      %s", g.label)
+    } else {
+      fmt.printfln("  [MISSING] %-24s -> %s", g.label, g.need)
+    }
+  }
+  if L := session.layout; L.objid_off != 0 && L.sendsettarget_rva != 0 && !session.srvsync_on {
+    fmt.println("  note: srvsync is OFF right now - `srvsync on` (defaults on at attach)")
+  }
+  fmt.println("optional extras (not part of `setup` - pin only if you want the feature):")
+  for o in optional_pins(session) {
+    fmt.printfln("  %-5s %-32s %s", o.ok ? "[OK]" : "[--]", o.label, o.need)
+  }
+  fmt.println("more detail: `status full`")
+}
+
+// status full / doctor -> health-check of the live setup: what's configured, what's missing, what each
 // thing means, and the command to fix it. Groups the layout by role (core / srvsync / pet exclusion)
 // and does light live probes (attached, 32-bit, world/player resolve). Supersedes the raw dump.
-cli_status :: proc(session: ^Session) {
+cli_status_full :: proc(session: ^Session) {
   L := session.layout
   fmt.println("=== memscan status ===")
 
@@ -377,7 +416,7 @@ cli_offsets :: proc(session: ^Session, args: []string) {
       return
     }
   }
-  cli_status(session)
+  cli_status_full(session)
 }
 
 // set <field> <value> -> set one layout field and auto-save flyff.cfg.

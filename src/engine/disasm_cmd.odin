@@ -1,13 +1,16 @@
-package main
-import "flyff"
-import "engine"
+package engine
 
 import "core:fmt"
 import "core:strings"
 
+// ===========================================================================
+// Disassembly / code-recon CLI commands (generic; any process). The decoder
+// itself lives in engine/disasm.odin; these are the REPL wrappers.
+// ===========================================================================
+
 // func <addr> -> find the enclosing function (scan back to the start after int3 padding) and
 // disassemble the whole thing. Painless way to read a function you landed inside via codescan.
-cli_func :: proc(session: ^flyff.Session, args: []string) {
+cmd_func :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -25,7 +28,7 @@ cli_func :: proc(session: ^flyff.Session, args: []string) {
   base := session.proc_info.base
   PRE :: 0x800
   pre := make([]byte, PRE + 16, context.temp_allocator)
-  engine.read_into(handle, addr - PRE, pre) // pre[j] is the byte at addr-PRE+j; addr is at index PRE
+  read_into(handle, addr - PRE, pre) // pre[j] is the byte at addr-PRE+j; addr is at index PRE
   // Function start = nearest byte <= addr preceded by >=2 int3 (MSVC inter-function padding).
   start := addr
   for j := PRE; j >= 2; j -= 1 {
@@ -36,7 +39,7 @@ cli_func :: proc(session: ^flyff.Session, args: []string) {
   }
   SPAN :: 0x700
   code := make([]byte, SPAN + 16, context.temp_allocator)
-  n, rok := engine.read_into(handle, start, code[:SPAN])
+  n, rok := read_into(handle, start, code[:SPAN])
   if !rok || n == 0 {
     fmt.eprintfln("read failed at 0x%X", start)
     return
@@ -46,7 +49,7 @@ cli_func :: proc(session: ^flyff.Session, args: []string) {
   ip := u32(start)
   passed := false
   for k := 0; k < 500 && off < int(n); k += 1 {
-    length, text := engine.disasm_one(code[off:], ip + u32(off))
+    length, text := disasm_one(code[off:], ip + u32(off))
     if length <= 0 {
       length = 1
     }
@@ -69,7 +72,7 @@ cli_func :: proc(session: ^flyff.Session, args: []string) {
 }
 
 // disasmtest -> decode a hand-built instruction stream with known lengths (offline decoder check).
-cli_disasmtest :: proc() {
+cmd_disasmtest :: proc() {
   // push ebp; mov ebp,esp; mov ecx,0x016688DC; push 2; push 0x11223344; call +5;
   // mov [ecx+0x20],edx; mov eax,[ecx+0x20]; mov eax,[0x016688DC]; mov [ebp-4],0;
   // cmp eax,5; je +5; ret 8; ret; int3   (+ zero padding so the decoder never reads OOB)
@@ -95,7 +98,7 @@ cli_disasmtest :: proc() {
   off := 0
   ip := u32(0x401000)
   for off < real {
-    length, text := engine.disasm_one(buf[off:], ip + u32(off))
+    length, text := disasm_one(buf[off:], ip + u32(off))
     sb := strings.builder_make(context.temp_allocator)
     for b in 0 ..< length {
       fmt.sbprintf(&sb, "%02X ", buf[off + b])
@@ -106,7 +109,7 @@ cli_disasmtest :: proc() {
 }
 
 // disasm <addr> [count]  -> disassemble `count` instructions (default 24) at an absolute address.
-cli_disasm :: proc(session: ^flyff.Session, args: []string) {
+cmd_disasm :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
     return
@@ -122,7 +125,7 @@ cli_disasm :: proc(session: ^flyff.Session, args: []string) {
   }
   count := 24
   if len(args) >= 2 {
-    if v, vok := engine.parse_addr(args[1]); vok {
+    if v, vok := parse_addr(args[1]); vok {
       count = int(v)
     }
   }
@@ -131,7 +134,7 @@ cli_disasm :: proc(session: ^flyff.Session, args: []string) {
   mod_end := base + uintptr(session.proc_info.module_size)
   sz := count * 16 + 16
   buf := make([]byte, sz + 16, context.temp_allocator) // 16-byte zero pad so decode never reads OOB
-  n, rok := engine.read_into(handle, addr, buf[:sz])
+  n, rok := read_into(handle, addr, buf[:sz])
   if !rok || n == 0 {
     fmt.eprintfln("read failed at 0x%X", addr)
     return
@@ -140,7 +143,7 @@ cli_disasm :: proc(session: ^flyff.Session, args: []string) {
   off := 0
   ip := u32(addr)
   for k := 0; k < count && off < int(n); k += 1 {
-    length, text := engine.disasm_one(code[off:], ip + u32(off))
+    length, text := disasm_one(code[off:], ip + u32(off))
     if length <= 0 {
       length = 1
     }
@@ -156,3 +159,70 @@ cli_disasm :: proc(session: ^flyff.Session, args: []string) {
   }
 }
 
+cmd_codescan :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if len(args) < 1 {
+    fmt.eprintln("usage: codescan <u32>   |   codescan call <addr>   |   codescan xref <rva>")
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  hits: [dynamic]uintptr
+  if args[0] == "call" {
+    if len(args) < 2 {
+      fmt.eprintln("usage: codescan call <addr>")
+      return
+    }
+    dest, dok := parse_addr(args[1])
+    if !dok {
+      fmt.eprintfln("invalid address: %s", args[1])
+      return
+    }
+    hits = codescan_calls(handle, dest, context.temp_allocator)
+    fmt.printfln("codescan call 0x%X: %d site(s)", dest, len(hits))
+  } else if args[0] == "xref" {
+    // Find code that references a base-relative global (e.g. the world at world_rva). Resolves
+    // base+rva at runtime so no manual base math even when the module rebases.
+    if len(args) < 2 {
+      fmt.eprintln("usage: codescan xref <rva>   (e.g. codescan xref 0x5888DC for the world global)")
+      return
+    }
+    rva, rok := parse_addr(args[1])
+    if !rok {
+      fmt.eprintfln("invalid rva: %s", args[1])
+      return
+    }
+    target := base + rva
+    hits = codescan_u32(handle, u32(target), context.temp_allocator)
+    fmt.printfln("codescan xref Neuz.exe+0x%X (abs 0x%X): %d hit(s)", rva, target, len(hits))
+  } else {
+    v, vok := parse_addr(args[0])
+    if !vok {
+      fmt.eprintfln("invalid value: %s", args[0])
+      return
+    }
+    hits = codescan_u32(handle, u32(v), context.temp_allocator)
+    fmt.printfln("codescan 0x%X: %d hit(s)", u32(v), len(hits))
+  }
+  shown := 0
+  for h in hits {
+    if shown >= 32 {
+      fmt.printfln("  ... (%d more)", len(hits) - shown)
+      break
+    }
+    wb: [20]byte
+    rn, _ := read_into(handle, h - 4, wb[:])
+    sb := strings.builder_make(context.temp_allocator)
+    for i in 0 ..< int(rn) {
+      if i == 4 {
+        fmt.sbprint(&sb, "| ") // marker: bytes at/after the hit
+      }
+      fmt.sbprintf(&sb, "%02X ", wb[i])
+    }
+    fmt.printfln("  0x%X (Neuz.exe+0x%X)  %s", h, h - base, strings.to_string(sb))
+    shown += 1
+  }
+}

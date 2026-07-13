@@ -366,6 +366,40 @@ read_prop_ai :: proc(session: ^Session, propbase: uintptr, id: u32) -> i64 {
   return -1
 }
 
+// Score a candidate dwAI column in the located MoverProp array. Returns (monster_count, richness, ok).
+// ok = every live species reads a valid AII enum (small: <=14, or the 100 sentinel) AND at least one
+// reads AII_MONSTER(2). richness = how many species read an AII-distinctive value (MONSTER 2 / PET 5 /
+// EGG 9); the real dwAI column is the only one that MIXES monsters with pets/eggs, so richness picks it
+// out from other small-enum fields (dwType, dwGender, dwBelligerence, ...) in the fallback scan. We do
+// NOT key off the focused pet's own AII value (some summon species carry dwAI=AII_NONE(0) in the prop
+// table), and we do NOT test the neighbouring dwHP: this server's prop table leaves dwHP zero-filled,
+// so a "dwHP follows" discriminator wrongly rejected the true column.
+prop_ai_col_score :: proc(session: ^Session, propbase: uintptr, stride: i64, ids: []u32, off: i64) -> (mon: int, richness: int, ok: bool) {
+  handle := session.proc_info.handle
+  two := 0
+  rich := 0
+  for id in ids {
+    v, r := engine.read_value(handle, propbase + uintptr(i64(id) * stride + off), .U32)
+    if !r {
+      return 0, 0, false
+    }
+    vv := u32(engine.value_as_u64(.U32, v))
+    if !(vv <= 14 || vv == 100) {
+      return 0, 0, false
+    }
+    if vv == 2 {
+      two += 1
+    }
+    if vv == 2 || vv == 5 || vv == 9 {
+      rich += 1
+    }
+  }
+  if two < 1 {
+    return 0, 0, false
+  }
+  return two, rich, true
+}
+
 // Human-readable verdict for a species' GetProp()->dwAI under the any-monster gate.
 aii_verdict :: proc(ai: i64) -> string {
   switch ai {
@@ -387,8 +421,9 @@ aii_verdict :: proc(ai: i64) -> string {
 // / moverprop_ai_off. TARGET your PET (target_closest <pet>) with a few monsters on screen, then run it.
 // The client resolves a mob's AI class as GetProp()->dwAI = m_pPropMover[m_dwIndex].dwAI - a flat array
 // indexed by species. Since record[i].dwID == i, this locates the array base + stride from the live
-// species ids on screen, then finds dwAI's column (your pet reads AII_PET=5/EGG=9, monsters read
-// AII_MONSTER=2) and the stable global-pointer RVA. Saves flyff.cfg. Read-only except the cfg write.
+// species ids on screen, then pins dwAI's column by its shape (all-enum across species, >=1 monster,
+// richest 2/5/9 mix) and the stable global-pointer RVA. The pet only needs to be a valid selected mover -
+// its own dwAI may be AII_NONE/PET/EGG, we don't rely on it. Saves flyff.cfg (read-only except the cfg).
 cli_findprop :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
@@ -652,42 +687,27 @@ cli_findprop :: proc(session: ^Session, args: []string) {
     return
   }
 
-  // dwAI column: an ENUM field, so every species record reads a small AII value (0..14 or 100). It's
-  // the all-enum column where the PET reads its own AII type (AII_PET=5 / AII_EGG=9) and at least some
-  // live species read AII_MONSTER(2); pick the one with the most monsters (the gate keeps those). No
-  // fixed monster-fraction threshold - a farm area can have few distinct AII_MONSTER species on screen.
+  // dwAI column. In the client's MoverProp (struct ObjProp -> CtrlProp -> MoverProp) dwAI sits right
+  // after szName[64] + dwType, i.e. a fixed struct offset (0x48 in every build seen so far). We pin it by
+  // SHAPE across the already-dwID-verified live species (see prop_ai_col_score: all-enum, >=1 AII_MONSTER,
+  // richest 2/5/9 mix) - NOT by the focused pet's own AII value, because some summon species (and the
+  // Infopeng NPC) carry dwAI=AII_NONE(0) in the prop table (that broke the old "selection must read 5/9"
+  // anchor: findprop rejected the real column and failed even with a mob/pet correctly targeted). Try the
+  // canonical 0x48 first, then fall back to a full scan (future-proof against a real struct move).
   ai_off := i64(-1)
-  best_two := -1
-  lim := stride < 0x600 ? stride : 0x600
-  for off := i64(0); off + 4 <= lim; off += 4 {
-    pav, paok := engine.read_value(handle, propbase + uintptr(i64(focus_id) * stride + off), .U32)
-    if !paok {
-      continue
-    }
-    pv := u32(engine.value_as_u64(.U32, pav))
-    if pv != 5 && pv != 9 {
-      continue // the pet's species reads AII_PET or AII_EGG at the real dwAI column
-    }
-    all_enum := true
-    two := 0
-    for id in ids {
-      v, ok := engine.read_value(handle, propbase + uintptr(i64(id) * stride + off), .U32)
-      if !ok {
-        all_enum = false
-        break
+  best_two := 0
+  best_rich := -1
+  if m, _, mok := prop_ai_col_score(session, propbase, stride, ids[:], 0x48); mok {
+    ai_off = 0x48
+    best_two = m
+  } else {
+    lim := stride < 0x600 ? stride : 0x600
+    for off := i64(0); off + 4 <= lim; off += 4 {
+      if cm, cr, cok := prop_ai_col_score(session, propbase, stride, ids[:], off); cok && cr > best_rich {
+        best_rich = cr
+        best_two = cm
+        ai_off = off
       }
-      vv := u32(engine.value_as_u64(.U32, v))
-      if !(vv <= 14 || vv == 100) {
-        all_enum = false
-        break
-      }
-      if vv == 2 {
-        two += 1
-      }
-    }
-    if all_enum && two >= 1 && two > best_two {
-      best_two = two
-      ai_off = off
     }
   }
   if ai_off < 0 {
