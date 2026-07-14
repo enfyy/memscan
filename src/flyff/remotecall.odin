@@ -619,6 +619,69 @@ remote_send_snapshot :: proc(session: ^Session) -> bool {
   return true
 }
 
+// SendPlayerMoved's prologue (push ebp; mov ebp,esp) - checked before the call so a stale RVA no-ops.
+sendplayermoved_rva_sane :: proc(session: ^Session) -> bool {
+  want := [?]byte{0x55, 0x8B, 0xEC}
+  return rva_prologue_ok(session, session.layout.sendplayermoved_rva, want[:])
+}
+
+// jump SERVER-SYNC: inject the client's own local-player state sender (SendPlayerMoved-style) so the jump
+// STATE that SendActMsg set locally is broadcast - otherwise other clients don't see the jump. thiscall:
+// ecx=&g_DPlay, 1 arg = the player CMover* (the callee bails unless it == g_pPlayer), callee ret 4; our
+// ret 4 cleans lpParameter. Reuses dplay_page (jump/moveto never overlap). ok=false when disabled/unsafe.
+remote_send_playermoved :: proc(session: ^Session) -> bool {
+  if !sendplayermoved_rva_sane(session) || session.layout.gdplay_rva == 0 {
+    return false
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  player := read_ptr_at(handle, base + session.layout.player_rva, engine.Value_Type.U32)
+  if player == 0 {
+    return false
+  }
+  gd := u32(base + session.layout.gdplay_rva)
+  fn := u32(base + session.layout.sendplayermoved_rva)
+
+  if session.dplay_page == 0 {
+    page := win.VirtualAllocEx(handle, nil, DPLAY_PAGE_LEN, win.MEM_COMMIT | win.MEM_RESERVE, win.PAGE_EXECUTE_READWRITE)
+    if page == nil {
+      fmt.eprintfln("VirtualAllocEx (playermoved) failed (error %d)", win.GetLastError())
+      return false
+    }
+    session.dplay_page = uintptr(page)
+  }
+  page := session.dplay_page
+
+  buf: [DPLAY_PAGE_LEN]byte
+  c := 0
+  buf[c] = 0xB9;put32_le(buf[c + 1:], gd);c += 5 // mov ecx, g_DPlay
+  buf[c] = 0x68;put32_le(buf[c + 1:], u32(player));c += 5 // push player (CMover*)
+  buf[c] = 0xB8;put32_le(buf[c + 1:], fn);c += 5 // mov eax, SendPlayerMoved
+  buf[c] = 0xFF;buf[c + 1] = 0xD0;c += 2 // call eax
+  buf[c] = 0xC2;buf[c + 1] = 0x04;buf[c + 2] = 0x00 // ret 4
+
+  written: uint
+  if win.WriteProcessMemory(handle, rawptr(page), raw_data(buf[:]), DPLAY_PAGE_LEN, &written) == win.FALSE ||
+     written != DPLAY_PAGE_LEN {
+    fmt.eprintfln("WriteProcessMemory (playermoved) failed (error %d)", win.GetLastError())
+    return false
+  }
+  start := transmute(proc "system" (rawptr) -> win.DWORD)rawptr(page)
+  th := win.CreateRemoteThread(handle, nil, 0, start, nil, 0, nil)
+  if th == nil {
+    fmt.eprintfln("CreateRemoteThread (playermoved) failed (error %d)", win.GetLastError())
+    return false
+  }
+  wait := win.WaitForSingleObject(th, 5000)
+  win.CloseHandle(th)
+  if wait != win.WAIT_OBJECT_0 {
+    fmt.eprintln("playermoved thread did not finish in 5s; leaking its page for safety.")
+    session.dplay_page = 0
+    return false
+  }
+  return true
+}
+
 // Free the cached g_DPlay-call page (call while attached, handle valid). Idempotent.
 remote_free_dplay_page :: proc(session: ^Session) {
   if session.dplay_page != 0 && session.attached {

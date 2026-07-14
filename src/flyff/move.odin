@@ -112,7 +112,9 @@ cli_jump :: proc(session: ^Session, args: []string) {
     return
   }
   if ret == 1 {
-    fmt.println("jump.")
+    // Broadcast the jump state so OTHER clients see it (SendActMsg only set it locally).
+    synced := remote_send_playermoved(session)
+    fmt.printfln("jump.%s", synced ? "" : "  (local only - others won't see it; run 'findmove')")
   } else {
     fmt.printfln(
       "jump not performed (SendActMsg returned %d - likely already airborne / casting / attacking / sitting).",
@@ -241,6 +243,14 @@ cli_findmove :: proc(session: ^Session, args: []string) {
   } else {
     fmt.println("  sendsnapshot_rva NOT derived - moveto still works but stays LOCAL-ONLY (others see a teleport).")
   }
+  if pm, pok := derive_sendplayermoved_rva(session); pok {
+    L.sendplayermoved_rva = pm
+    fmt.printfln("  sendplayermoved_rva = 0x%X   (derived: local-player state sender - jump-sync)", pm)
+  } else if L.sendplayermoved_rva != 0 && sendplayermoved_rva_sane(session) {
+    fmt.printfln("  sendplayermoved_rva = 0x%X   (kept)", L.sendplayermoved_rva)
+  } else {
+    fmt.println("  sendplayermoved_rva NOT derived - jump still works but stays LOCAL-ONLY (others don't see it).")
+  }
   fmt.printfln(
     "  server-sync: gdplay_rva=0x%X %s  dplay_destpos_off=0x%X (fForward +0xC, fValid +0x10)",
     L.gdplay_rva, gd_ok ? "[OK resolves]" : "[unresolved - set gdplay_rva]", L.dplay_destpos_off,
@@ -251,21 +261,27 @@ cli_findmove :: proc(session: ^Session, args: []string) {
   }
 }
 
-// Walk back from an address to the enclosing function start (nearest byte preceded by >=2 int3 padding) -
-// the same heuristic `func` uses. Returns addr unchanged if no padding is found in the window.
+// Find the start of the function containing `addr`, assuming it opens with `55 8B EC` (push ebp; mov
+// ebp,esp) - true for the SEH packet senders we derive. Scans back for that prologue sitting at a
+// function boundary: the previous byte is a ret (C3), a ret-imm's high byte (C2 xx 00), or int3 (CC)
+// padding. Robust even when the compiler packs functions with NO int3 padding (the int3-only `func`
+// heuristic over-walks there). Returns 0 if not found.
 func_start :: proc(handle: win.HANDLE, addr: uintptr) -> uintptr {
   PRE :: 0x800
-  pre := make([]byte, PRE + 16, context.temp_allocator)
-  n, ok := engine.read_into(handle, addr - PRE, pre)
+  buf := make([]byte, PRE + 4, context.temp_allocator)
+  n, ok := engine.read_into(handle, addr - PRE, buf)
   if !ok || int(n) < PRE {
-    return addr
+    return 0
   }
-  for j := PRE; j >= 2; j -= 1 {
-    if pre[j - 1] == 0xCC && pre[j - 2] == 0xCC {
-      return addr - PRE + uintptr(j)
+  for j := PRE; j >= 1; j -= 1 {
+    if buf[j] == 0x55 && buf[j + 1] == 0x8B && buf[j + 2] == 0xEC {
+      b := buf[j - 1]
+      if b == 0xCC || b == 0xC3 || b == 0x00 {
+        return addr - PRE + uintptr(j)
+      }
     }
   }
-  return addr
+  return 0
 }
 
 // Auto-derive sendsnapshot_rva: codescan the destpos.vPos ABSOLUTE address; the instruction that READS it
@@ -293,6 +309,55 @@ derive_sendsnapshot_rva :: proc(session: ^Session) -> (rva: uintptr, ok: bool) {
       if start > base && rva_prologue_ok(session, start - base, sig[:]) {
         return start - base, true
       }
+    }
+  }
+  return 0, false
+}
+
+// Callee stack-cleanup of the function at `start`: the imm of its terminating `ret N` (0 for `ret`/C3),
+// or -1 if not found. Finds a ret immediately followed by int3 padding (a real function-exit ret). Used
+// to confirm a derived call target matches the shim's calling convention before we ever call it.
+func_ret_n :: proc(handle: win.HANDLE, start: uintptr) -> int {
+  code: [0x400]byte
+  n, ok := engine.read_into(handle, start, code[:])
+  if !ok {
+    return -1
+  }
+  lim := int(n)
+  for i := 0; i + 1 < lim; i += 1 {
+    if code[i] == 0xC3 && code[i + 1] == 0xCC {
+      return 0 // ret; int3
+    }
+    if code[i] == 0xC2 && i + 4 <= lim && code[i + 3] == 0xCC {
+      return int(code[i + 1]) | int(code[i + 2]) << 8 // ret N; int3
+    }
+  }
+  return -1
+}
+
+// Auto-derive sendplayermoved_rva: the local-player state sender (jump-sync) bails unless its mover ==
+// g_pPlayer, i.e. `cmp esi, [g_pPlayer]` (3B 35 <g_pPlayer abs>) early in a SEH packet-builder. codescan
+// g_pPlayer (= base+player_rva), find that compare, walk back to the function start, and require the
+// prologue + a `ret 4` (1-arg, matching remote_send_playermoved's shim - so we never call a void/other
+// sender with a mismatched stack). Read-only.
+derive_sendplayermoved_rva :: proc(session: ^Session) -> (rva: uintptr, ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  if session.layout.player_rva == 0 {
+    return 0, false
+  }
+  gp_abs := u32(base + session.layout.player_rva)
+  hits := engine.codescan_u32(handle, gp_abs, context.temp_allocator)
+  sig := [?]byte{0x55, 0x8B, 0xEC}
+  for h in hits {
+    pre: [2]byte // `cmp esi, [disp32]` = 3B 35 <disp32>
+    n, rok := engine.read_into(handle, h - 2, pre[:])
+    if !rok || int(n) < 2 || pre[0] != 0x3B || pre[1] != 0x35 {
+      continue
+    }
+    start := func_start(handle, h - 2)
+    if start > base && rva_prologue_ok(session, start - base, sig[:]) && func_ret_n(handle, start) == 4 {
+      return start - base, true
     }
   }
   return 0, false

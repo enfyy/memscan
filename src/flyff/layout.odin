@@ -102,6 +102,8 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.dplay_destpos_off = i64(v)
   case "sendsnapshot_rva":
     layout.sendsnapshot_rva = uintptr(v)
+  case "sendplayermoved_rva":
+    layout.sendplayermoved_rva = uintptr(v)
   case:
     return false
   }
@@ -149,6 +151,7 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "forward_off=0x%X", layout.forward_off)
   fmt.sbprintfln(&b, "dplay_destpos_off=0x%X", layout.dplay_destpos_off)
   fmt.sbprintfln(&b, "sendsnapshot_rva=0x%X", layout.sendsnapshot_rva)
+  fmt.sbprintfln(&b, "sendplayermoved_rva=0x%X", layout.sendplayermoved_rva)
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
   return err == nil
 }
@@ -306,15 +309,18 @@ cli_status_full :: proc(session: ^Session) {
   } else {
     fmt.println("  [OFF] jump inert - sendactmsg_rva/actmover_off/jump_msg not all set. fix: 'findmove' in-game.")
   }
-  sync_ok := L.gdplay_rva != 0 && L.dplay_destpos_off != 0 && sendsnapshot_rva_sane(session)
+  move_sync_ok := L.gdplay_rva != 0 && L.dplay_destpos_off != 0 && sendsnapshot_rva_sane(session)
+  jump_sync_ok := L.gdplay_rva != 0 && sendplayermoved_rva_sane(session)
   fmt.printfln(
-    "  move server-sync: gdplay_rva=0x%X dplay_destpos_off=0x%X sendsnapshot_rva=0x%X",
-    L.gdplay_rva, L.dplay_destpos_off, L.sendsnapshot_rva,
+    "  server-sync: gdplay_rva=0x%X  sendsnapshot_rva=0x%X (move)  sendplayermoved_rva=0x%X (jump)",
+    L.gdplay_rva, L.sendsnapshot_rva, L.sendplayermoved_rva,
   )
-  if sync_ok {
-    fmt.println("  [OK] moveto broadcasts to the server - OTHER clients see a walk (not a teleport).")
-  } else {
-    fmt.println("  [OFF] moveto is LOCAL-ONLY - other clients see a teleport. fix: 'findmove' in-game.")
+  fmt.printfln(
+    "  %s moveto broadcasts (other clients see a walk)   |   %s jump broadcasts (other clients see it)",
+    move_sync_ok ? "[OK] " : "[OFF]", jump_sync_ok ? "[OK] " : "[OFF]",
+  )
+  if !move_sync_ok || !jump_sync_ok {
+    fmt.println("       [OFF] = LOCAL-ONLY (others see a teleport / miss the jump). fix: 'findmove' in-game.")
   }
 
   // --- Species prop-table gate for no-name auto ---

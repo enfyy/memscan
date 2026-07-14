@@ -126,6 +126,13 @@ FLYFF_FORWARD_OFF :: 0x39C
 FLYFF_DPLAY_DESTPOS_OFF :: 0x2C
 FLYFF_SENDSNAPSHOT_RVA :: 0x0
 
+// jump SERVER-SYNC. SendActMsg(OBJMSG_JUMP) only sets the jump STATE locally; other clients don't see it
+// until the client sends its state. The periodic sync driver does this via the local-player state sender
+// (a SendPlayerMoved-style fn: thiscall ecx=&g_DPlay, 1 arg = the player CMover*, bails unless arg ==
+// g_pPlayer, sends pos/velocity/GetState/motion, ret 4). jump injects it right after SendActMsg so the
+// jump state broadcasts. Code RVA (re-patches per launch); prologue-guarded. 0 => jump stays local-only.
+FLYFF_SENDPLAYERMOVED_RVA :: 0x0
+
 // Camera-INDEPENDENT obstacle source (see terrain.odin collect_area_colliders). Each CLandscape tile
 // keeps a flat array of every object on it, unlike m_aobjCull which only holds what the render frustum
 // draws (measured: the cull list hides ~47% of nearby colliders). Layout (landscape.h, __MOD_OBJARR):
@@ -206,6 +213,7 @@ Flyff_Layout :: struct {
   forward_off:       i64,
   dplay_destpos_off: i64,
   sendsnapshot_rva:  uintptr,
+  sendplayermoved_rva: uintptr,
 }
 
 flyff_layout_default :: proc() -> Flyff_Layout {
@@ -247,5 +255,6 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     forward_off       = FLYFF_FORWARD_OFF,
     dplay_destpos_off = FLYFF_DPLAY_DESTPOS_OFF,
     sendsnapshot_rva  = FLYFF_SENDSNAPSHOT_RVA,
+    sendplayermoved_rva = FLYFF_SENDPLAYERMOVED_RVA,
   }
 }
