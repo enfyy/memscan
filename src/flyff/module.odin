@@ -144,6 +144,14 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_radar(s, args)
   case "fence":
     cli_fence(s, args)
+  case "moveto", "walkto", "go":
+    cli_moveto(s, args)
+  case "jump":
+    cli_jump(s, args)
+  case "position", "pos", "/position":
+    cli_position(s, args)
+  case "findmove":
+    cli_findmove(s, args)
   case:
     return false
   }
@@ -208,6 +216,8 @@ on_detach :: proc(es: ^engine.Session) {
   remote_free_shim(s)
   remote_free_spawn_page(s)
   remote_free_objline_page(s)
+  remote_free_actmsg_page(s)
+  remote_free_dplay_page(s)
   s.collider_cache_valid = false // stale across processes
 }
 
@@ -218,6 +228,8 @@ on_close :: proc(es: ^engine.Session) {
     remote_free_shim(s)
     remote_free_spawn_page(s)
     remote_free_objline_page(s)
+    remote_free_actmsg_page(s)
+    remote_free_dplay_page(s)
   }
   fence_destroy(&s.fence)
   auto_free_names(s)
@@ -269,6 +281,14 @@ farming (day to day)
   srvsync [on|off]           mirror each select to the server (stops the after-N-kills DC);
                              ON by default on attach
   srvtest                    fire one server SendSetTarget at the current target
+
+character control (no keypress simulation; run 'findmove' once to pin it)
+  moveto <x,z> | <x,y,z>     walk to a world point - writes CMover's dest fields, so the client walks
+                             there itself (like a ground click). Y defaults to your height. aliases: walkto, go
+  jump                       jump (sends the client's own OBJMSG_JUMP; all in-game jump guards apply)
+  position (pos)             print your world position (copy-paste x,y,z for calibrate / moveto / findpos)
+  findmove                   pin the move/jump config (dest-field offsets + sendactmsg_rva via the
+                             actmover vtable + actmover_off + jump_msg); re-run after a game patch. saves flyff.cfg
 
 setup & health (run once after a game patch)
   setup <name> [hp]          ONE-STEP setup: stand in a field on the ground, target your PET with

@@ -23,7 +23,7 @@ FLYFF_ANGLE_OFF :: 0x18 // CObj.m_fAngle (Y-yaw, DEGREES). Obj.cpp: RotationY(-m
 // (codescan for the code addresses, idscan for the offset). 0 means "not yet found": while
 // any is 0, `srvsync`/`srvtest` refuse to run and notify_server_target is a no-op.
 FLYFF_SENDSETTARGET_RVA :: 0x0 // entry of CDPClient::SendSetTarget (thiscall(OBJID, BYTE))
-FLYFF_GDPLAY_RVA :: 0x0 // &g_DPlay (global CDPClient) - the thiscall `this`
+FLYFF_GDPLAY_RVA :: 0x58CCC0 // &g_DPlay (global CDPClient object). Used for moveto server-sync (below).
 FLYFF_OBJID_OFF :: 0x0 // CObj.m_objid (GetId) - value sent as idTarget
 
 // In-world debug markers (see draw.odin / remote_spawn_particles). We call the client's own
@@ -77,6 +77,54 @@ FLYFF_COLL_TYPE_OFF :: 0x104
 // prologue bytes before every call. Re-find after a patch (string "CWorld::IntersectObjLine" ->
 // codescan -> func prologue). 0 => disabled.
 FLYFF_INTERSECTOBJLINE_RVA :: 0x44AA10
+
+// Character control - `moveto` (field-write) + `jump` (client-call). See move.odin / remotecall.odin.
+//
+// moveto is CLIENT-AUTHORITATIVE and needs NO code call: a ground click just sets CMover's dest fields
+// and the client's own ProcessMove walks there each tick, re-reporting position continuously (so no
+// anti-DC concern). CMover::SetDestPos is INLINED into its callers in this build (no standalone function
+// to call), so moveto writes the same fields directly via WriteProcessMemory. These are DATA offsets and
+// stayed stable across the fork's code re-patches (unlike RVAs). Found/validated by `findmove`.
+//   destpos_off - m_vDestPos (3x f32). Non-zero (IsEmptyDestPos false) is what makes ProcessMove walk.
+//   iddest_off  - m_idDest (OBJID). Set to NULL_ID (0xFFFFFFFF) so it's dest-POS mode, not dest-object.
+//   forward_off - m_bForward (byte, =1 to walk toward the dest). m_bPositiveX = +1, m_bPositiveZ = +2
+//                 (consecutive bytes): the arrival-sign bits ProcessMove compares against each tick -
+//                 must equal (m_vPos.x - dest.x)>0 / (m_vPos.z - dest.z)>0 at write time or it insta-arrives.
+//
+// jump DOES call the client: CActionMover::SendActMsg(jump_msg, 0,0,0,0,0) from an injected thread, so
+// every in-client guard (grounded / not casting/attacking/sitting) applies. SendActMsg is VIRTUAL
+// (vtable[1] on m_pActMover), thiscall(ecx=m_pActMover), takes SIX stack args -> ret 0x18. findmove
+// auto-derives its RVA from the vtable (robust across code re-patches) and verifies the prologue before
+// each call (a stale RVA would jump into wrong code = client crash). 0 => jump stays inert.
+//   sendactmsg_rva - RVA of CActionMover::SendActMsg (derived from actmover vtable[1]).
+//   actmover_off   - CMover.m_pActMover offset (the CActionMover* jump needs as `this`; CAction::m_pObj,
+//                    the backref to the owning CMover, sits at +0xC inside it - how findmove pins it).
+//   jump_msg       - OBJMSG_JUMP enum value. The base source has 0x11, but THIS fork shifted the enum
+//                    +1 (0x11 plays a stun) so it's 0x12 here. findmove auto-derives it from the
+//                    SendActMsg switch (the case that writes OBJSTA_SJUMP1) so an enum renumber is handled.
+FLYFF_SENDACTMSG_RVA :: 0x0
+FLYFF_ACTMOVER_OFF :: 0x0
+FLYFF_JUMP_MSG :: u32(0x12)
+FLYFF_DESTPOS_OFF :: 0x38C
+FLYFF_IDDEST_OFF :: 0x388
+FLYFF_FORWARD_OFF :: 0x39C
+
+// moveto SERVER-SYNC. The field-write above only makes OUR client walk; other clients see a teleport
+// unless the client tells the SERVER its destination. The click-path does that via
+// g_DPlay.PutPlayerDestPos + SendSnapshot, which just set m_ss.playerdestpos {fValid, vPos, fForward} and
+// let the client's per-frame SendSnapshot broadcast SNAPSHOTTYPE_DESTPOS. So we write that struct directly
+// (in g_DPlay = base+gdplay_rva) and rely on the client's own periodic snapshot - no injected call.
+//   dplay_destpos_off - offset of m_ss.playerdestpos.vPos inside g_DPlay (found by findpos after a real
+//                       click-to-move). fForward (byte) sits at +0xC, fValid (BOOL) at +0x10 (verified
+//                       against the inlined PutPlayerDestPos). 0 => sync off.
+//   sendsnapshot_rva  - CDPClient::SendSnapshot(BOOL fUnconditional); thiscall(ecx=&g_DPlay), 1 arg,
+//                       ret 4. Writing playerdestpos.fValid alone does NOT broadcast (the client's own
+//                       periodic snapshot won't flush an externally-set flag), so moveto injects
+//                       SendSnapshot(TRUE) to flush it immediately - exactly what a ground click does.
+//                       Code RVA (re-patches per launch); derived by findmove (codescan the destpos.vPos
+//                       absolute -> the reader that builds the packet). 0 => sync off.
+FLYFF_DPLAY_DESTPOS_OFF :: 0x2C
+FLYFF_SENDSNAPSHOT_RVA :: 0x0
 
 // Camera-INDEPENDENT obstacle source (see terrain.odin collect_area_colliders). Each CLandscape tile
 // keeps a flat array of every object on it, unlike m_aobjCull which only holds what the render frustum
@@ -150,6 +198,14 @@ Flyff_Layout :: struct {
   coll_type_off:     i64,
   intersectobjline_rva: uintptr,
   landobj_off:       i64,
+  sendactmsg_rva:    uintptr,
+  actmover_off:      i64,
+  jump_msg:          u32,
+  destpos_off:       i64,
+  iddest_off:        i64,
+  forward_off:       i64,
+  dplay_destpos_off: i64,
+  sendsnapshot_rva:  uintptr,
 }
 
 flyff_layout_default :: proc() -> Flyff_Layout {
@@ -183,5 +239,13 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     coll_type_off     = FLYFF_COLL_TYPE_OFF,
     intersectobjline_rva = FLYFF_INTERSECTOBJLINE_RVA,
     landobj_off       = FLYFF_LANDOBJ_OFF,
+    sendactmsg_rva    = FLYFF_SENDACTMSG_RVA,
+    actmover_off      = FLYFF_ACTMOVER_OFF,
+    jump_msg          = FLYFF_JUMP_MSG,
+    destpos_off       = FLYFF_DESTPOS_OFF,
+    iddest_off        = FLYFF_IDDEST_OFF,
+    forward_off       = FLYFF_FORWARD_OFF,
+    dplay_destpos_off = FLYFF_DPLAY_DESTPOS_OFF,
+    sendsnapshot_rva  = FLYFF_SENDSNAPSHOT_RVA,
   }
 }

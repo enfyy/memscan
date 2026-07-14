@@ -427,3 +427,202 @@ notify_server_target :: proc(session: ^Session, obj: uintptr) -> bool {
   }
   return remote_send_settarget(session, objid)
 }
+
+// --- Character control: jump via an injected SendActMsg call -------------------------------------
+// jump calls a client thiscall member from a CreateRemoteThread'd 32-bit thread, the same mechanism as
+// the settarget/objline injections. (moveto is a pure field-write - no injection - since SetDestPos is
+// inlined in this build; see move.odin.) See flyff.odin for the RVA/offset config.
+
+ACTMSG_RES_OFF :: 0x00 // u32 result: SendActMsg's int return (1 = message accepted; else a guard code)
+ACTMSG_CODE_OFF :: 0x08 // shim code start
+ACTMSG_PAGE_LEN :: 0x40
+
+// Guard for an injected client call: RVA set, client 32-bit, and the bytes at base+rva match an expected
+// function prologue - so a patch-shifted (stale) RVA refuses instead of jumping into wrong code and
+// crashing the client. Same idea as intersectobjline_rva_sane.
+rva_prologue_ok :: proc(session: ^Session, rva: uintptr, want: []byte) -> bool {
+  if rva == 0 || session.ptr_size != 4 || len(want) == 0 {
+    return false
+  }
+  buf: [16]byte
+  if len(want) > len(buf) {
+    return false
+  }
+  n, ok := engine.read_into(session.proc_info.handle, session.proc_info.base + rva, buf[:len(want)])
+  if !ok || int(n) < len(want) {
+    return false
+  }
+  for b, i in want {
+    if buf[i] != b {
+      return false
+    }
+  }
+  return true
+}
+
+// CActionMover::SendActMsg opens with a distinctive 7-byte signature: `push ebp; mov ebp,esp;
+// test byte [ecx+8],8` (55 8B EC F6 41 08 08). Checking it (not just the generic 55 8B EC) both guards a
+// stale RVA and confirms findmove picked the right vtable slot. Adjust these bytes if a patch recompiles it.
+SENDACTMSG_SIG := [?]byte{0x55, 0x8B, 0xEC, 0xF6, 0x41, 0x08, 0x08}
+
+sendactmsg_rva_sane :: proc(session: ^Session) -> bool {
+  return rva_prologue_ok(session, session.layout.sendactmsg_rva, SENDACTMSG_SIG[:])
+}
+
+// Send an act-message to the player by calling the client's own
+// CActionMover::SendActMsg(dwMsg, 0,0,0,0) from an injected thread, with ecx = CMover.m_pActMover (the
+// real callable body - CMover::SendActMsg is an inline forwarder). Used for jump (dwMsg = jump_msg); the
+// in-client guards (grounded / not casting/attacking/sitting / not NOMOVE) run as normal and the handler's
+// int return is captured (1 = accepted, else the code for the guard that blocked it). ok=false when
+// disabled/unsafe, the player/actmover is unresolved, or the thread didn't finish. Serialise via exec_mutex.
+remote_send_actmsg :: proc(session: ^Session, msg: u32) -> (ret: i32, ok: bool) {
+  if !sendactmsg_rva_sane(session) {
+    return
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  player := read_ptr_at(handle, base + session.layout.player_rva, engine.Value_Type.U32)
+  if player == 0 {
+    return
+  }
+  actmover := read_ptr_at(handle, player + uintptr(session.layout.actmover_off), engine.Value_Type.U32)
+  if actmover == 0 {
+    return
+  }
+  fn := u32(base + session.layout.sendactmsg_rva)
+
+  if session.actmsg_page == 0 {
+    page := win.VirtualAllocEx(handle, nil, ACTMSG_PAGE_LEN, win.MEM_COMMIT | win.MEM_RESERVE, win.PAGE_EXECUTE_READWRITE)
+    if page == nil {
+      fmt.eprintfln("VirtualAllocEx (actmsg) failed (error %d)", win.GetLastError())
+      return
+    }
+    session.actmsg_page = uintptr(page)
+  }
+  page := session.actmsg_page
+  P := u32(page)
+
+  buf: [ACTMSG_PAGE_LEN]byte
+  // ACTMSG_RES_OFF stays 0 (buf is zero-initialised) until the shim stores eax.
+  // thiscall: ecx = m_pActMover (CActionMover*); CActionMover::SendActMsg takes SIX stack args
+  // (dwMsg + nParam1..nParam5) and cleans them itself (ret 0x18); then our `ret 4` cleans the injected
+  // thread's lpParameter. Args pushed right-to-left, so dwMsg is pushed last.
+  c := ACTMSG_CODE_OFF
+  buf[c] = 0xB9;put32_le(buf[c + 1:], u32(actmover));c += 5 // mov ecx, m_pActMover
+  buf[c] = 0x6A;buf[c + 1] = 0x00;c += 2 // push 0  (nParam5)
+  buf[c] = 0x6A;buf[c + 1] = 0x00;c += 2 // push 0  (nParam4)
+  buf[c] = 0x6A;buf[c + 1] = 0x00;c += 2 // push 0  (nParam3)
+  buf[c] = 0x6A;buf[c + 1] = 0x00;c += 2 // push 0  (nParam2)
+  buf[c] = 0x6A;buf[c + 1] = 0x00;c += 2 // push 0  (nParam1)
+  buf[c] = 0x68;put32_le(buf[c + 1:], msg);c += 5 // push dwMsg
+  buf[c] = 0xB8;put32_le(buf[c + 1:], fn);c += 5 // mov eax, SendActMsg
+  buf[c] = 0xFF;buf[c + 1] = 0xD0;c += 2 // call eax
+  buf[c] = 0xA3;put32_le(buf[c + 1:], P + ACTMSG_RES_OFF);c += 5 // mov [result], eax
+  buf[c] = 0xC2;buf[c + 1] = 0x04;buf[c + 2] = 0x00 // ret 4
+
+  written: uint
+  if win.WriteProcessMemory(handle, rawptr(page), raw_data(buf[:]), ACTMSG_PAGE_LEN, &written) == win.FALSE ||
+     written != ACTMSG_PAGE_LEN {
+    fmt.eprintfln("WriteProcessMemory (actmsg) failed (error %d)", win.GetLastError())
+    return
+  }
+  start := transmute(proc "system" (rawptr) -> win.DWORD)rawptr(page + uintptr(ACTMSG_CODE_OFF))
+  th := win.CreateRemoteThread(handle, nil, 0, start, nil, 0, nil)
+  if th == nil {
+    fmt.eprintfln("CreateRemoteThread (actmsg) failed (error %d)", win.GetLastError())
+    return
+  }
+  wait := win.WaitForSingleObject(th, 5000)
+  win.CloseHandle(th)
+  if wait != win.WAIT_OBJECT_0 {
+    fmt.eprintln("actmsg thread did not finish in 5s; leaking its page for safety.")
+    session.actmsg_page = 0
+    return
+  }
+  rv, rok := engine.read_value(handle, page + uintptr(ACTMSG_RES_OFF), .U32)
+  if !rok {
+    return
+  }
+  ret = i32(u32(engine.value_as_u64(.U32, rv)))
+  ok = true
+  return
+}
+
+// Free the cached actmsg page (call while attached, handle valid). Idempotent.
+remote_free_actmsg_page :: proc(session: ^Session) {
+  if session.actmsg_page != 0 && session.attached {
+    win.VirtualFreeEx(session.proc_info.handle, rawptr(session.actmsg_page), 0, win.MEM_RELEASE)
+  }
+  session.actmsg_page = 0
+}
+
+// --- moveto server-sync: flush the destpos to the server via g_DPlay.SendSnapshot(TRUE) --------------
+DPLAY_PAGE_LEN :: 0x40
+
+// SendSnapshot's prologue (push ebp; mov ebp,esp) - checked before the call so a stale RVA no-ops.
+sendsnapshot_rva_sane :: proc(session: ^Session) -> bool {
+  want := [?]byte{0x55, 0x8B, 0xEC}
+  return rva_prologue_ok(session, session.layout.sendsnapshot_rva, want[:])
+}
+
+// Inject g_DPlay.SendSnapshot(TRUE) so the destpos moveto wrote into m_ss.playerdestpos is broadcast to
+// the server as SNAPSHOTTYPE_DESTPOS - the immediate flush a ground click does (the client's own periodic
+// snapshot won't push an externally-set fValid). thiscall: ecx=&g_DPlay (the body folds g_DPlay absolute,
+// so ecx is belt-and-suspenders), 1 arg (fUnconditional=TRUE), callee ret 4; our ret 4 cleans lpParameter.
+// ok=false when disabled/unsafe or the thread didn't finish. Serialise via exec_mutex.
+remote_send_snapshot :: proc(session: ^Session) -> bool {
+  if !sendsnapshot_rva_sane(session) || session.layout.gdplay_rva == 0 {
+    return false
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  gd := u32(base + session.layout.gdplay_rva)
+  fn := u32(base + session.layout.sendsnapshot_rva)
+
+  if session.dplay_page == 0 {
+    page := win.VirtualAllocEx(handle, nil, DPLAY_PAGE_LEN, win.MEM_COMMIT | win.MEM_RESERVE, win.PAGE_EXECUTE_READWRITE)
+    if page == nil {
+      fmt.eprintfln("VirtualAllocEx (snapshot) failed (error %d)", win.GetLastError())
+      return false
+    }
+    session.dplay_page = uintptr(page)
+  }
+  page := session.dplay_page
+
+  buf: [DPLAY_PAGE_LEN]byte
+  c := 0
+  buf[c] = 0xB9;put32_le(buf[c + 1:], gd);c += 5 // mov ecx, g_DPlay
+  buf[c] = 0x6A;buf[c + 1] = 0x01;c += 2 // push 1  (fUnconditional = TRUE)
+  buf[c] = 0xB8;put32_le(buf[c + 1:], fn);c += 5 // mov eax, SendSnapshot
+  buf[c] = 0xFF;buf[c + 1] = 0xD0;c += 2 // call eax
+  buf[c] = 0xC2;buf[c + 1] = 0x04;buf[c + 2] = 0x00 // ret 4
+
+  written: uint
+  if win.WriteProcessMemory(handle, rawptr(page), raw_data(buf[:]), DPLAY_PAGE_LEN, &written) == win.FALSE ||
+     written != DPLAY_PAGE_LEN {
+    fmt.eprintfln("WriteProcessMemory (snapshot) failed (error %d)", win.GetLastError())
+    return false
+  }
+  start := transmute(proc "system" (rawptr) -> win.DWORD)rawptr(page)
+  th := win.CreateRemoteThread(handle, nil, 0, start, nil, 0, nil)
+  if th == nil {
+    fmt.eprintfln("CreateRemoteThread (snapshot) failed (error %d)", win.GetLastError())
+    return false
+  }
+  wait := win.WaitForSingleObject(th, 5000)
+  win.CloseHandle(th)
+  if wait != win.WAIT_OBJECT_0 {
+    fmt.eprintln("snapshot thread did not finish in 5s; leaking its page for safety.")
+    session.dplay_page = 0
+    return false
+  }
+  return true
+}
+
+// Free the cached g_DPlay-call page (call while attached, handle valid). Idempotent.
+remote_free_dplay_page :: proc(session: ^Session) {
+  if session.dplay_page != 0 && session.attached {
+    win.VirtualFreeEx(session.proc_info.handle, rawptr(session.dplay_page), 0, win.MEM_RELEASE)
+  }
+  session.dplay_page = 0
+}

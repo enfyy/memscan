@@ -86,6 +86,22 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.intersectobjline_rva = uintptr(v)
   case "landobj_off":
     layout.landobj_off = i64(v)
+  case "sendactmsg_rva":
+    layout.sendactmsg_rva = uintptr(v)
+  case "actmover_off":
+    layout.actmover_off = i64(v)
+  case "jump_msg":
+    layout.jump_msg = u32(v)
+  case "destpos_off":
+    layout.destpos_off = i64(v)
+  case "iddest_off":
+    layout.iddest_off = i64(v)
+  case "forward_off":
+    layout.forward_off = i64(v)
+  case "dplay_destpos_off":
+    layout.dplay_destpos_off = i64(v)
+  case "sendsnapshot_rva":
+    layout.sendsnapshot_rva = uintptr(v)
   case:
     return false
   }
@@ -125,6 +141,14 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "coll_type_off=0x%X", layout.coll_type_off)
   fmt.sbprintfln(&b, "intersectobjline_rva=0x%X", layout.intersectobjline_rva)
   fmt.sbprintfln(&b, "landobj_off=0x%X", layout.landobj_off)
+  fmt.sbprintfln(&b, "sendactmsg_rva=0x%X", layout.sendactmsg_rva)
+  fmt.sbprintfln(&b, "actmover_off=0x%X", layout.actmover_off)
+  fmt.sbprintfln(&b, "jump_msg=0x%X", layout.jump_msg)
+  fmt.sbprintfln(&b, "destpos_off=0x%X", layout.destpos_off)
+  fmt.sbprintfln(&b, "iddest_off=0x%X", layout.iddest_off)
+  fmt.sbprintfln(&b, "forward_off=0x%X", layout.forward_off)
+  fmt.sbprintfln(&b, "dplay_destpos_off=0x%X", layout.dplay_destpos_off)
+  fmt.sbprintfln(&b, "sendsnapshot_rva=0x%X", layout.sendsnapshot_rva)
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
   return err == nil
 }
@@ -261,6 +285,36 @@ cli_status_full :: proc(session: ^Session) {
   } else {
     fmt.println("  [MISSING] srvsync is INERT -> you WILL disconnect after farming a while.")
     fmt.println("    fix: findsettarget    (or just re-run 'calibrate' - it derives these too)")
+  }
+
+  // --- Character control (moveto / jump) ---
+  move_ok := L.destpos_off != 0 && L.iddest_off != 0 && L.forward_off != 0
+  jump_ok := sendactmsg_rva_sane(session) && L.actmover_off != 0 && L.jump_msg != 0
+  fmt.println("")
+  fmt.println("CHARACTER CONTROL (from 'findmove') - 'moveto' (field-write) / 'jump' (client call) - OPTIONAL:")
+  fmt.printfln(
+    "  moveto:  destpos_off=0x%X iddest_off=0x%X forward_off=0x%X   jump: sendactmsg_rva=0x%X actmover_off=0x%X jump_msg=0x%X",
+    L.destpos_off, L.iddest_off, L.forward_off, L.sendactmsg_rva, L.actmover_off, L.jump_msg,
+  )
+  if move_ok {
+    fmt.println("  [OK] moveto ready (writes CMover dest fields; client walks there).")
+  } else {
+    fmt.println("  [OFF] moveto inert - dest-field offsets unset. fix: 'findmove' in-game.")
+  }
+  if jump_ok {
+    fmt.println("  [OK] jump ready (SendActMsg signature verified; actmover_off + jump_msg set).")
+  } else {
+    fmt.println("  [OFF] jump inert - sendactmsg_rva/actmover_off/jump_msg not all set. fix: 'findmove' in-game.")
+  }
+  sync_ok := L.gdplay_rva != 0 && L.dplay_destpos_off != 0 && sendsnapshot_rva_sane(session)
+  fmt.printfln(
+    "  move server-sync: gdplay_rva=0x%X dplay_destpos_off=0x%X sendsnapshot_rva=0x%X",
+    L.gdplay_rva, L.dplay_destpos_off, L.sendsnapshot_rva,
+  )
+  if sync_ok {
+    fmt.println("  [OK] moveto broadcasts to the server - OTHER clients see a walk (not a teleport).")
+  } else {
+    fmt.println("  [OFF] moveto is LOCAL-ONLY - other clients see a teleport. fix: 'findmove' in-game.")
   }
 
   // --- Species prop-table gate for no-name auto ---

@@ -99,6 +99,14 @@ Session :: struct {
   // fixed-size (input vecs + result slot + shim), so it's allocated once and reused per query. 0 = none.
   objline_page: uintptr,
 
+  // Cached RWX page for the jump remote call (remote_send_actmsg). Fixed small layout (result slot +
+  // shim), allocated once and reused. Freed with the other remote pages on detach/close. 0 = none.
+  actmsg_page: uintptr,
+
+  // Cached RWX page for g_DPlay method calls (remote_send_snapshot - moveto's server-sync flush). moveto
+  // field-writes the destpos then injects SendSnapshot(TRUE) so other clients see a walk. 0 = none.
+  dplay_page: uintptr,
+
   // Camera-independent nearby-collider cache (see collect_area_colliders). Built by walking the player's
   // tile + neighbours' flat CLandscape object arrays (m_apObject), so reach sees off-camera obstacles the
   // render cull list misses. Static props don't move, so it's refreshed only when the player leaves the
