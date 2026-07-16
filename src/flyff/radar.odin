@@ -4,7 +4,9 @@ import "core:fmt"
 import "core:math"
 import "core:slice"
 import "core:strconv"
+import "core:strings"
 import "core:sync"
+import "core:time"
 import rl "vendor:raylib"
 
 import "../engine"
@@ -44,6 +46,27 @@ OTHER_COL :: rl.Color{130, 140, 150, 220} // pet / egg / NPC (neutral grey)
 UNCLASS_COL :: rl.Color{231, 76, 60, 255} // any mover, when the AI gate isn't configured (falls back to red)
 SEL_COL :: rl.Color{241, 196, 15, 255} // selected-target highlight ring (yellow)
 RANGE_COL :: rl.Color{46, 204, 113, 130} // attack_range ring around the player (soft green)
+
+// --- Phase 4 radar interaction (click-to-target / shift-click-to-move) + juice (penya pop, move mark) ---
+HIT_R :: f32(12) // screen-px radius: a left-click within this of a mob dot targets it
+POP_TTL :: i64(1_200_000_000) // "+penya" pop lifetime (~1.2s): rises + fades over this
+MARK_TTL :: i64(900_000_000) // move-destination marker lifetime (~0.9s)
+PENYA_COL :: rl.Color{255, 208, 64, 255} // "+penya" pop text (gold)
+HOVER_COL :: rl.Color{255, 255, 255, 180} // ring on the mob a plain click would target (white)
+MARK_COL :: rl.Color{90, 200, 225, 255} // shift-click move-destination pip (cyan)
+
+// A floating "+N penya" popup at a world point (drawn on the radar, rises + fades). Appended when the
+// live penya field increases (a loot pickup); pruned once older than POP_TTL. Radar-local (see cli_radar).
+Penya_Pop :: struct {
+  amount: i64,
+  t:      i64, // time.now()._nsec at spawn
+  pos:    [3]f32,
+}
+// A fading destination marker where a shift-click issued a moveto.
+Move_Mark :: struct {
+  pos: [3]f32,
+  t:   i64,
+}
 
 // One blip on the radar: a live mover with its world position, kind (for colour/size), the object
 // pointer (to match the selected target), and - for players - a facing angle drawn like our own arrow.
@@ -366,6 +389,227 @@ radar_draw_camera :: proc(eye, lookat: [3]f32, cam: [2]f32, scale: f32, center: 
   rl.DrawCircleLinesV(es, 6, CAM_COL)
 }
 
+// ===========================================================================
+// PANEL - the Phase 3 raygui control surface. A fixed strip on the right edge of the radar window whose
+// widgets drive the existing REPL commands, so the tool becomes UI-controlled without losing the headless
+// REPL. All widgets draw in cli_radar's exec_mutex-UNLOCKED section, so any action that touches session
+// automation is DEFERRED: it appends a command string to Panel_State.pending during the draw, and the
+// loop drains it through exec_line right after re-locking the mutex (matching REPL discipline). Radar-local
+// view bools (edit/show_cam/show_reach/cam) are single-threaded stack locals and mutate directly. The
+// panel READS setup_groups/optional_pins/auto_* directly, so it never drifts from `status`/`auto`.
+// ===========================================================================
+
+PANEL_W :: f32(280) // fixed right-side control panel; the radar map keeps the left region
+
+PANEL_BG :: rl.Color{20, 26, 34, 255} // opaque panel background (over the right strip)
+PANEL_SEP :: rl.Color{40, 50, 62, 255} // section divider / panel edge line
+PANEL_HDR :: rl.Color{200, 210, 222, 255} // section header text
+PANEL_TXT :: rl.Color{198, 206, 216, 255} // body label text
+PANEL_DIM :: rl.Color{132, 142, 154, 255} // secondary / hint text
+DOT_OK :: rl.Color{46, 204, 113, 255} // status light: pinned (green)
+DOT_REQ :: rl.Color{231, 76, 60, 255} // status light: required + missing (red)
+DOT_OPT :: rl.Color{241, 196, 15, 255} // status light: optional + missing (yellow)
+CHIP_BG :: rl.Color{52, 73, 94, 255} // selected mob-name pill
+
+// raygui's built-in theme is a low-contrast light-grey scheme; its DISABLED state (light-grey text on a
+// near-white base) reads as unreadable "white text on white background" - and the WHOLE panel renders in
+// that state whenever it draws while gui-locked (we GuiLock() the panel behind the Setup modal). Applied
+// once at window init, this overrides every control state to a dark, high-contrast look so text stays
+// legible in NORMAL/FOCUSED/PRESSED/DISABLED alike, and bumps the tiny default font. Colors are packed
+// 0xRRGGBBAA as raygui expects. See cli_radar's per-frame GuiUnlock guard for the lock-leak half of the fix.
+gui_rgba :: proc(c: rl.Color) -> i32 {
+  return i32(u32(c.r) << 24 | u32(c.g) << 16 | u32(c.b) << 8 | u32(c.a))
+}
+
+radar_apply_theme :: proc() {
+  // THE button-label fix: raygui keeps its OWN font (guiFont), separate from raylib's default. Until it's
+  // initialised it's a zero Font (texture id 0) that renders NOTHING - which is why every GuiButton label
+  // was blank while our rl.DrawText panel text drew fine. It was never a colour/contrast problem (that's
+  // why darkening the button backgrounds didn't help). GuiLoadStyleDefault initialises guiFont (=
+  // GetFontDefault) plus baseline props (text alignment / border width / padding); we override the colours
+  // + text size below. GuiSetFont is belt-and-suspenders for raygui builds that don't set the font there.
+  rl.GuiLoadStyleDefault()
+  rl.GuiSetFont(rl.GetFontDefault())
+  set :: proc(prop: rl.GuiControlProperty, col: rl.Color) {
+    rl.GuiSetStyle(.DEFAULT, i32(prop), gui_rgba(col)) // DEFAULT base props propagate to every control
+  }
+  // global: larger, more legible text + dark surfaces for GuiPanel background / dividers
+  rl.GuiSetStyle(.DEFAULT, i32(rl.GuiDefaultProperty.TEXT_SIZE), 14)
+  rl.GuiSetStyle(.DEFAULT, i32(rl.GuiDefaultProperty.TEXT_SPACING), 1)
+  rl.GuiSetStyle(.DEFAULT, i32(rl.GuiDefaultProperty.BACKGROUND_COLOR), gui_rgba(rl.Color{20, 26, 34, 255}))
+  rl.GuiSetStyle(.DEFAULT, i32(rl.GuiDefaultProperty.LINE_COLOR), gui_rgba(rl.Color{48, 60, 74, 255}))
+  // NORMAL - slate button on the dark panel, near-white label (high contrast)
+  set(.BORDER_COLOR_NORMAL, rl.Color{64, 80, 98, 255})
+  set(.BASE_COLOR_NORMAL, rl.Color{38, 48, 62, 255})
+  set(.TEXT_COLOR_NORMAL, rl.Color{206, 214, 224, 255})
+  // FOCUSED (hover) - lighter fill, blue-accent border, brighter text
+  set(.BORDER_COLOR_FOCUSED, rl.Color{92, 150, 210, 255})
+  set(.BASE_COLOR_FOCUSED, rl.Color{54, 72, 94, 255})
+  set(.TEXT_COLOR_FOCUSED, rl.Color{236, 242, 250, 255})
+  // PRESSED - bright accent
+  set(.BORDER_COLOR_PRESSED, rl.Color{120, 180, 235, 255})
+  set(.BASE_COLOR_PRESSED, rl.Color{70, 104, 146, 255})
+  set(.TEXT_COLOR_PRESSED, rl.Color{255, 255, 255, 255})
+  // DISABLED - clearly dimmed but STILL readable (never near-white on near-white)
+  set(.BORDER_COLOR_DISABLED, rl.Color{44, 54, 66, 255})
+  set(.BASE_COLOR_DISABLED, rl.Color{28, 34, 42, 255})
+  set(.TEXT_COLOR_DISABLED, rl.Color{110, 122, 136, 255})
+}
+
+// Full Flyff monster roster offered in the mob-search suggestions, MERGED (deduped, case-insensitive)
+// with the live nearby monster names each frame (see the panel snapshot). Purely a convenience corpus;
+// a typed name that isn't listed can still be added as a custom chip. Sourced from the Flyff wiki's
+// "Complete Monster list" (flyff.fandom.com/wiki/Complete_Monster_list) - regenerate from there on updates.
+AUTO_MOB_SUGGESTIONS :: []string {
+  "(Anguished Soul) Mara", "(Deathbringer) Kheldor", "(Demonic Soul) Hel", "(General) Razgul", "(God of Death) Ankou", "(Perverted Soul) Morrigan",
+  "(Tormented Soul) Nergal", "(Twisted Soul) Orcus", "(Violent Soul) Ghed", "Abraxas", "Aibatt", "Air Marshall Spiketail",
+  "Ant Turtle", "Antiquery", "Araknoid", "Arc Master of the Violet Magician Troupe", "Asmodan", "Asterius",
+  "Asuras", "Atrox", "Augu", "Axe-Jaw Ant", "Babari", "Bang",
+  "Basque", "Battle Toadrin", "Bearnerky", "Beast King Khan", "Beast Overlord Khan", "Big Muscle",
+  "Blackweb Shade", "Blighted Gryphon", "Blood Trillipy", "Bloody Mary", "Blue Meteonyker", "Blue Roach",
+  "Blue Roach Queen", "Boo", "Boss Cardpuppet", "Brigadier General Crumple", "Bucrow", "Burudeng",
+  "Cannibal Mammoth", "Cardpuppet", "Carrierbomb", "Catsy", "Chaner", "Chef Muffrin",
+  "Chief Keokuk", "Chimeradon", "Clocks", "Clockworks", "Clockworks Butler", "Club-tailed Reptilion",
+  "Colonel Club-tailed Reptilion", "Crane Machinery", "Creper", "Cursed Axe-Jaw Ant", "Cursed Giant Maul Rat", "Cursed Giant Scorpede",
+  "Cursed Maul Rat", "Cursed Razor Axe-Jaw Ant", "Cursed Scorpede", "Cyclops X", "Dantalian", "Demian",
+  "Dire Razor", "Dorian", "Doridoma", "Drakul the Diabolic", "Dread Drakul the Diabolic", "Dread Lykanos the Malevolent",
+  "Dreadful Rangda", "Driller", "Dumb Bull", "Dump", "Elderguard", "Elite Keakoon Guard",
+  "Elite Keakoon Guard Leader", "Elite Keakoon Worker", "Elite Keakoon Worker Leader", "Elite Tanuki Enforcer", "Elite Tanuki Protector", "Emeraldmantis",
+  "Fallen Necromancer", "Fefern", "Female Zombie", "Flbyrigen", "Flybat", "Forsaken Banshee",
+  "GM Cromiell", "Gangard", "Gannessa", "Garbagepider", "General Bearnerky", "General Chimeradon",
+  "General Glyphaxz", "Ghost of the Forgotten King", "Ghost of the Forgotten Prince", "Giant Abraxas", "Giant Aibatt", "Giant Antiquery",
+  "Giant Araknoid", "Giant Asterius", "Giant Asuras", "Giant Bang", "Giant Basque", "Giant Battle Toadrin",
+  "Giant Boo", "Giant Bucrow", "Giant Burudeng", "Giant Carrierbomb", "Giant Catsy", "Giant Crane Machinery",
+  "Giant Dantalian", "Giant Demian", "Giant Doridoma", "Giant Driller", "Giant Dumb Bull", "Giant Dump",
+  "Giant Elderguard", "Giant Fefern", "Giant Flbyrigen", "Giant Flybat", "Giant Gannessa", "Giant Garbagepider",
+  "Giant Giggle Box", "Giant Glaphan", "Giant Gongury", "Giant Greemong", "Giant Grrr", "Giant Gullah",
+  "Giant Hague", "Giant Harpy", "Giant Hobo", "Giant Hoppre", "Giant Iren", "Giant Jack The Hammer",
+  "Giant Kern", "Giant Lawolf", "Giant Leyena", "Giant Luia", "Giant Maul Rat", "Giant Mia",
+  "Giant Mothbee", "Giant Mr Pumpkin", "Giant Mushpang", "Giant Mushpoie", "Giant Nautrepy", "Giant Nuctuvehicle",
+  "Giant Nutty Wheel", "Giant Nyangnyang", "Giant Peakyturtle", "Giant Pukepuke", "Giant Red Mantis", "Giant Risem",
+  "Giant Rock Muscle", "Giant Rockepeller", "Giant Scorpede", "Giant Scorpicon", "Giant Shuhamma", "Giant Steamwalker",
+  "Giant Steel Knight", "Giant Syliaca", "Giant Tengu", "Giant Tombstone Bearer", "Giant Totemia", "Giant Trangfoma",
+  "Giant Volt", "Giant Wagsaac", "Giant Watangka", "Giant Wheelem", "Giant Zombiger", "Giantmage Prankster",
+  "Giggle Box", "Glaphan", "Gobbler", "Gongury", "Great Abraxas", "Great Asterius",
+  "Great Asuras", "Great Catsy", "Great Chef Muffrin", "Great Dantalian", "Great Gannessa", "Great Gullah",
+  "Great Hague", "Great Harpy", "Great Tengu", "Great White Bolo", "Greemong", "Green Meteonyker",
+  "Green Trillipy", "Grrr", "Grumble Mauler", "Guan Yu Heavyblade", "Gullah", "Hadeseor",
+  "Hague", "Hammer Kick", "Harpy", "Hazard Blood Trillipy", "Hazard Green Trillipy", "Hazard Violet Trillipy",
+  "Hellhound", "Hobo", "Hoiren", "Hoppre", "Horrible Rangda", "Hundur Sharpfoot",
+  "Hunter X", "Idol of Blighted Gryphon", "Idol of Fallen Necromancer", "Idol of Forsaken Banshee", "Idol of Scythe Protector", "Idol of Vile Flayer",
+  "Immovable Crag", "Iren", "Ivillis Black Otem", "Ivillis Boxter", "Ivillis Crasher", "Ivillis Dandysher",
+  "Ivillis Destroyer", "Ivillis Guardian", "Ivillis Leanes", "Ivillis Mushellizer", "Ivillis Poisoner", "Ivillis Puppet",
+  "Ivillis Quaker", "Ivillis Red Otem", "Ivillis Thief", "Ivillis Wrecker", "Jack The Hammer", "Kanonicus",
+  "Keakoon Guard", "Keakoon Guard Leader", "Keakoon Worker", "Keakoon Worker Leader", "Kern", "Kidler",
+  "Kingster", "Kraken", "Krrr", "Kynsy", "Kyouchish", "Lawolf",
+  "Leyena", "Lieutenant General Scythoid", "Lord Bang", "Lord Bang Hanoyan", "Lord Clockworks Alpha", "Luia",
+  "Lykanos the Malevolent", "Mage Redcloud", "Male Zombie", "Mammoth", "Master Demian", "Master Muffrin",
+  "Maul Rat", "Meral", "Meteonyker", "Mia", "Mocomochi", "Monument of Death",
+  "Mothbee", "Mr Pumpkin", "Mushmoot", "Mushpang", "Mushpoie", "Mutant Augu",
+  "Mutant Bang", "Mutant Fefern", "Mutant Giant 2nd Class Fefern", "Mutant Giant Bang King", "Mutant Giant Nyangnyang", "Mutant Keakoon Guard",
+  "Mutant Keakoon Guard Leader", "Mutant Keakoon Worker", "Mutant Keakoon Worker Leader", "Mutant Nyangnyang", "Mutant Yetti", "Mythic Prismatic Cobra",
+  "Mythic Twinstrike Cobra", "Mythic Wildwood Stalker", "Naga", "Nautrepy", "Nuctuvehicle", "Nutty Wheel",
+  "Nyangnyang", "Nyx", "Okean", "Organigor", "Peakyturtle", "Pink Roach",
+  "Pink Roach Queen", "Popcrank", "Prankster", "Prismatic Cobra", "Pukepuke", "Queen Popcrank",
+  "R. DeFeo", "Rampaging Dumb Bull", "Rangda", "Razor Axe-Jaw Ant", "Red Bang", "Red Mantis",
+  "Red Meteonyker", "Ren", "Risem", "Risen Assassin", "Risen Gladiator", "Risen Mage",
+  "Risen Pikeman", "Risen Warrior", "Rock Muscle", "Rockepeller", "Rubo", "Sakai",
+  "Samoset", "Scorpede", "Scorpicon", "Scythe Protector", "Seido", "Serus Uriel",
+  "Shacalpion", "Shadowy Wildwood Shaman", "Shuhamma", "Shuraiture", "Sisif", "Small Mushpoie",
+  "Spotted Bolo", "Steamwalker", "Steel Knight", "Syliaca", "Taiaha", "Tanuki Enforcer",
+  "Tanuki Protector", "Tengu", "Tombstone Bearer", "Totem", "Totemia", "Trangfoma",
+  "Troglodon Warlord", "Troglodon Warrior", "Twinstrike Cobra", "Uncanny Rangda", "Venel Guardian", "Vice Veduque",
+  "Vile Flayer", "Vile Thorn", "Violet Magician Troupe", "Violet Trillipy", "Volt", "Wagsaac",
+  "Watangka", "Wheelem", "Wildwood Shaman", "Wildwood Stalker", "Worm Veduque", "Yetti",
+  "Zombiger", "Mortom", "Captain Catsy", "Captain Harpy"
+}
+
+// Per-window widget state for the control panel. A LOCAL in cli_radar (like poly_wip), NOT a package
+// global - a shared global would be the forbidden Radar struct. Holds only UI buffers + the deferred
+// command queue; nothing here is read by the watcher. `pending`/`selected` strings are HEAP-owned (they
+// must outlive the frame's temp free_all, which runs before the drain) and are freed on drain / close.
+Panel_State :: struct {
+  pending:     [dynamic]string, // deferred session commands, drained under exec_mutex after each frame
+
+  setup_open:  bool, // the Setup modal is up
+  name_buf:    [64]u8, // character-name textbox (setup modal)
+  name_edit:   bool,
+  hp_buf:      [16]u8, // optional-hp textbox (setup modal)
+  hp_edit:     bool,
+  penya_buf:   [24]u8, // optional-penya textbox (setup modal) -> runs findpenya to pin penya_off
+  penya_edit:  bool,
+
+  search_buf:  [64]u8, // mob-search textbox (auto section)
+  search_edit: bool,
+  selected:    [dynamic]string, // chosen mob-name chips (heap-owned)
+
+  ar_slider:   f32, // attack_range slider value (seeded from the layout, live while dragging)
+  ar_dragging: bool, // slider held -> defer the flyff.cfg persist until release
+  ar_seeded:   bool, // one-time seed of ar_slider from the live attack_range
+}
+
+// Read a NUL-terminated string out of a raygui textbox byte buffer (pure; no session touch).
+panel_buf_str :: proc(buf: []u8) -> string {
+  n := 0
+  for n < len(buf) && buf[n] != 0 {
+    n += 1
+  }
+  return string(buf[:n])
+}
+
+// Enqueue a deferred command. The string is cloned to the heap so it survives the frame's temp free_all
+// (which runs before the drain); the drain frees it after running it.
+panel_enqueue :: proc(ps: ^Panel_State, cmd: string) {
+  append(&ps.pending, strings.clone(cmd))
+}
+
+// Case-insensitive membership test over a name list (for "already a chip" / dedup checks).
+panel_name_in :: proc(list: []string, name: string) -> bool {
+  for e in list {
+    if strings.equal_fold(e, name) {
+      return true
+    }
+  }
+  return false
+}
+
+// Append <name> to the temp candidate pool if not already present (case-insensitive dedup).
+panel_add_cand :: proc(pool: ^[dynamic]string, name: string) {
+  if !panel_name_in(pool[:], name) {
+    append(pool, name)
+  }
+}
+
+// One status light: a colored dot + label. Returns the row rectangle so the caller can hit-test it for a
+// hover tooltip. Green = pinned; red = required + missing; yellow = optional + missing.
+panel_status_light :: proc(x, y, w: f32, g: Setup_Group) -> rl.Rectangle {
+  col := g.ok ? DOT_OK : (g.required ? DOT_REQ : DOT_OPT)
+  rl.DrawCircle(i32(x + 6), i32(y + 8), 5, col)
+  rl.DrawText(fmt.ctprintf("%s", g.label), i32(x + 18), i32(y + 2), 12, PANEL_TXT)
+  return rl.Rectangle{x, y, w, 16}
+}
+
+// Format an integer with thousands separators (e.g. 1240 -> "1,240"), temp-allocated. For the penya pop.
+commafy :: proc(n: i64) -> string {
+  s := fmt.tprintf("%d", n)
+  neg := len(s) > 0 && s[0] == '-'
+  if neg {
+    s = s[1:]
+  }
+  b := strings.builder_make(context.temp_allocator)
+  if neg {
+    strings.write_byte(&b, '-')
+  }
+  L := len(s)
+  for i in 0 ..< L {
+    if i > 0 && (L - i) % 3 == 0 {
+      strings.write_byte(&b, ',')
+    }
+    strings.write_byte(&b, s[i])
+  }
+  return strings.to_string(b)
+}
+
 // radar [seconds] - open the live radar window. seconds>0 auto-closes after that long (handy for a quick
 // look / headless smoke test); omit to run until you close the window. Press E in-window for the fence
 // editor (see the HUD for controls); draw your fence, close the window, then `fence save <name>`.
@@ -390,35 +634,44 @@ cli_radar :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   ppos, pok := read_player_pos(session)
   if !pok || world == 0 {
-    fmt.eprintln("radar: world/player not resolved - run 'calibrate'.")
-    return
-  }
-  probe_player := read_ptr_at(handle, base + L.player_rva, pt)
-  probe_pb, probe_pai := radar_prop_ctx(session, probe_player)
-  probe := make([dynamic]Radar_Blip, context.temp_allocator)
-  radar_gather_movers(session, world, probe_player, probe_pb, probe_pai, ppos[0], ppos[2], view_r + 20, &probe)
-  probe_obbs := collect_area_colliders(session, world, ppos[0], ppos[2])
-  nmon, nply, noth := 0, 0, 0
-  for b in probe {
-    switch b.kind {
-    case .Monster:
-      nmon += 1
-    case .Player:
-      nply += 1
-    case .Other, .Unclassified:
-      noth += 1
+    // Open ANYWAY with an empty map. The control panel's Setup dialog is how you configure the tool, so
+    // requiring setup to be complete before you can open it is a dead end (this used to hard-return here).
+    // The render loop re-reads world + player every frame and guards all mob/obstacle work on them, so
+    // blips appear live the instant setup resolves them. Fall back to the origin for the initial camera.
+    if !pok {
+      ppos = {0, 0, 0}
     }
+    fmt.eprintln("radar: world/player not resolved yet - opening the panel so you can run Setup. Be in-game + run setup; blips appear once it resolves.")
+  } else {
+    probe_player := read_ptr_at(handle, base + L.player_rva, pt)
+    probe_pb, probe_pai := radar_prop_ctx(session, probe_player)
+    probe := make([dynamic]Radar_Blip, context.temp_allocator)
+    radar_gather_movers(session, world, probe_player, probe_pb, probe_pai, ppos[0], ppos[2], view_r + 20, &probe)
+    probe_obbs := collect_area_colliders(session, world, ppos[0], ppos[2])
+    nmon, nply, noth := 0, 0, 0
+    for b in probe {
+      switch b.kind {
+      case .Monster:
+        nmon += 1
+      case .Player:
+        nply += 1
+      case .Other, .Unclassified:
+        noth += 1
+      }
+    }
+    fmt.printfln(
+      "radar: player (%.1f, %.1f), %d movers (%d mob, %d player, %d other), %d obstacles in view. opening window%s...",
+      ppos[0], ppos[2], len(probe), nmon, nply, noth, len(probe_obbs), dur > 0 ? fmt.tprintf(" for %.0fs", dur) : "",
+    )
   }
-  fmt.printfln(
-    "radar: player (%.1f, %.1f), %d movers (%d mob, %d player, %d other), %d obstacles in view. opening window%s...",
-    ppos[0], ppos[2], len(probe), nmon, nply, noth, len(probe_obbs), dur > 0 ? fmt.tprintf(" for %.0fs", dur) : "",
-  )
   free_all(context.temp_allocator)
 
   rl.SetConfigFlags({.WINDOW_RESIZABLE})
-  rl.InitWindow(820, 820, "memscan radar")
+  rl.InitWindow(820 + i32(PANEL_W), 820, "memscan radar")
   defer rl.CloseWindow() // raylib's own (via /WHOLEARCHIVE:raylib.lib) - see note atop this file
+  rl.SetWindowMinSize(i32(PANEL_W) + 320, 480) // keep the panel + a usable map region visible
   rl.SetTargetFPS(30)
+  radar_apply_theme() // dark, high-contrast raygui theme (raylib's default is unreadable low-contrast grey)
 
   scale := f32(3.0) // pixels per world unit; mouse wheel zooms
   cam := [2]f32{ppos[0], ppos[2]} // world point at screen center; right-drag pans, C recenters on player
@@ -437,6 +690,27 @@ cli_radar :: proc(session: ^Session, args: []string) {
   poly_wip := make([dynamic][2]f32)
   defer delete(poly_wip)
 
+  // Control-panel widget state (Phase 3). Local, like poly_wip. Its pending/selected strings are
+  // heap-owned; free any leftovers on close (the per-frame drain frees the rest).
+  ps: Panel_State
+  defer {
+    for c in ps.pending {delete(c)}
+    delete(ps.pending)
+    for s in ps.selected {delete(s)}
+    delete(ps.selected)
+  }
+
+  // Phase 4 interaction state - radar-local (like poly_wip); the watcher thread never touches these.
+  // penya field-watch (spawns "+penya" pops on a rise) + the pop/marker lists + the hover-target.
+  penya_seeded := false
+  last_penya: i64
+  pops := make([dynamic]Penya_Pop)
+  marks := make([dynamic]Move_Mark)
+  defer delete(pops)
+  defer delete(marks)
+  hover_obj: uintptr // nearest hittable mob under the cursor (view mode) - drawn as a ring, plain-click targets it
+  hover_pos: [3]f32
+
   // cli_radar is entered holding exec_mutex (run_cli locks around every command). We keep that invariant:
   // each frame's session work runs locked, and we RELEASE the lock across the draw/present so the watcher
   // can farm, re-acquiring before the next iteration. On every exit path the mutex is held (run_cli unlocks).
@@ -447,9 +721,13 @@ cli_radar :: proc(session: ^Session, args: []string) {
 
     fw := f32(rl.GetScreenWidth())
     fh := f32(rl.GetScreenHeight())
-    center := rl.Vector2{fw / 2, fh / 2}
+    center := rl.Vector2{(fw - PANEL_W) / 2, fh / 2} // recentre the world into the left region (panel on the right)
     mouse := rl.GetMousePosition()
     mw := radar_s2w(cam, scale, center, mouse.x, mouse.y) // world (x,z) under the cursor
+    // Gate world input: panel clicks/scroll must never pan/zoom/edit the map, and typing in a panel
+    // textbox must not trigger the E/F/R/C or fence hotkeys. (Modal open => treat all as panel.)
+    mouse_in_panel := mouse.x >= fw - PANEL_W || ps.setup_open
+    typing := ps.search_edit || ps.name_edit || ps.hp_edit
 
     // --- live player pos + facing (single player resolve) ---
     pangle: f32
@@ -467,7 +745,8 @@ cli_radar :: proc(session: ^Session, args: []string) {
       }
     }
 
-    // --- input: view controls (both modes) ---
+    // --- input: view controls + fence editor (both modes). Gated so the panel owns its region. ---
+    if !mouse_in_panel && !typing {
     scale += rl.GetMouseWheelMove() * 0.5
     if scale < 0.5 {scale = 0.5}
     if scale > 24 {scale = 24}
@@ -554,6 +833,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
         }
       }
     }
+    } // end input gate (mouse_in_panel / typing)
 
     // --- live data (snapshot shared state before releasing the lock) ---
     w := read_ptr_at(handle, base + L.world_rva, pt)
@@ -582,10 +862,95 @@ cli_radar :: proc(session: ^Session, args: []string) {
         }
       }
     }
+
+    // --- Phase 4 click interaction (still locked): plain-click = target the mob under the cursor;
+    // Shift+click = walk to the ground point. Only in view mode (edit owns left-click for fences) and
+    // off the panel. focus_set_obj / write_dest_pos need exec_mutex, which we still hold here. ---
+    shift_down := rl.IsKeyDown(.LEFT_SHIFT) || rl.IsKeyDown(.RIGHT_SHIFT)
+    hover_obj = 0
+    if !mouse_in_panel && !typing && !edit {
+      best := HIT_R // nearest mob dot under the cursor (hover ring + plain-click target)
+      for m in mobs {
+        sp := radar_w2s(cam, scale, center, m.pos[0], m.pos[2])
+        dx := sp.x - mouse.x
+        dy := sp.y - mouse.y
+        dd := math.sqrt(dx * dx + dy * dy)
+        if dd <= best {
+          best = dd
+          hover_obj = m.obj
+          hover_pos = m.pos
+        }
+      }
+      if rl.IsMouseButtonPressed(.LEFT) {
+        if shift_down {
+          if moveto_ready(session) { // walk to the world point under the cursor (broadcasts the walk)
+            dest := [3]f32{mw[0], ppos[1], mw[1]}
+            write_dest_pos(session, ppos, dest)
+            remote_send_snapshot(session)
+            append(&marks, Move_Mark{pos = dest, t = time.now()._nsec})
+          }
+        } else if hover_obj != 0 { // select the exact mob under the cursor (guarded write + srvsync)
+          focus_set_obj(session, hover_obj, nil)
+        }
+      }
+    }
+    // penya field-watch: pop "+N penya" when the live gold field rises (loot pickup). Read under the lock.
+    if L.penya_off != 0 && player != 0 {
+      if pvv, ok := engine.read_value(handle, player + uintptr(L.penya_off), .U32); ok {
+        cur := i64(u32(engine.value_as_u64(.U32, pvv)))
+        if !penya_seeded {
+          last_penya = cur
+          penya_seeded = true
+        } else if cur > last_penya {
+          append(&pops, Penya_Pop{amount = cur - last_penya, t = time.now()._nsec, pos = ppos})
+          last_penya = cur
+        } else if cur < last_penya {
+          last_penya = cur // spent penya (repair / buy) - re-baseline, no pop
+        }
+      }
+    }
+
     ceye, clook: [3]f32
     cam_ok := false
     if show_cam {
       ceye, clook, cam_ok = read_camera(session)
+    }
+
+    // --- panel snapshot (structured status/auto/range data; drawn after unlock, no text parsing) ---
+    // attack_range slider seed/apply. ONLY write the layout from the slider WHILE the user is dragging it
+    // (ar_dragging), so the green ring tracks the drag; otherwise re-seed the slider FROM the layout each
+    // frame. That (a) reflects an external `set attack_range`/`density` and (b) stops GuiSlider's pixel-
+    // quantisation from drifting the stored value every time the panel opens - that silent creep is what
+    // bloated attack_range to ~17 and made the auto-picker's engage range spread targets. The aligned
+    // 4-byte store is atomic vs the watcher's read; the flyff.cfg persist is deferred to slider release.
+    if !ps.ar_seeded {
+      ps.ar_slider = session.layout.attack_range
+      ps.ar_seeded = true
+    }
+    if ps.ar_dragging {
+      session.layout.attack_range = ps.ar_slider
+    } else {
+      ps.ar_slider = session.layout.attack_range
+    }
+    groups := setup_groups(session)
+    opins := optional_pins(session)
+    status_hdr := setup_status_line(session)
+    auto_on_s := session.auto_on
+    auto_paused_s := session.auto_paused
+    auto_desc_s := auto_target_desc(session.auto_names[:])
+    auto_line_s := auto_on_s ? auto_stats(session, time.now()._nsec) : ""
+    // Distinct nearby monster names for the search suggestions - only read (extra RPM) while the search
+    // box is in use, so an idle panel costs nothing. Temp-lifetime (consumed by this frame's draw).
+    live_names := make([dynamic]string, context.temp_allocator)
+    if ps.search_edit || panel_buf_str(ps.search_buf[:]) != "" {
+      for m in mobs {
+        if m.kind != .Monster {
+          continue
+        }
+        if nm, ok := read_mover_name(session, m.obj); ok && len(nm) > 0 {
+          panel_add_cand(&live_names, nm)
+        }
+      }
     }
 
     // Release exec_mutex for the draw/present so the watcher thread can run auto_tick this frame. All
@@ -596,6 +961,8 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // --- draw ---
     rl.BeginDrawing()
     rl.ClearBackground(rl.Color{12, 16, 22, 255})
+    // Clip all world/HUD drawing to the left region so nothing bleeds under the right-side panel.
+    rl.BeginScissorMode(0, 0, i32(fw - PANEL_W), i32(fh))
     // screen-center crosshair (the current camera focus)
     rl.DrawLineV({center.x, 0}, {center.x, fh}, rl.Color{28, 38, 50, 255})
     rl.DrawLineV({0, center.y}, {fw, center.y}, rl.Color{28, 38, 50, 255})
@@ -701,19 +1068,331 @@ cli_radar :: proc(session: ^Session, args: []string) {
     }
     rl.DrawCircleV(pp, 5, rl.WHITE)
 
+    // hover ring: the mob a plain left-click would target (view mode)
+    if hover_obj != 0 {
+      hpv := radar_w2s(cam, scale, center, hover_pos[0], hover_pos[2])
+      rl.DrawCircleLinesV(hpv, 7, HOVER_COL)
+    }
+    // move-destination markers (shift-click) - shrinking cyan crosshair, fades out. Prune expired.
+    now_ns := time.now()._nsec
+    for i := len(marks) - 1; i >= 0; i -= 1 {
+      age := now_ns - marks[i].t
+      if age > MARK_TTL {
+        ordered_remove(&marks, i)
+        continue
+      }
+      frac := f32(age) / f32(MARK_TTL)
+      mp := radar_w2s(cam, scale, center, marks[i].pos[0], marks[i].pos[2])
+      col := MARK_COL
+      col.a = u8(200 * (1 - frac))
+      rl.DrawCircleLinesV(mp, (1 - frac) * 10 + 2, col)
+      rl.DrawLineV({mp.x - 5, mp.y}, {mp.x + 5, mp.y}, col)
+      rl.DrawLineV({mp.x, mp.y - 5}, {mp.x, mp.y + 5}, col)
+    }
+    // "+penya" pops - gold text, rises + fades. Prune expired.
+    for i := len(pops) - 1; i >= 0; i -= 1 {
+      age := now_ns - pops[i].t
+      if age > POP_TTL {
+        ordered_remove(&pops, i)
+        continue
+      }
+      frac := f32(age) / f32(POP_TTL)
+      sp := radar_w2s(cam, scale, center, pops[i].pos[0], pops[i].pos[2])
+      col := PENYA_COL
+      col.a = u8(255 * (1 - frac))
+      txt := fmt.ctprintf("+%s penya", commafy(pops[i].amount))
+      tw := rl.MeasureText(txt, 16)
+      rl.DrawText(txt, i32(sp.x) - tw / 2, i32(sp.y - frac * 30) - 22, 16, col)
+    }
+
     // HUD
     toolname: cstring = tool == .Circle ? "circle" : tool == .Rect ? "rect" : tool == .Polygon ? "polygon" : "eraser"
     rl.DrawText(fmt.ctprintf("%s | fence %s | %d shapes | tool:%s tag:%s | cam:%s | reach:%s | %.1f px/u", edit ? "EDIT" : "view", session.fence.active ? "ON" : "off", len(session.fence.shapes), toolname, include ? "+" : "-", show_cam ? "on" : "off", show_reach ? "on" : "off", scale), 10, 10, 18, rl.RAYWHITE)
     legend: cstring = prop_gate_ready(session) ? "red:mob  blue:player  grey:pet/npc  faded:unreachable  yellow ring:target  green ring:attack_range" : "movers:red (run 'findprop' to tell players/pets apart)  faded:unreachable  yellow ring:target"
     rl.DrawText(legend, 10, 32, 14, rl.Color{150, 160, 172, 255})
-    hint: cstring = "E:edit fence   F:camera   R:reach   wheel:zoom   RMB-drag:pan   C:recenter   ESC:close"
+    hint: cstring = "click:target  shift+click:move  E:edit fence  F:camera  R:reach  wheel:zoom  RMB-drag:pan  C:recenter  ESC:close"
     if edit {
       hint = "E:view  1/2/3:draw  4:erase  Tab:+/-  Ldrag/click  Enter:close-poly  Bksp:undo  Del:clear  A:on/off  R:reach  RMB-drag:pan  F:cam  C:recenter"
     }
     rl.DrawText(hint, 10, i32(fh) - 24, 16, rl.Color{150, 160, 172, 255})
+    rl.EndScissorMode() // end the world/HUD clip; the panel draws over the right strip below
+
+    // === PANEL === (raygui control surface; every session-touching action is deferred to ps.pending
+    // and drained under exec_mutex after this frame - see the PANEL section header near the top).
+    px := fw - PANEL_W
+    rl.DrawRectangle(i32(px), 0, i32(PANEL_W), i32(fh), PANEL_BG)
+    rl.DrawLine(i32(px), 0, i32(px), i32(fh), PANEL_SEP)
+    x0 := px + 12
+    pw := PANEL_W - 24
+    y := f32(12)
+    rl.GuiUnlock() // clear any stale lock leaked from a prior frame -> panel never gets stuck in DISABLED
+    if ps.setup_open {rl.GuiLock()} // freeze the background widgets while the modal is up
+
+    // header + setup status lights + optional pins (hover a missing one for the fix)
+    rl.DrawText(fmt.ctprintf("%s", status_hdr), i32(x0), i32(y), 11, PANEL_HDR)
+    y += 20
+    tooltip: cstring = nil
+    for g in groups {
+      row := panel_status_light(x0, y, pw, g)
+      if !ps.setup_open && !g.ok && rl.CheckCollisionPointRec(mouse, row) {
+        tooltip = fmt.ctprintf("%s", g.need)
+      }
+      y += 17
+    }
+    y += 3
+    rl.DrawText("optional pins", i32(x0), i32(y), 11, PANEL_DIM)
+    y += 15
+    for g in opins {
+      row := panel_status_light(x0, y, pw, g)
+      if !ps.setup_open && !g.ok && rl.CheckCollisionPointRec(mouse, row) {
+        tooltip = fmt.ctprintf("run: %s", g.need)
+      }
+      y += 17
+    }
+    y += 6
+
+    // Setup dialog trigger
+    if rl.GuiButton({x0, y, pw, 28}, "Setup...") {
+      ps.setup_open = true
+      ps.name_edit = true
+    }
+    y += 36
+
+    // --- AUTO-FARM ---
+    rl.DrawLine(i32(x0), i32(y), i32(x0 + pw), i32(y), PANEL_SEP)
+    y += 8
+    rl.DrawText("PLAY", i32(x0), i32(y), 13, PANEL_HDR)
+    y += 18
+    toggle_label: cstring = auto_on_s ? "Stop" : "Start"
+    if rl.GuiButton({x0, y, pw, 30}, toggle_label) {
+      if auto_on_s {
+        panel_enqueue(&ps, "auto off") // explicit off (clearer than re-issuing the same set, which toggles)
+      } else if len(ps.selected) == 0 {
+        panel_enqueue(&ps, "auto any")
+      } else {
+        sb := strings.builder_make(context.temp_allocator)
+        strings.write_string(&sb, "auto ")
+        for s, i in ps.selected {
+          if i > 0 {strings.write_byte(&sb, ',')}
+          strings.write_byte(&sb, '\'')
+          strings.write_string(&sb, s)
+          strings.write_byte(&sb, '\'')
+        }
+        panel_enqueue(&ps, strings.to_string(sb))
+      }
+    }
+    y += 36
+    if auto_on_s {
+      rl.DrawText(fmt.ctprintf("%s: %s", auto_paused_s ? "ARMED" : "ON", auto_desc_s), i32(x0), i32(y), 11, rl.Color{150, 170, 190, 255})
+      y += 15
+      rl.DrawText(fmt.ctprintf("%s", auto_line_s), i32(x0), i32(y), 11, rl.Color{120, 190, 140, 255})
+      y += 16
+    } else {
+      rl.DrawText(fmt.ctprintf("target: %s", len(ps.selected) == 0 ? "any monster" : "the chips below"), i32(x0), i32(y), 11, PANEL_DIM)
+      y += 16
+    }
+
+    // mob search box + live-filtered suggestions
+    rl.DrawText("target mobs (search, click to add)", i32(x0), i32(y), 11, PANEL_DIM)
+    y += 15
+    if rl.GuiTextBox({x0, y, pw, 26}, cstring(&ps.search_buf[0]), i32(len(ps.search_buf)), ps.search_edit) {
+      ps.search_edit = !ps.search_edit
+    }
+    y += 30
+    search_txt := strings.trim_space(panel_buf_str(ps.search_buf[:]))
+    if !ps.setup_open && len(search_txt) > 0 {
+      // merged, deduped candidate pool: hardcoded corpus + live nearby names
+      pool := make([dynamic]string, context.temp_allocator)
+      for n in AUTO_MOB_SUGGESTIONS {panel_add_cand(&pool, n)}
+      for n in live_names {panel_add_cand(&pool, n)}
+      // "Captain"/"Small" are variant MODIFIERS, not filters: a leading one is stripped so it never
+      // excludes any base monster (the whole list stays visible), and it's prepended onto whatever you
+      // pick - the badge becomes e.g. "Captain Aibatt". Any text after it still narrows the base list.
+      prefix := ""
+      rest := search_txt
+      low := strings.to_lower(search_txt, context.temp_allocator)
+      switch {
+      case low == "captain" || strings.has_prefix(low, "captain "):
+        prefix = "Captain"
+        rest = strings.trim_space(search_txt[len("Captain"):])
+      case low == "small" || strings.has_prefix(low, "small "):
+        prefix = "Small"
+        rest = strings.trim_space(search_txt[len("Small"):])
+      }
+      prefix_lc_space := ""
+      if prefix != "" {prefix_lc_space = fmt.tprintf("%s ", strings.to_lower(prefix, context.temp_allocator))}
+      needle := strings.to_lower(rest, context.temp_allocator)
+      seen := make([dynamic]string, context.temp_allocator) // composed badges already offered this frame
+      shown := 0
+      for cand in pool {
+        if shown >= 6 {break}
+        if len(needle) > 0 && !strings.contains(strings.to_lower(cand, context.temp_allocator), needle) {continue}
+        // compose the badge; don't double up if the candidate already carries the modifier
+        full := cand
+        if prefix != "" && !strings.has_prefix(strings.to_lower(cand, context.temp_allocator), prefix_lc_space) {
+          full = fmt.tprintf("%s %s", prefix, cand)
+        }
+        if panel_name_in(ps.selected[:], full) {continue}
+        if panel_name_in(seen[:], full) {continue} // two bases can compose to the same badge - offer it once
+        append(&seen, full)
+        if rl.GuiButton({x0, y, pw, 22}, fmt.ctprintf("+ %s", full)) {
+          append(&ps.selected, strings.clone(full))
+          ps.search_buf = {} // clear the box after picking
+        }
+        y += 24
+        shown += 1
+      }
+      // add the typed text verbatim as a custom chip
+      if !panel_name_in(ps.selected[:], search_txt) {
+        if rl.GuiButton({x0, y, pw, 22}, fmt.ctprintf("+ add \"%s\"", search_txt)) {
+          append(&ps.selected, strings.clone(search_txt))
+          ps.search_buf = {}
+        }
+        y += 24
+      }
+    }
+
+    // selected chips (wrap across rows; click the x to remove)
+    if len(ps.selected) > 0 {
+      cx := x0
+      chip_h := f32(22)
+      for i := 0; i < len(ps.selected); i += 1 {
+        cname := ps.selected[i]
+        tw := f32(rl.MeasureText(fmt.ctprintf("%s", cname), 12))
+        cw := tw + 30
+        if cx + cw > x0 + pw {
+          cx = x0
+          y += chip_h + 4
+        }
+        rl.DrawRectangleRounded({cx, y, cw, chip_h}, 0.4, 6, CHIP_BG)
+        rl.DrawText(fmt.ctprintf("%s", cname), i32(cx + 8), i32(y + 5), 12, rl.RAYWHITE)
+        xb := rl.Rectangle{cx + cw - 18, y, 18, chip_h}
+        xhov := !ps.setup_open && rl.CheckCollisionPointRec(mouse, xb)
+        rl.DrawText("x", i32(cx + cw - 13), i32(y + 5), 12, xhov ? rl.RED : rl.Color{205, 185, 185, 255})
+        if xhov && rl.IsMouseButtonPressed(.LEFT) {
+          delete(ps.selected[i])
+          ordered_remove(&ps.selected, i)
+          i -= 1
+          continue
+        }
+        cx += cw + 6
+      }
+      y += chip_h + 6
+    }
+
+    // --- attack_range slider (live ring feedback; persists to flyff.cfg on release) ---
+    rl.DrawLine(i32(x0), i32(y), i32(x0 + pw), i32(y), PANEL_SEP)
+    y += 8
+    rl.DrawText(fmt.ctprintf("attack_range: %.2f", ps.ar_slider), i32(x0), i32(y), 12, PANEL_HDR)
+    y += 18
+    sl := rl.Rectangle{x0 + 4, y, pw - 8, 18}
+    rl.GuiSlider(sl, "0", "30", &ps.ar_slider, 0, 30)
+    if !ps.setup_open && rl.IsMouseButtonDown(.LEFT) && rl.CheckCollisionPointRec(mouse, sl) {
+      ps.ar_dragging = true
+    }
+    if ps.ar_dragging && rl.IsMouseButtonReleased(.LEFT) {
+      ps.ar_dragging = false
+      panel_enqueue(&ps, fmt.tprintf("set attack_range %.3f", ps.ar_slider))
+    }
+    y += 26
+
+    // --- VIEW / FENCE toolbar (view toggles flip local bools; fence state is deferred) ---
+    rl.DrawLine(i32(x0), i32(y), i32(x0 + pw), i32(y), PANEL_SEP)
+    y += 8
+    rl.DrawText("VIEW / FENCE", i32(x0), i32(y), 13, PANEL_HDR)
+    y += 18
+    bw := (pw - 10) / 2
+    if rl.GuiButton({x0, y, bw, 26}, edit ? "Edit: ON" : "Edit: off") {edit = !edit}
+    if rl.GuiButton({x0 + bw + 10, y, bw, 26}, show_cam ? "Camera: ON" : "Camera: off") {show_cam = !show_cam}
+    y += 30
+    if rl.GuiButton({x0, y, bw, 26}, show_reach ? "Reach: ON" : "Reach: off") {show_reach = !show_reach}
+    if rl.GuiButton({x0 + bw + 10, y, bw, 26}, "Recenter") {cam = {ppos[0], ppos[2]}}
+    y += 30
+    if rl.GuiButton({x0, y, bw, 26}, session.fence.active ? "Fence: ON" : "Fence: off") {
+      panel_enqueue(&ps, session.fence.active ? "fence off" : "fence on")
+    }
+    if rl.GuiButton({x0 + bw + 10, y, bw, 26}, "Fence Clear") {panel_enqueue(&ps, "fence clear")}
+    y += 30
+    if rl.GuiButton({x0, y, bw, 26}, "Fence Undo") {panel_enqueue(&ps, "fence undo")}
+
+    // hovered status-light tooltip (on top of the panel)
+    if tooltip != nil {
+      tw := rl.MeasureText(tooltip, 12)
+      tx := mouse.x + 14
+      ty := mouse.y + 6
+      if tx + f32(tw) + 10 > fw {tx = fw - f32(tw) - 10}
+      rl.DrawRectangle(i32(tx - 4), i32(ty - 3), tw + 10, 20, rl.Color{10, 14, 20, 240})
+      rl.DrawRectangleLines(i32(tx - 4), i32(ty - 3), tw + 10, 20, rl.Color{80, 90, 102, 255})
+      rl.DrawText(tooltip, i32(tx + 1), i32(ty), 12, rl.RAYWHITE)
+    }
+
+    // --- Setup modal (drawn last, on top; background widgets are GuiLock'd above) ---
+    if ps.setup_open {
+      rl.GuiUnlock()
+      rl.DrawRectangle(0, 0, i32(fw), i32(fh), rl.Color{0, 0, 0, 150})
+      mw2 := f32(360)
+      mh2 := f32(268)
+      mx := (fw - mw2) / 2
+      my := (fh - mh2) / 2
+      rl.GuiPanel({mx, my, mw2, mh2}, "setup <name> [hp]")
+      rl.GuiLabel({mx + 14, my + 34, mw2 - 28, 18}, "character name")
+      if rl.GuiTextBox({mx + 14, my + 54, mw2 - 28, 28}, cstring(&ps.name_buf[0]), i32(len(ps.name_buf)), ps.name_edit) {
+        ps.name_edit = !ps.name_edit
+        ps.hp_edit = false
+        ps.penya_edit = false
+      }
+      rl.GuiLabel({mx + 14, my + 92, mw2 - 28, 18}, "current hp (optional)")
+      if rl.GuiTextBox({mx + 14, my + 112, mw2 - 28, 28}, cstring(&ps.hp_buf[0]), i32(len(ps.hp_buf)), ps.hp_edit) {
+        ps.hp_edit = !ps.hp_edit
+        ps.name_edit = false
+        ps.penya_edit = false
+      }
+      // optional penya: if filled, Run setup also fires `findpenya <penya>` to pin penya_off (radar +penya pop)
+      rl.GuiLabel({mx + 14, my + 150, mw2 - 28, 18}, "current penya (optional -> +penya pop)")
+      if rl.GuiTextBox({mx + 14, my + 170, mw2 - 28, 28}, cstring(&ps.penya_buf[0]), i32(len(ps.penya_buf)), ps.penya_edit) {
+        ps.penya_edit = !ps.penya_edit
+        ps.name_edit = false
+        ps.hp_edit = false
+      }
+      bw2 := (mw2 - 40) / 2
+      if rl.GuiButton({mx + 14, my + mh2 - 40, bw2, 28}, "Run setup") {
+        nm := strings.trim_space(panel_buf_str(ps.name_buf[:]))
+        if len(nm) > 0 {
+          hp := strings.trim_space(panel_buf_str(ps.hp_buf[:]))
+          panel_enqueue(&ps, len(hp) > 0 ? fmt.tprintf("setup %s %s", nm, hp) : fmt.tprintf("setup %s", nm))
+          // penya isn't derivable from the name anchor (it needs a live value), so it rides as a second
+          // command: findpenya pins penya_off from the number you read off the game UI. Commas tolerated.
+          py := strings.trim_space(panel_buf_str(ps.penya_buf[:]))
+          py, _ = strings.remove_all(py, ",", context.temp_allocator)
+          if len(py) > 0 {
+            panel_enqueue(&ps, fmt.tprintf("findpenya %s", py))
+          }
+          ps.setup_open = false
+          ps.name_edit = false
+          ps.hp_edit = false
+          ps.penya_edit = false
+        }
+      }
+      if rl.GuiButton({mx + 26 + bw2, my + mh2 - 40, bw2, 28}, "Cancel") {
+        ps.setup_open = false
+        ps.name_edit = false
+        ps.hp_edit = false
+        ps.penya_edit = false
+      }
+    }
     rl.EndDrawing()
 
     free_all(context.temp_allocator) // reclaim this frame's mob array + collider snapshot + HUD strings
     sync.mutex_lock(&session.exec_mutex) // re-acquire before the next iteration (and for run_cli to unlock)
+
+    // Drain deferred widget commands now that we hold exec_mutex again (matches REPL discipline). The
+    // pending strings are heap-owned, so the free_all above didn't touch them; free each after it runs.
+    for cmd in ps.pending {
+      if session.exec_line != nil {
+        session.exec_line(&session.eng, cmd)
+      }
+      delete(cmd)
+    }
+    clear(&ps.pending)
   }
 }

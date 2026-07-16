@@ -70,6 +70,26 @@ Session :: struct {
   pause_obj:        uintptr, // mob watched for a kill while paused (0 = none)
   pause_key_prev:   bool, // F10 edge-detection state for the default pause binding (see module_tick)
 
+  // Pre-select / precompute-next (see tc_precompute_next / auto_tick). While a target is focused, auto
+  // precomputes the mob it will advance to next, so it can be committed the INSTANT focus clears on a
+  // kill - removing the ~0.5s post-kill enumeration gap. One precompute per locked target: auto_next_for
+  // is the focus obj the cache was computed against. The cached pick is re-validated at commit time
+  // (focus_set_obj); if it went stale, auto falls back to the reactive tc_select scan. Default on.
+  preselect_on:     bool,
+  auto_next_obj:    uintptr, // the precomputed next target (0 / auto_next_set=false = none cached)
+  auto_next_pos:    [3]f32, // its world pos (seeds the kill-anchor bookkeeping on commit)
+  auto_next_set:    bool,
+  auto_next_for:    uintptr, // the focused obj this cache is for (re-arm the precompute when focus changes)
+
+  // Look-alive mode (see cli_lookalive + the lookalive_* hooks in auto_tick). Opt-in human-like farming
+  // for low-spawn quest grinds: a randomized hesitation before engaging each new target (delayed lock-on,
+  // which also holds the pre-select fast-commit) and occasional jumps while travelling to a far target.
+  // Deliberately less efficient than the snappy loop, so default OFF. Jumps reuse the 'findmove' primitive
+  // and are skipped when char-control isn't configured. RNG = core:math/rand (see lookalive_rand_ns).
+  lookalive_on:         bool,
+  lookalive_hold_until: i64, // nsec deadline for the post-kill hesitation (0 = no active hold)
+  lookalive_jump_at:    i64, // nsec of the next scheduled travel-jump attempt (0 = (re)seed on next tick)
+
   // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
   world_cal:     [dynamic]World_Cal_Cand,
@@ -126,6 +146,7 @@ session_init :: proc(session: ^Session) -> bool {
   }
   session.auto_stuck_on = true // obstacle/stuck detection on by default (see auto_monitor)
   session.reach_gate_on = true // proactive reach gate on by default (inert until findcull sets aobjcull_rva)
+  session.preselect_on = true // precompute the next target during combat -> instant advance on kill
   // Mesh-accurate reach confirm defaults OFF: it injects a game-code thread (IntersectObjLine) per
   // OBB-blocked candidate, which walks the live collision linkmaps concurrently with the main thread -
   // a real race that correlated with more client crashes during sustained farming. The zero-injection

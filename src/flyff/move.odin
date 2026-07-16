@@ -38,7 +38,7 @@ cli_moveto :: proc(session: ^Session, args: []string) {
   }
   ppos, pok := read_player_pos(session)
   if !pok {
-    fmt.eprintln("couldn't read player position - run 'calibrate' first.")
+    fmt.eprintln("couldn't read player position - run 'setup <name>' first (be in-game).")
     return
   }
   dest: [3]f32
@@ -149,7 +149,7 @@ cli_findmove :: proc(session: ^Session, args: []string) {
 
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if player == 0 || !in_module_range(read_ptr_at(handle, player, pt), base, mod_end) {
-    fmt.eprintln("player not resolved - run 'calibrate'/'setup' first (need a valid player object).")
+    fmt.eprintln("player not resolved - run 'setup <name>' first (need a valid player object).")
     return
   }
   fmt.printfln("findmove: player obj = 0x%X", player)
@@ -495,7 +495,7 @@ cli_position :: proc(session: ^Session, args: []string) {
   }
   pos, ok := read_player_pos(session)
   if !ok {
-    fmt.eprintln("couldn't read player position - run 'calibrate' first (need a resolved player).")
+    fmt.eprintln("couldn't read player position - run 'setup <name>' first (need a resolved player).")
     return
   }
   fmt.printfln("position: x=%.3f  y=%.3f  z=%.3f", pos[0], pos[1], pos[2])

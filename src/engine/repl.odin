@@ -176,7 +176,13 @@ cmd_module :: proc(session: ^Session, args: []string) {
   }
   name := args[0]
   if session.module_active && session.module_name == name {
-    fmt.printfln("module '%s' is active.", name)
+    if session.open_ui != nil {
+      // Opens the module's UI (blocks until closed). Same thread + exec_mutex contract as typing the
+      // module's own window command (the REPL already holds exec_mutex around this call).
+      session.open_ui(session)
+    } else {
+      fmt.printfln("module '%s' is active.", name)
+    }
     return
   }
   fmt.eprintfln("unknown module '%s' (available: %s)", name, session.module_active ? session.module_name : "none")
@@ -248,4 +254,4 @@ HELP_FOOTER :: `
   help (?)   this list         quit (q)   exit
 
 chain commands on one line with ';' or '&&':
-  calibrate 253,100,243 MyChar 1234 ; auto any`
+  setup MyChar 1234 ; auto any`

@@ -351,7 +351,7 @@ fence_player_xz :: proc(session: ^Session) -> (x, z: f32, ok: bool) {
   }
   pp, pok := read_player_pos(session)
   if !pok {
-    fmt.eprintln("fence: could not read player position - run 'calibrate'.")
+    fmt.eprintln("fence: could not read player position - run 'setup <name>'.")
     return 0, 0, false
   }
   return pp[0], pp[2], true

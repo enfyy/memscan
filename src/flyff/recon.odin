@@ -167,7 +167,7 @@ cli_findaii :: proc(session: ^Session, args: []string) {
   wv, wok := engine.read_value(handle, base + L.world_rva, pt)
   pv, pok := engine.read_value(handle, base + L.player_rva, pt)
   if !wok || !pok {
-    fmt.eprintln("could not read world/player anchors - run calibrate first.")
+    fmt.eprintln("could not read world/player anchors - run 'setup <name>' first.")
     return
   }
   world := uintptr(engine.value_as_u64(pt, wv))
@@ -175,7 +175,7 @@ cli_findaii :: proc(session: ^Session, args: []string) {
 
   fp, fok := engine.read_value(handle, world + uintptr(L.focus_off), pt)
   if !fok {
-    fmt.eprintln("could not read the selection (focus_off) - run calibrate / findfocus first.")
+    fmt.eprintln("could not read the selection (focus_off) - run 'setup <name>' / 'findfocus' first.")
     return
   }
   focus := uintptr(engine.value_as_u64(pt, fp))
@@ -418,12 +418,12 @@ aii_verdict :: proc(ai: i64) -> string {
 }
 
 // findprop -> derive the species MoverProp-array gate for "auto any": propmover_rva / moverprop_stride
-// / moverprop_ai_off. TARGET your PET (target_closest <pet>) with a few monsters on screen, then run it.
-// The client resolves a mob's AI class as GetProp()->dwAI = m_pPropMover[m_dwIndex].dwAI - a flat array
-// indexed by species. Since record[i].dwID == i, this locates the array base + stride from the live
+// / moverprop_ai_off. Just stand where a few DISTINCT monster species are on screen and run it - NO target
+// needed. The client resolves a mob's AI class as GetProp()->dwAI = m_pPropMover[m_dwIndex].dwAI - a flat
+// array indexed by species. Since record[i].dwID == i, this locates the array base + stride from the live
 // species ids on screen, then pins dwAI's column by its shape (all-enum across species, >=1 monster,
-// richest 2/5/9 mix) and the stable global-pointer RVA. The pet only needs to be a valid selected mover -
-// its own dwAI may be AII_NONE/PET/EGG, we don't rely on it. Saves flyff.cfg (read-only except the cfg).
+// richest 2/5/9 mix) and the stable global-pointer RVA. (A selected mob's species is folded in as one more
+// anchor when present, but isn't required - there's no in-game way to target your own pet.) Saves flyff.cfg.
 cli_findprop :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
@@ -440,7 +440,7 @@ cli_findprop :: proc(session: ^Session, args: []string) {
   wv, wok := engine.read_value(handle, base + L.world_rva, pt)
   pv, pok := engine.read_value(handle, base + L.player_rva, pt)
   if !wok || !pok {
-    fmt.eprintln("could not read world/player anchors - run calibrate first.")
+    fmt.eprintln("could not read world/player anchors - run 'setup <name>' first.")
     return
   }
   world := uintptr(engine.value_as_u64(pt, wv))
@@ -450,7 +450,7 @@ cli_findprop :: proc(session: ^Session, args: []string) {
   if len(args) >= 2 && args[0] == "check" {
     if idv, idok := engine.parse_addr(args[1]); idok {
       if !prop_gate_ready(session) {
-        fmt.eprintln("prop gate not configured - run findprop (pet targeted) first.")
+        fmt.eprintln("prop gate not configured - run findprop (monsters on screen) first.")
         return
       }
       pb, pbok := engine.read_value(handle, base + L.propmover_rva, pt)
@@ -472,27 +472,35 @@ cli_findprop :: proc(session: ^Session, args: []string) {
     }
   }
 
-  fp, fok := engine.read_value(handle, world + uintptr(L.focus_off), pt)
-  if !fok {
-    fmt.eprintln("could not read the selection - run calibrate / findfocus first.")
-    return
+  // Optional selected target: if a mob/pet is selected we fold its species into the anchor pool (it's a
+  // trusted, rare id), but findprop no longer REQUIRES a selection. There's no in-game way to target your
+  // own pet, so the old "target your PET" ritual was a dead end - the on-screen monster species are equally
+  // valid array anchors (see the derivation below). A read failure just means nothing is selected.
+  focus: uintptr = 0
+  focus_id: u32 = 0
+  have_focus := false
+  if fp, fok := engine.read_value(handle, world + uintptr(L.focus_off), pt); fok {
+    focus = uintptr(engine.value_as_u64(pt, fp))
+    if focus != 0 && focus != player {
+      if fid, fidok := read_species(session, focus); fidok && fid != 0 && fid <= 0xFFFF {
+        focus_id = fid
+        have_focus = true
+      }
+    }
   }
-  focus := uintptr(engine.value_as_u64(pt, fp))
-  if focus == 0 || focus == player {
-    fmt.eprintln("target your PET first (target_closest <pet name>), with monsters on screen, then run findprop.")
-    return
+  fnm := ""
+  if have_focus {
+    fnm, _ = engine.read_obj_name(handle, ps, focus, L.name_off)
   }
-  focus_id, fidok := read_species(session, focus)
-  if !fidok || focus_id == 0 || focus_id > 0xFFFF {
-    fmt.eprintln("couldn't read the pet's species id - retry with the pet targeted.")
-    return
-  }
-  fnm, _ := engine.read_obj_name(handle, ps, focus, L.name_off)
 
   // `findprop check` -> classify the currently-targeted mob via the configured prop gate (verify).
   if len(args) >= 1 && args[0] == "check" {
+    if !have_focus {
+      fmt.eprintln("findprop check: select a mob first - this classifies the SELECTED target's species.")
+      return
+    }
     if !prop_gate_ready(session) {
-      fmt.eprintln("prop gate not configured - run findprop (pet targeted) first.")
+      fmt.eprintln("prop gate not configured - run findprop (monsters on screen) first.")
       return
     }
     pb, pbok := engine.read_value(handle, base + L.propmover_rva, pt)
@@ -536,120 +544,142 @@ cli_findprop :: proc(session: ^Session, args: []string) {
       }
     }
   }
-  dup := false
-  for x in ids {
-    if x == focus_id {
-      dup = true
-      break
+  if have_focus {
+    // Fold the selected target's species into the pool (dedup) - one more trusted, rare anchor.
+    dup := false
+    for x in ids {
+      if x == focus_id {
+        dup = true
+        break
+      }
+    }
+    if !dup {
+      append(&ids, focus_id)
     }
   }
-  if !dup {
-    append(&ids, focus_id)
-  }
   if len(ids) < 4 {
-    fmt.println("need more species variety on screen (a few different monsters + your pet). Move and retry.")
+    fmt.println("need more species variety on screen (a few different monsters). Move and retry.")
     return
   }
 
-  // Anchor1 = the pet's id (definitely valid). Some of the "live species" are garbage from coincidental
-  // world-ptr scan hits, so don't trust the single largest id; try several plausible ones (<= 5000).
-  // record[i].dwID == i, so for the right (R0, stride): u32(R0 + i*stride) == i for every real id.
-  anchor1 := focus_id
-  hitsA := scan_u32_addrs(session, anchor1)
-  if len(hitsA) == 0 {
-    fmt.println("pet species value not found in memory - retry with the pet targeted.")
-    return
+  // Locate the array by identity: record[i].dwID == i, so for the right (r0, stride) we get
+  // u32(r0 + i*stride) == i for every real species id. We anchor on the ON-SCREEN monster species - no
+  // target needs to be selected. (findprop used to require your PET selected as a "trusted" anchor, but
+  // there's no in-game way to target your own pet; the exact-match scoring below IS the trust - a wrong
+  // (r0,stride) matching several distinct ids exactly is astronomically unlikely, see the floor.) A common
+  // id (a player job) appears millions of times in memory and can't pair efficiently, so we scan each
+  // candidate once, keep only the RARE ones (small hit list), and try their address pairs rarest-first.
+  Anchor :: struct {
+    id:   u32,
+    hits: [dynamic]uintptr,
   }
-  cand2 := make([dynamic]u32, context.temp_allocator)
+  cand_ids := make([dynamic]u32, context.temp_allocator) // distinct plausible species (monster-range)
   for id in ids {
-    if id == anchor1 || id > 5000 {
-      continue
+    if id == 0 || id > 5000 {
+      continue // 0 = unset; >5000 tend to be non-species garbage from coincidental scan hits
     }
     seen := false
-    for x in cand2 {
+    for x in cand_ids {
       if x == id {
         seen = true
         break
       }
     }
     if !seen {
-      append(&cand2, id)
+      append(&cand_ids, id)
     }
   }
-  if len(cand2) == 0 {
-    fmt.println("need at least two distinct plausible species on screen.")
+  slice.sort(cand_ids[:])
+  slice.reverse(cand_ids[:]) // largest ids first (rarer in memory -> more likely to pair cheaply)
+  pool := make([dynamic]Anchor, context.temp_allocator)
+  for id in cand_ids {
+    if len(pool) >= 6 {
+      break // enough anchors; each is a full memory scan
+    }
+    h := scan_u32_addrs(session, id)
+    if len(h) == 0 || len(h) > 40000 {
+      continue // not found, or too common to pair efficiently
+    }
+    append(&pool, Anchor{id = id, hits = h})
+  }
+  if len(pool) < 2 {
+    fmt.println("need a few DISTINCT monster species on screen (couldn't find two rare array anchors). Move and retry.")
     return
   }
-  slice.sort(cand2[:]) // ascending; iterate from the back (largest ids = rarest in memory)
-  fmt.printfln("findprop: pet '%s' species %d; %d live species; anchor %d x%d; locating array...", fnm, focus_id, len(ids), anchor1, len(hitsA))
+  slice.sort_by(pool[:], proc(a, b: Anchor) -> bool {return len(a.hits) < len(b.hits)}) // rarest-first = cheapest pairs
+  fmt.printfln("findprop: %d live species, %d rare anchors; locating array...", len(ids), len(pool))
 
   best_r0 := i64(0)
   best_stride := i64(0)
   best_score := 0
   good := max(12, len(ids) / 3)
   tried := 0
-  anchors: for k := len(cand2) - 1; k >= 0; k -= 1 {
-    if tried >= 8 {
-      break
-    }
-    anchor2 := cand2[k]
-    hitsB := scan_u32_addrs(session, anchor2)
-    if len(hitsB) == 0 || len(hitsB) > 40000 {
-      continue // not found, or too common to pair efficiently
-    }
-    tried += 1
-    span := i64(anchor1) - i64(anchor2)
-    if span == 0 {
-      continue
-    }
-    pre_id := u32(0)
-    for id in ids {
-      if id != anchor1 && id != anchor2 {
-        pre_id = id
-        break
+  anchors: for ai in 0 ..< len(pool) {
+    anchor1 := pool[ai].id
+    hitsA := pool[ai].hits
+    for aj in 0 ..< len(pool) {
+      if aj == ai {
+        continue
       }
-    }
-    for a in hitsA {
-      aa := i64(a)
-      for b in hitsB {
-        d := aa - i64(b)
-        if d > 0x8000000 || d < -0x8000000 {
-          continue // records of one array are within ~128MB
+      if tried >= 12 {
+        break anchors
+      }
+      tried += 1
+      anchor2 := pool[aj].id
+      hitsB := pool[aj].hits
+      span := i64(anchor1) - i64(anchor2)
+      if span == 0 {
+        continue
+      }
+      pre_id := u32(0)
+      for id in ids {
+        if id != anchor1 && id != anchor2 {
+          pre_id = id
+          break
         }
-        if d % span != 0 {
-          continue
-        }
-        stride := d / span
-        if stride < 0x80 || stride > 0x20000 || stride % 4 != 0 {
-          continue
-        }
-        r0 := aa - i64(anchor1) * stride
-        if r0 <= 0 {
-          continue
-        }
-        // Cheap pre-check on a third id before the full validation (skips coincidental strides fast).
-        if pre_id != 0 {
-          if v, ok := engine.read_value(handle, uintptr(r0 + i64(pre_id) * stride), .U32);
-             !ok || u32(engine.value_as_u64(.U32, v)) != pre_id {
+      }
+      for a in hitsA {
+        aa := i64(a)
+        for b in hitsB {
+          d := aa - i64(b)
+          if d > 0x8000000 || d < -0x8000000 {
+            continue // records of one array are within ~128MB
+          }
+          if d % span != 0 {
             continue
           }
-        }
-        score := 0
-        for id in ids {
-          if v, ok := engine.read_value(handle, uintptr(r0 + i64(id) * stride), .U32); ok &&
-             u32(engine.value_as_u64(.U32, v)) == id {
-            score += 1
+          stride := d / span
+          if stride < 0x80 || stride > 0x20000 || stride % 4 != 0 {
+            continue
+          }
+          r0 := aa - i64(anchor1) * stride
+          if r0 <= 0 {
+            continue
+          }
+          // Cheap pre-check on a third id before the full validation (skips coincidental strides fast).
+          if pre_id != 0 {
+            if v, ok := engine.read_value(handle, uintptr(r0 + i64(pre_id) * stride), .U32);
+               !ok || u32(engine.value_as_u64(.U32, v)) != pre_id {
+              continue
+            }
+          }
+          score := 0
+          for id in ids {
+            if v, ok := engine.read_value(handle, uintptr(r0 + i64(id) * stride), .U32); ok &&
+               u32(engine.value_as_u64(.U32, v)) == id {
+              score += 1
+            }
+          }
+          if score > best_score {
+            best_score = score
+            best_r0 = r0
+            best_stride = stride
           }
         }
-        if score > best_score {
-          best_score = score
-          best_r0 = r0
-          best_stride = stride
-        }
       }
-    }
-    if best_score >= good {
-      break anchors
+      if best_score >= good {
+        break anchors
+      }
     }
   }
   // Acceptance floor. Each match is an EXACT record[i].dwID == i at a computed offset, and the (r0,stride)
@@ -711,10 +741,16 @@ cli_findprop :: proc(session: ^Session, args: []string) {
     }
   }
   if ai_off < 0 {
+    // Dump a real species' record so the column can be picked by eye: the selected target if any, else
+    // the first live species id.
+    sample_id := focus_id
+    if !have_focus && len(ids) > 0 {
+      sample_id = ids[0]
+    }
     fmt.printfln("  found the array (propbase 0x%X rva 0x%X stride 0x%X) but not a clean dwAI column.", propbase, propmover_rva, stride)
-    fmt.print("  pet record dump (+off=value):")
+    fmt.printf("  record[%d] dump (+off=value):", sample_id)
     for o := i64(0); o < 0x180; o += 4 {
-      if v, ok := engine.read_value(handle, propbase + uintptr(i64(focus_id) * stride + o), .U32); ok {
+      if v, ok := engine.read_value(handle, propbase + uintptr(i64(sample_id) * stride + o), .U32); ok {
         fmt.printf(" +0x%X=%d", o, u32(engine.value_as_u64(.U32, v)))
       }
     }
@@ -725,9 +761,13 @@ cli_findprop :: proc(session: ^Session, args: []string) {
   session.layout.propmover_rva = propmover_rva
   session.layout.moverprop_stride = stride
   session.layout.moverprop_ai_off = ai_off
-  pet_ai := read_prop_ai(session, propbase, focus_id)
   fmt.printfln("  propmover_rva=0x%X moverprop_stride=0x%X moverprop_ai_off=0x%X", propmover_rva, stride, ai_off)
-  fmt.printfln("  validation: pet '%s' (species %d) dwAI=%d; %d/%d live species read AII_MONSTER(2).", fnm, focus_id, pet_ai, best_two, len(ids))
+  if have_focus {
+    sel_ai := read_prop_ai(session, propbase, focus_id)
+    fmt.printfln("  validation: selected '%s' (species %d) dwAI=%d; %d/%d live species read AII_MONSTER(2).", fnm, focus_id, sel_ai, best_two, len(ids))
+  } else {
+    fmt.printfln("  validation: %d/%d live species read AII_MONSTER(2).", best_two, len(ids))
+  }
   if flyff_save_cfg(session.layout, flyff_cfg_path()) {
     fmt.println("saved to flyff.cfg. run 'auto off' then 'auto any' - it now skips pets / eggs / NPCs / players by species.")
   }
@@ -1229,6 +1269,88 @@ cli_objscan :: proc(session: ^Session, args: []string) {
     off += 4
   }
   fmt.println("(done)")
+}
+
+// findpenya <current-penya> [span] - pin penya_off (the player's inline gold field) by its known
+// value, so the radar can pop the REAL '+N penya' on each loot pickup. Read your penya off the game
+// UI and pass it in (the "ask the tool a fact the game shows" flow). Scans the player CMover for a
+// 4-byte field == <value>; a distinct penya value is essentially unique in the object, so a single
+// match auto-pins. On multiple matches it lists them and does NOT guess - kill a mob and re-run with
+// the NEW penya (a fresh unique value resolves to one), or 'set penya_off 0x..'. span defaults to
+// 0x4000 (the stat block reaches ~0x2900). Read as u32 (classic Flyff DWORD gold).
+cli_findpenya :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if session.ptr_size != 4 {
+    fmt.eprintln("findpenya: targets the 32-bit Neuz.exe.")
+    return
+  }
+  if len(args) < 1 {
+    fmt.eprintln("usage: findpenya <current-penya> [span]   (read your penya off the game UI)")
+    return
+  }
+  val, vok := strconv.parse_i64(args[0])
+  if !vok || val < 0 {
+    fmt.eprintfln("bad penya value: %s (want a non-negative number)", args[0])
+    return
+  }
+  span := 0x4000
+  if len(args) >= 2 {
+    if s, sok := strconv.parse_i64(args[1]); sok && s > 0 {
+      span = int(s)
+    }
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  pt := engine.Value_Type.U32
+  pv, pok := engine.read_value(handle, base + session.layout.player_rva, pt)
+  if !pok {
+    fmt.eprintln("could not read the player anchor - are you in-game? (else run 'setup <name>' first).")
+    return
+  }
+  player := uintptr(engine.value_as_u64(pt, pv))
+  if player == 0 {
+    fmt.eprintln("player anchor is null - be fully in-game, then re-run.")
+    return
+  }
+  target := u32(val)
+  buf := make([]byte, span, context.temp_allocator)
+  n, rok := engine.read_into(handle, player, buf)
+  if !rok || n < 4 {
+    fmt.eprintln("could not read the player object.")
+    return
+  }
+  // collect every 4-aligned offset holding the value
+  cands := make([dynamic]i64, context.temp_allocator)
+  o := 0
+  for o + 4 <= int(n) {
+    v := u32(buf[o]) | u32(buf[o + 1]) << 8 | u32(buf[o + 2]) << 16 | u32(buf[o + 3]) << 24
+    if v == target {
+      append(&cands, i64(o))
+    }
+    o += 4
+  }
+  switch len(cands) {
+  case 0:
+    fmt.printfln("findpenya: no field == %d in the player object (first 0x%X bytes).", val, span)
+    fmt.println("  is the value exact (current, not max)? penya over ~4.29e9 is 64-bit - not handled yet.")
+    fmt.println("  try a wider span, e.g.: findpenya <penya> 0x8000")
+  case 1:
+    session.layout.penya_off = cands[0]
+    fmt.printfln("penya_off = 0x%X (unique match for %d).", cands[0], val)
+    if flyff_save_cfg(session.layout, flyff_cfg_path()) {
+      fmt.printfln("saved -> %s", flyff_cfg_path())
+    }
+  case:
+    fmt.printfln("findpenya: %d fields hold %d - ambiguous, NOT pinned:", len(cands), val)
+    for c in cands {
+      fmt.printfln("  +0x%X", c)
+    }
+    fmt.println("  disambiguate: kill a mob and re-run 'findpenya <new-penya>' (a fresh unique value")
+    fmt.println("  resolves to one), or pick from the list: 'set penya_off 0x<off>'.")
+  }
 }
 
 // ---------------------------------------------------------------------------

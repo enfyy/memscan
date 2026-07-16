@@ -1,9 +1,11 @@
 package flyff
 
 import "core:fmt"
+import "core:math/rand"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+
 import "../engine"
 
 // Auto-farm: the hands-free farming layer on top of the selection logic in target.odin - the
@@ -113,6 +115,8 @@ auto_monitor :: proc(session: ^Session, focus: uintptr, now: i64) {
     }
     session.auto_focus_obj = 0
     session.auto_last = 0
+    session.auto_next_set = false // the precompute for this abandoned target is stale
+    session.auto_next_for = 0
     fmt.printf("\n[auto] '%s' blocked (d=%.1f) - skipping\n", name, d)
     fmt.print("memscan> ")
   }
@@ -206,10 +210,25 @@ auto_tick :: proc(session: ^Session) {
     pause_tick(session, now)
     return
   }
-  // A live target is still selected: watch it for obstacle-stuck (every tick, unthrottled) and wait.
+  // A live target is still selected: watch it for obstacle-stuck (every tick, unthrottled) and, while
+  // we fight it, precompute the NEXT target so the advance is instant when it dies (pre-select).
   if focus, fok := read_focus_ptr(session); fok && focus != 0 && focus_obj_live(session, focus) {
     if session.auto_stuck_on {
       auto_monitor(session, focus, now)
+    }
+    if session.preselect_on && focus != session.auto_next_for {
+      // One precompute per distinct locked target: a full enumeration (~same cost as the old post-kill
+      // scan, just moved earlier). Mark it handled up front so a nok result doesn't rescan every tick.
+      session.auto_next_for = focus
+      session.auto_next_set = false
+      if nobj, npos, nok := tc_precompute_next(session, session.auto_names[:], focus); nok {
+        session.auto_next_obj = nobj
+        session.auto_next_pos = npos
+        session.auto_next_set = true
+      }
+    }
+    if session.lookalive_on {
+      lookalive_jump_tick(session, focus, now) // occasional jump while travelling to the target
     }
     return
   }
@@ -246,8 +265,40 @@ auto_tick :: proc(session: ^Session) {
       return
     }
   }
-  // Advance to the next mob. Selection itself is silent now - no print unless something died above.
-  tc_select(session, session.auto_names[:], true)
+  // Look-alive: a randomized "human reaction" hesitation before engaging the next target (delayed
+  // lock-on). Holds the whole advance - including the pre-select fast-commit - so we don't insta-lock
+  // onto the next mob the instant the current one dies. The kill above is still counted immediately.
+  if session.lookalive_on {
+    if session.lookalive_hold_until == 0 {
+      session.lookalive_hold_until = now + lookalive_rand_ns(LA_HOLD_MIN_NS, LA_HOLD_MAX_NS)
+      return
+    }
+    if now < session.lookalive_hold_until {
+      return // still hesitating
+    }
+    session.lookalive_hold_until = 0 // hold elapsed - engage now; re-armed on the next kill
+  }
+  // Advance to the next mob. Pre-select fast path: if we precomputed a next target during combat (and
+  // this isn't a stuck-skip, which needs the reactive avoid steer), commit it instantly with no scan.
+  // focus_set_obj re-validates it (freed/moved/model-less -> WentStale), so on any staleness we fall
+  // through to the reactive tc_select scan - worst case is today's behavior, best case is instant.
+  advanced := false
+  if session.preselect_on && session.auto_next_set && !session.auto_avoid_on {
+    nobj := session.auto_next_obj
+    npos := session.auto_next_pos
+    session.auto_next_set = false
+    if focus_set_obj(session, nobj, session.auto_names[:]) == .Picked {
+      session.auto_sel_pos = npos // mirror tc_select's post-pick bookkeeping (kill detect + anchor)
+      session.auto_sel_obj = nobj
+      session.auto_sel_set = true
+      advanced = true
+    }
+  }
+  session.auto_next_for = 0 // re-arm the precompute for whatever target we land on
+  if !advanced {
+    // Selection itself is silent now - no print unless something died above.
+    tc_select(session, session.auto_names[:], true)
+  }
   session.auto_last = now
 }
 
@@ -326,7 +377,7 @@ auto_set_names :: proc(session: ^Session, names: []string) {
 // yet, warn that pets / other players / NPCs will also be targeted, and point at the one-time fix.
 auto_warn_mobgate :: proc(session: ^Session) {
   if len(session.auto_names) == 0 && !prop_gate_ready(session) {
-    fmt.println("  note: any-monster mode will also target pets / players / NPCs until you run 'findprop' once (target your pet, with monsters on screen).")
+    fmt.println("  note: any-monster mode will also target pets / players / NPCs until you run 'findprop' once (a few distinct monsters on screen; no target needed).")
   }
 }
 
@@ -344,6 +395,11 @@ auto_stop :: proc(session: ^Session) {
   session.last_kill_set = false
   session.auto_paused = false
   session.pause_obj = 0
+  session.auto_next_set = false
+  session.auto_next_for = 0
+  session.auto_next_obj = 0
+  session.lookalive_hold_until = 0 // run-state only; lookalive_on persists (a mode toggle)
+  session.lookalive_jump_at = 0
   clear(&session.auto_blocked)
 }
 
@@ -371,6 +427,14 @@ cli_auto :: proc(session: ^Session, args: []string) {
   if len(args) == 0 && session.auto_on {
     state := session.auto_paused ? "ARMED/paused" : "ON"
     fmt.printfln("auto-farm %s: %s.  %s", state, auto_target_desc(session.auto_names[:]), auto_stats(session, time.now()._nsec))
+    fmt.printfln(
+      "  stuck:%s  preselect:%s  lookalive:%s  reachgate:%s  density_w:%v",
+      session.auto_stuck_on ? "on" : "off",
+      session.preselect_on ? "on" : "off",
+      session.lookalive_on ? "on" : "off",
+      session.reach_gate_on ? "on" : "off",
+      session.layout.density_weight,
+    )
     return
   }
 
@@ -449,6 +513,122 @@ cli_stuck :: proc(session: ^Session, args: []string) {
     return
   }
   fmt.printfln("stuck-detection %s.", session.auto_stuck_on ? "ON" : "OFF")
+}
+
+// preselect | preselect on|off -> toggle pre-selection: while fighting a mob, precompute the NEXT target
+// and commit it the instant the current one dies, removing the ~0.5s post-kill enumeration gap. On by
+// default. This is purely a latency/smoothness setting - it never changes WHICH mob auto picks (same
+// cascade as the reactive path), only WHEN the enumeration runs. Turn off to revert to scan-after-kill.
+cli_preselect :: proc(session: ^Session, args: []string) {
+  switch {
+  case len(args) == 0:
+    session.preselect_on = !session.preselect_on
+  case len(args) == 1 && args[0] == "on":
+    session.preselect_on = true
+  case len(args) == 1 && args[0] == "off":
+    session.preselect_on = false
+  case:
+    fmt.eprintln("usage: preselect [on|off]")
+    return
+  }
+  if !session.preselect_on {
+    session.auto_next_set = false // drop any cached pick so a re-enable starts fresh
+    session.auto_next_for = 0
+  }
+  fmt.printfln("pre-select %s.", session.preselect_on ? "ON" : "OFF")
+}
+
+// ===========================================================================
+// Look-alive mode: opt-in human-like farming for low-spawn quest grinds.
+// ===========================================================================
+
+// Look-alive tuning. The post-kill hesitation before engaging the next target (delayed lock-on) and the
+// interval between travel-jumps are each randomized per event, so the cadence never reads as robotic.
+LA_HOLD_MIN_NS :: i64(800_000_000) // 0.8s min hesitation before locking the next target
+LA_HOLD_MAX_NS :: i64(3_000_000_000) // 3.0s max
+LA_JUMP_MIN_NS :: i64(4_000_000_000) // 4s min between travel-jump attempts
+LA_JUMP_MAX_NS :: i64(12_000_000_000) // 12s max
+LA_JUMP_MIN_DIST :: f32(8.0) // only jump while still this far from the target (travelling, not in melee)
+
+lookalive_seeded: bool // one-time seed guard for the look-alive RNG (see lookalive_rand_ns)
+
+// Uniform random duration in [lo, hi) nanoseconds for look-alive's jitter. Seeds the context random
+// generator once from the wall clock (on the watcher thread, which owns a valid default context) so runs
+// don't repeat the same delay pattern. Returns lo when the range is empty/inverted.
+lookalive_rand_ns :: proc(lo, hi: i64) -> i64 {
+  if !lookalive_seeded {
+    rand.reset_u64(u64(time.now()._nsec))
+    lookalive_seeded = true
+  }
+  if hi <= lo {
+    return lo
+  }
+  return rand.int64_range(lo, hi)
+}
+
+// Silent check that the jump primitive is fully configured (mirrors jump_ready without its eprintln
+// output), so the look-alive hot loop can skip jumps quietly when char-control ('findmove') isn't set up.
+jump_configured :: proc(session: ^Session) -> bool {
+  if !session.attached || session.ptr_size != 4 {
+    return false
+  }
+  return sendactmsg_rva_sane(session) && session.layout.actmover_off != 0 && session.layout.jump_msg != 0
+}
+
+// Fire one look-alive jump: the client's own SendActMsg(jump), then broadcast the jump state so other
+// clients see it (best-effort - both primitives no-op silently when unconfigured). No console output.
+lookalive_do_jump :: proc(session: ^Session) {
+  if ret, ok := remote_send_actmsg(session, session.layout.jump_msg); ok && ret == 1 {
+    remote_send_playermoved(session)
+  }
+}
+
+// Per-tick travel-jump scheduler (look-alive). Jumps at randomized intervals, but only while still
+// travelling to the target (>= LA_JUMP_MIN_DIST away) so we don't hop in place during melee. Seeds the
+// first interval instead of jumping on the very first tick.
+lookalive_jump_tick :: proc(session: ^Session, focus: uintptr, now: i64) {
+  if !jump_configured(session) {
+    return
+  }
+  if session.lookalive_jump_at == 0 {
+    session.lookalive_jump_at = now + lookalive_rand_ns(LA_JUMP_MIN_NS, LA_JUMP_MAX_NS)
+    return
+  }
+  if now < session.lookalive_jump_at {
+    return
+  }
+  session.lookalive_jump_at = now + lookalive_rand_ns(LA_JUMP_MIN_NS, LA_JUMP_MAX_NS)
+  ppos, pok := read_player_pos(session)
+  tpos, tok := engine.read_vec3(session.proc_info.handle, focus + uintptr(session.layout.pos_off))
+  if pok && tok && engine.dist_horizontal(ppos, tpos) >= LA_JUMP_MIN_DIST {
+    lookalive_do_jump(session)
+  }
+}
+
+// lookalive | lookalive on|off -> toggle look-alive mode (opt-in). When on, auto farms more like a human:
+// a random hesitation before engaging each new target (delayed lock-on) plus occasional jumps while
+// travelling to one. Deliberately less efficient than the snappy loop - for low-spawn quest grinds where
+// AFK-looking farming is the concern - so it's OFF by default. Jumps need 'findmove'; without it the
+// hesitation still applies and jumps are skipped.
+cli_lookalive :: proc(session: ^Session, args: []string) {
+  switch {
+  case len(args) == 0:
+    session.lookalive_on = !session.lookalive_on
+  case len(args) == 1 && args[0] == "on":
+    session.lookalive_on = true
+  case len(args) == 1 && args[0] == "off":
+    session.lookalive_on = false
+  case:
+    fmt.eprintln("usage: lookalive [on|off]")
+    return
+  }
+  session.lookalive_hold_until = 0
+  session.lookalive_jump_at = 0
+  note := ""
+  if session.lookalive_on && !jump_configured(session) {
+    note = "  (jumps need 'findmove'; delayed lock-on still active)"
+  }
+  fmt.printfln("look-alive %s.%s", session.lookalive_on ? "ON" : "OFF", note)
 }
 
 // reachgate | reachgate on|off -> toggle the PROACTIVE reach filter for auto: skip candidate mobs whose

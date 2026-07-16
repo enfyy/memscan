@@ -95,6 +95,7 @@ TC_Stage :: enum {
   Avoid,
   Pocket,
   Nearest,
+  Density,
   Excluded,
 }
 
@@ -118,6 +119,8 @@ Pick_Ctx :: struct {
   engage:        f32, // bow/pocket radius (BOW_RANGE today)
   recent:        []TC_Recent, // cooldown set (skip just-killed); session.tc_recent live, a copy in sim
   blocked:       []TC_Recent, // stuck-blacklist set; session.auto_blocked live, a copy in sim
+  density:       []int, // per-candidate local pack size (index-aligned to cands); nil = don't score
+  density_w:     f32, // density_weight (world units); 0 = disabled (strict-nearest walk fallback)
 }
 
 // Skip test for one candidate: already consumed (alive[i]==false), on the recently-targeted cooldown,
@@ -179,10 +182,13 @@ tc_pick_one :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: [
       return i, .Avoid
     }
   }
-  // Bow-range retarget: if an eligible mob is within engage range, stay on the pack - pick the in-range
-  // mob nearest the last kill's spot rather than the one nearest us. Falls through to plain nearest when
-  // nothing eligible is in range (walk to the next pocket).
-  if ctx.require_fresh && ctx.last_kill_set {
+  // Bow-range retarget ("stay on the pack"): if an eligible mob is within engage range, pick the in-range
+  // mob nearest the last kill's spot rather than the one nearest us. This is part of the CLUSTERING brain,
+  // so it's gated behind density steering (density_w > 0) - with density OFF the picker falls straight to
+  // plain nearest, i.e. the simple/legacy behaviour, no matter how large attack_range (engage) is. (Before,
+  // this pass only ever fired point-blank because attack_range was tiny; a large attack_range turned it on
+  // and spread picks across the whole range - hence "density off must behave exactly like before".)
+  if ctx.require_fresh && ctx.density_w > 0 && ctx.last_kill_set {
     best := -1
     best_ad := f32(1e30)
     for c, i in cands {
@@ -200,6 +206,29 @@ tc_pick_one :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: [
     }
     if best >= 0 {
       return best, .Pocket
+    }
+  }
+  // Density-steered walk pick: with density steering on (auto only, density_w > 0), when nothing eligible
+  // is in engage range this stage chooses WHICH pack to walk to next - the eligible candidate maximizing
+  // pack size vs travel distance (score = pack * W / (W + d)), so we head for a dense cluster instead of
+  // the nearest lone straggler. A denser-but-farther pack only wins when its size beats the distance
+  // penalty. With all packs equal (e.g. every mob isolated, pack==1) the score is monotone in -d, so it
+  // reduces to the strict-nearest pick below - fully backward-compatible when density_w == 0.
+  if ctx.require_fresh && ctx.density_w > 0 && len(ctx.density) == len(cands) {
+    best := -1
+    best_score := f32(-1)
+    for c, i in cands {
+      if tc_cand_skip(session, ctx, cands, i, alive) {
+        continue
+      }
+      score := f32(ctx.density[i]) * ctx.density_w / (ctx.density_w + c.d)
+      if score > best_score {
+        best_score = score
+        best = i
+      }
+    }
+    if best >= 0 {
+      return best, .Density
     }
   }
   // Fallback: the nearest eligible mob.
@@ -425,6 +454,38 @@ tc_collect_cands :: proc(
   return cands
 }
 
+// The density scorer's neighborhood radius (world units) - what counts as one "pack". Derived from the
+// engage range so it scales with reach, floored so a melee character (tiny engage) still sees real
+// clusters rather than only point-blank neighbors.
+density_radius :: proc(engage: f32) -> f32 {
+  r := engage * 2
+  if r < DENSITY_R_MIN {
+    r = DENSITY_R_MIN
+  }
+  return r
+}
+
+// Local PACK SIZE per candidate: how many candidates (including itself) lie within `r` horizontally.
+// Index-aligned to `cands`; O(n^2) over the candidate set (tens-to-~150) so sub-millisecond. Run once
+// per pick and carried in Pick_Ctx.density, so the live picker (tc_select) and the debug predictor
+// (tc_predict_order) score identically. A lone mob has pack size 1. Temp-allocated.
+compute_densities :: proc(cands: []TC_Cand, r: f32) -> []int {
+  out := make([]int, len(cands), context.temp_allocator)
+  r2 := r * r
+  for a, i in cands {
+    c := 0
+    for b in cands {
+      dx := a.pos[0] - b.pos[0]
+      dz := a.pos[2] - b.pos[2]
+      if dx * dx + dz * dz <= r2 {
+        c += 1 // counts itself (d=0), so pack size is always >= 1
+      }
+    }
+    out[i] = c
+  }
+  return out
+}
+
 // True if <cand_pos> lies on the opposite side of the player from <avoid> (a horizontal x,z delta
 // pointing at the mob we just got stuck on). Only the sign of the dot matters, so no normalization
 // is needed - a zero/degenerate avoid yields dot 0 (not opposite), so nothing qualifies and the
@@ -442,6 +503,46 @@ TC_Result :: enum {
   WentStale, // chosen obj was freed/reallocated between enumeration and the write
   AnchorFail, // couldn't read the world/player anchors (not in-game / wrong build)
   WriteFail, // the focus write failed (message already printed)
+}
+
+// Write <obj> into m_pObjFocus (the selected-target field) with the client-safe crash-guard +
+// server-notify. Shared by tc_select (its distance-picked mob), the `target_at` command, and the
+// radar's click-to-target - so all three go through one guard+write+notify. Re-validates <obj> with
+// obj_is_selectable IMMEDIATELY before the write (it can be freed between the caller picking it and
+// here); writing a stale/model-less pointer crashes the client's selection-render, so a failed guard
+// returns .WentStale instead of writing. <names> gates the re-check (empty = any mover, e.g. a radar
+// click targets whatever you clicked). Marks the pick on the recently-targeted cooldown so a later
+// `auto` doesn't immediately re-skip it. Caller MUST hold exec_mutex.
+focus_set_obj :: proc(session: ^Session, obj: uintptr, names: []string) -> TC_Result {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  pt := engine.Value_Type.U64
+  if session.ptr_size == 4 {
+    pt = .U32
+  }
+  wv, wok := engine.read_value(handle, base + session.layout.world_rva, pt)
+  if !wok {
+    return .AnchorFail
+  }
+  world := uintptr(engine.value_as_u64(pt, wv))
+  if world == 0 {
+    return .AnchorFail
+  }
+  focus_addr := world + uintptr(session.layout.focus_off)
+  if !obj_is_selectable(session, obj, names) {
+    return .WentStale
+  }
+  tc_mark_recent(session, obj, time.now()._nsec)
+  if !engine.write_value(handle, focus_addr, pt, engine.ptr_to_value(obj, session.ptr_size)) {
+    fmt.eprintfln("write failed at focus 0x%X (error %d)", focus_addr, win.GetLastError())
+    return .WriteFail
+  }
+  // Server sync: make the client emit its own SendSetTarget so the server registers the same target
+  // (stops the after-N-kills DC). Inert unless 'srvsync on' and the srvsync offsets are configured.
+  if session.srvsync_on {
+    notify_server_target(session, obj)
+  }
+  return .Picked
 }
 
 // Resolve the Flyff world/player anchors, enumerate selectable movers named <name>, pick
@@ -479,7 +580,6 @@ tc_select :: proc(
   }
   world := uintptr(engine.value_as_u64(pt, wv))
   player := uintptr(engine.value_as_u64(pt, pv))
-  focus_addr := world + uintptr(session.layout.focus_off)
   player_pos, ppok := engine.read_vec3(handle, player + uintptr(session.layout.pos_off))
   if !ppok {
     return .AnchorFail, 0, 0, 0, 0
@@ -498,6 +598,12 @@ tc_select :: proc(
   // next mob after each kill.
   now := time.now()._nsec
   melee, engage := pick_ranges(session)
+  // Density steering (auto only): precompute per-candidate pack sizes so the walk-target fallback can
+  // prefer clusters. Skipped entirely when off (weight 0) or for manual picks, so tc pays no O(n^2) cost.
+  dens: []int = nil
+  if require_fresh && session.layout.density_weight > 0 {
+    dens = compute_densities(cands[:], density_radius(engage))
+  }
   ctx := Pick_Ctx {
     player_pos    = player_pos,
     world         = world,
@@ -514,6 +620,8 @@ tc_select :: proc(
     engage        = engage,
     recent        = session.tc_recent[:],
     blocked       = session.auto_blocked[:],
+    density       = dens,
+    density_w     = session.layout.density_weight,
   }
   idx, _ := tc_pick_one(session, cands[:], ctx, nil)
   if idx < 0 {
@@ -526,17 +634,11 @@ tc_select :: proc(
   }
   chosen := cands[idx]
   sel = idx
-  // Re-validate immediately before the write. The object can be freed/reallocated between
-  // enumeration and now; writing a stale pointer whose m_pModel has gone NULL crashes the
-  // client. This shrinks the TOCTOU window from ~ms (the sort/pick above) to ~µs.
-  if !obj_is_selectable(session, chosen.obj, names) {
-    return .WentStale, 0, 0, 0, total
-  }
-  tc_mark_recent(session, chosen.obj, now)
-
-  if !engine.write_value(handle, focus_addr, pt, engine.ptr_to_value(chosen.obj, session.ptr_size)) {
-    fmt.eprintfln("write failed at focus 0x%X (error %d)", focus_addr, win.GetLastError())
-    return .WriteFail, chosen.obj, chosen.d, sel, total
+  // Guard-revalidate + write m_pObjFocus + server-notify via the shared helper. It re-checks
+  // obj_is_selectable immediately before the write (shrinking the TOCTOU window from the ~ms
+  // sort/pick above to ~µs), so a freed/model-less pointer is refused, not written.
+  if r := focus_set_obj(session, chosen.obj, names); r != .Picked {
+    return r, chosen.obj, chosen.d, sel, total
   }
   if require_fresh {
     // Remember this mob (obj + where it was) so auto_tick can confirm it actually died before it
@@ -545,12 +647,93 @@ tc_select :: proc(
     session.auto_sel_obj = chosen.obj
     session.auto_sel_set = true
   }
-  // Server sync: also make the client emit its own SendSetTarget so the server registers the
-  // same target (stops the after-N-kills DC). Inert unless 'srvsync on' and Phase-0 configured.
-  if session.srvsync_on {
-    notify_server_target(session, chosen.obj)
-  }
   return .Picked, chosen.obj, chosen.d, sel, total
+}
+
+// Pre-select: compute (but do NOT select) the mob auto would advance to AFTER the current target dies, so
+// auto_tick can commit it the instant focus clears - removing the ~0.5s post-kill enumeration gap. Reuses
+// the live cascade (tc_collect_cands + tc_pick_one) so it never drifts from tc_select. <current_focus> is
+// the mob we're still fighting: it's EXCLUDED from the pick (added to a local cooldown copy, since it may
+// have outlived TC_RECENT_NS during a long fight) and its live position anchors the pocket pass (that's
+// where we'll be standing when it dies, so the next pick stays on this pack). Read-only: no focus write,
+// no cooldown mark - both happen when auto_tick actually commits the pick (focus_set_obj). ok=false when
+// the anchors fail or nothing else is eligible, so the caller just falls back to the reactive tc_select.
+tc_precompute_next :: proc(
+  session: ^Session,
+  names: []string,
+  current_focus: uintptr,
+) -> (
+  obj: uintptr,
+  pos: [3]f32,
+  ok: bool,
+) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  pt := engine.Value_Type.U64
+  if session.ptr_size == 4 {
+    pt = .U32
+  }
+  wv, wok := engine.read_value(handle, base + session.layout.world_rva, pt)
+  pv, pok := engine.read_value(handle, base + session.layout.player_rva, pt)
+  if !wok || !pok {
+    return 0, {}, false
+  }
+  world := uintptr(engine.value_as_u64(pt, wv))
+  player := uintptr(engine.value_as_u64(pt, pv))
+  player_pos, ppok := engine.read_vec3(handle, player + uintptr(session.layout.pos_off))
+  if !ppok {
+    return 0, {}, false
+  }
+
+  cands := tc_collect_cands(session, names, world, player, player_pos)
+  if len(cands) == 0 {
+    return 0, {}, false
+  }
+
+  now := time.now()._nsec
+  melee, engage := pick_ranges(session)
+  dens: []int = nil
+  if session.layout.density_weight > 0 {
+    dens = compute_densities(cands[:], density_radius(engage))
+  }
+  // Anchor the pocket pass to the mob we're about to kill (its live position), so the next pick stays on
+  // this pack; fall back to the live last-kill anchor, then the player, if the focus pos can't be read.
+  anchor := player_pos
+  anchor_set := session.last_kill_set
+  if anchor_set {
+    anchor = session.last_kill_pos
+  }
+  if fpos, fok := engine.read_vec3(handle, current_focus + uintptr(session.layout.pos_off)); fok {
+    anchor = fpos
+    anchor_set = true
+  }
+  // Exclude the current focus from the pick via a local cooldown copy (never mutate session state here).
+  local_recent := make([dynamic]TC_Recent, context.temp_allocator)
+  append(&local_recent, ..session.tc_recent[:])
+  append(&local_recent, TC_Recent{obj = current_focus, t = now})
+  ctx := Pick_Ctx {
+    player_pos    = player_pos,
+    world         = world,
+    now           = now,
+    name_filtered = len(names) > 0,
+    require_fresh = true,
+    gate          = session.reach_gate_on,
+    fence_on      = session.fence.active,
+    avoid_on      = false, // pre-select never runs the one-shot stuck-avoid steer
+    last_kill_set = anchor_set,
+    last_kill_pos = anchor,
+    melee         = melee,
+    engage        = engage,
+    recent        = local_recent[:],
+    blocked       = session.auto_blocked[:],
+    density       = dens,
+    density_w     = session.layout.density_weight,
+  }
+  idx, _ := tc_pick_one(session, cands[:], ctx, nil)
+  if idx < 0 {
+    return 0, {}, false
+  }
+  return cands[idx].obj, cands[idx].pos, true
 }
 
 // One-shot: select the nearest selectable mover matching <name> by writing it into
@@ -586,6 +769,39 @@ cli_target_closest :: proc(session: ^Session, args: []string) {
   }
 }
 
+// target_at <addr> (alias tat) - select the EXACT object at <addr> (a raw CObj*), writing it into
+// m_pObjFocus with the same crash-guard + server-notify as `tc`. Unlike `target_closest` (name +
+// distance, which re-scans and could pick a different same-named mob), this pins the one object you
+// name - it's the headless-testable primitive behind the radar's click-to-target (grab a live CObj*
+// with `mobs`, then `target_at 0x..`). Refuses a freed / model-less / non-mover pointer (writing one
+// crashes the client's selection-render). <addr> is decimal or 0x-hex.
+cli_target_at :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if len(args) < 1 {
+    fmt.eprintln("usage: target_at <addr>   (a live CObj* - e.g. an address from 'mobs')")
+    return
+  }
+  v, ok := engine.parse_addr(args[0])
+  if !ok {
+    fmt.eprintfln("bad address: %s", args[0])
+    return
+  }
+  obj := uintptr(v)
+  switch focus_set_obj(session, obj, nil) {
+  case .Picked:
+    fmt.printfln("targeted obj=0x%X.", obj)
+  case .WentStale:
+    fmt.printfln("obj 0x%X is not a live selectable mover (freed / model-less / wrong type) - not written.", obj)
+  case .AnchorFail:
+    fmt.eprintln("could not read world anchor (wrong build or not in-game?).")
+  case .WriteFail: // focus_set_obj already printed the specific error
+  case .NoCandidates, .AllOnCooldown: // not returned by focus_set_obj
+  }
+}
+
 AUTO_MIN_INTERVAL_NS :: i64(30_000_000) // ~300ms between advance attempts (caps idle rescans)
 
 // Stuck / obstacle detection tuning (see auto_monitor). While a target is focused we watch the
@@ -606,6 +822,10 @@ BOW_RANGE :: f32(16.0)
 // priority (name-filtered auto only). Capped to the engage range. See the melee pass in tc_pick_one.
 MELEE_RANGE :: f32(1.7)
 
+// Floor for the density scorer's pack radius (density_radius), so a melee character with a tiny engage
+// range still bins nearby mobs into real clusters rather than only counting point-blank neighbors.
+DENSITY_R_MIN :: f32(15.0)
+
 // The picker's two range thresholds, derived from the configured attack_range - horizontal (ground-plane)
 // distances, matching tc_collect_cands. engage = your attack_range (the reach at which you can hit a mob,
 // so the picker stays on the pack instead of walking to the strict-nearest); falls back to BOW_RANGE when
@@ -621,6 +841,42 @@ pick_ranges :: proc(session: ^Session) -> (melee: f32, engage: f32) {
     melee = engage
   }
   return
+}
+
+// The weight `density on` sets - a moderate cluster bias. Tune with `density <n>` (~5 mild, ~40 strong).
+DENSITY_ON_DEFAULT :: f32(20)
+
+// density [on|off|<weight>] - toggle the auto-picker's cluster steering. OFF (weight 0) is the SIMPLE
+// picker: it targets the plain nearest eligible mob and the stay-on-the-pack passes (pocket + density) are
+// both inert, so a large attack_range never spreads picks - exactly the legacy behaviour. ON steers auto
+// toward dense mob packs and keeps it on the current pack between kills. No arg just prints the state.
+// Persisted to flyff.cfg (it's the same field as `set density_weight`). See tc_pick_one.
+cli_density :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if len(args) >= 1 {
+    switch strings.to_lower(args[0]) {
+    case "on":
+      session.layout.density_weight = DENSITY_ON_DEFAULT
+    case "off":
+      session.layout.density_weight = 0
+    case:
+      if v, ok := strconv.parse_f64(args[0]); ok && v >= 0 {
+        session.layout.density_weight = f32(v)
+      } else {
+        fmt.eprintln("usage: density [on|off|<weight>]   (weight >= 0; ~5 mild, ~40 strong)")
+        return
+      }
+    }
+    flyff_save_cfg(session.layout, flyff_cfg_path())
+  }
+  if w := session.layout.density_weight; w > 0 {
+    fmt.printfln("density steering: ON (weight %v) - auto prefers dense packs and stays on the pack between kills.", w)
+  } else {
+    fmt.println("density steering: OFF (weight 0) - auto targets the plain nearest eligible mob (simple/legacy behaviour).")
+  }
 }
 
 // Read the player's world position: [base+player_rva] -> the CMover*, then +pos_off (m_vPos).

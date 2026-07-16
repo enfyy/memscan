@@ -16,9 +16,9 @@ import "../engine"
 // finishing with a prescriptive checklist that tells you exactly what (if anything) still needs a
 // different condition. Re-runnable/idempotent - pin what you can now, fix the named condition, run again.
 //
-// Ideal spot: standing in a field, on the ground, with your PET targeted and monsters on screen. That one
-// state satisfies core (name anchor), focus_off + prop-gate (pet + monsters), terrain (ground), and the
-// collision filter (props on screen) all at once.
+// Ideal spot: standing in a field, on the ground, with a few DISTINCT monster species on screen. That one
+// state satisfies core (name anchor), prop-gate (monster species variety), terrain (ground), and the
+// collision filter (props on screen) all at once. No target needs to be selected.
 // ===========================================================================
 
 cli_setup :: proc(session: ^Session, args: []string) {
@@ -32,7 +32,7 @@ cli_setup :: proc(session: ^Session, args: []string) {
   }
   if len(args) < 1 {
     fmt.eprintln("usage: setup <name> [hp]   (your character name; optional current HP)")
-    fmt.eprintln("  stand in a field on the ground, target your PET with monsters on screen, then run it.")
+    fmt.eprintln("  stand in a field on the ground with a few distinct monsters on screen, then run it.")
     return
   }
   name := strings.trim(args[0], "'\"")
@@ -48,33 +48,40 @@ cli_setup :: proc(session: ^Session, args: []string) {
   fmt.println("=== setup ===")
 
   // [1] Core + srvsync + focus - anchor by name (position-free), then derive everything downstream.
-  fmt.printfln("[1/6] core + srvsync + focus  (anchoring on '%s')", name)
+  fmt.printfln("[1/8] core + srvsync + focus  (anchoring on '%s')", name)
   player, noff, ok := find_player_by_name(session, name)
   if !ok {
-    fmt.eprintfln("  could not find a mover named '%s' - are you in-game and is the name exact?", name)
-    fmt.eprintln("  if the client was recompiled (struct moved), fall back to: calibrate <x,y,z> <name> [hp]")
+    fmt.eprintfln("  could not find a mover named '%s' - are you FULLY in-game (not at a loading screen) and is the name exact (case-sensitive)?", name)
     return
   }
   calibrate_derive(session, player, session.layout.pos_off, noff, has_hp, hp)
 
-  // [2] Attackable-monster prop gate - needs your PET targeted with monsters on screen.
-  fmt.println("\n[2/6] attackable-monster prop gate (findprop - target your PET, monsters on screen)")
+  // [2] Attackable-monster prop gate - just needs a few distinct monster species on screen (no target).
+  fmt.println("\n[2/8] attackable-monster prop gate (findprop - a few distinct monsters on screen)")
   cli_findprop(session, {})
 
   // [3] Decorative (walk-through) prop filter - full-scan, so all nearby props feed the consensus.
-  fmt.println("\n[3/6] walk-through-prop collision filter (collscan)")
+  fmt.println("\n[3/8] walk-through-prop collision filter (collscan)")
   cli_collscan(session, {})
 
   // [4] Terrain reachability - best effort; wants flat solid ground.
-  fmt.println("\n[4/6] terrain reachability (worldscan - stand on flat ground; may need a 2nd sample)")
+  fmt.println("\n[4/8] terrain reachability (worldscan - stand on flat ground; may need a 2nd sample)")
   cli_worldscan(session, {})
 
   // [5] Character control (moveto / jump) - derives the dest-field offsets + SendActMsg RVA + jump_msg.
-  fmt.println("\n[5/6] character control (findmove - moveto + jump)")
+  fmt.println("\n[5/8] character control (findmove - moveto + jump)")
   cli_findmove(session, {})
 
-  // [6] Attack range - drives the picker's engage/melee ranges.
-  fmt.println("\n[6/6] attack range")
+  // [6] Render camera - enables the tdbg cull-cone overlay + the radar's camera frustum (F). Read-only scan.
+  fmt.println("\n[6/8] render camera (findcam)")
+  cli_findcam(session, {})
+
+  // [7] Mesh-reach RVA - pins IntersectObjLine so `meshreach`/`objline`/`reachcmp` work. Read-only scan.
+  fmt.println("\n[7/8] mesh-reach function (findobjline)")
+  cli_findobjline(session, {})
+
+  // [8] Attack range - drives the picker's engage/melee ranges.
+  fmt.println("\n[8/8] attack range")
   if session.layout.attack_range <= 0 {
     session.layout.attack_range = 1.75 // melee default; the user should set their real reach
     flyff_save_cfg(session.layout, flyff_cfg_path())
@@ -97,7 +104,7 @@ Setup_Group :: struct {
 
 // The live setup checklist - shared by the `setup` summary and the `status` babysitter top-line, so they
 // never drift. Reads the live layout (each finder auto-pins its fields) + resolves the anchors.
-setup_groups :: proc(session: ^Session) -> [7]Setup_Group {
+setup_groups :: proc(session: ^Session) -> [9]Setup_Group {
   L := session.layout
   handle := session.proc_info.handle
   base := session.proc_info.base
@@ -106,26 +113,27 @@ setup_groups :: proc(session: ^Session) -> [7]Setup_Group {
   char_ctrl_ok :=
     L.destpos_off != 0 && L.iddest_off != 0 && L.forward_off != 0 && // moveto (field-write)
     sendactmsg_rva_sane(session) && L.actmover_off != 0 && L.jump_msg != 0 // jump (SendActMsg call)
-  return [7]Setup_Group {
-    {core_ok, true, "core (see/select targets)", "be fully in-game, then `setup <name>` (else `calibrate <pos> <name>`)"},
+  return [9]Setup_Group {
+    {core_ok, true, "core (see/select targets)", "be fully in-game, then `setup <name>`"},
     {L.objid_off != 0 && L.sendsettarget_rva != 0, true, "srvsync (anti-disconnect)", "select a mob and re-run `setup` (or `findsettarget`)"},
-    {prop_gate_live_ok(session), true, "attackable-monster gate", "target your PET with monsters on screen, re-run `setup`"},
+    {prop_gate_live_ok(session), true, "attackable-monster gate", "get a few distinct monsters on screen, re-run `setup` (or `findprop`)"},
     {L.coll_obj3d_off != 0 && L.coll_type_off != 0, false, "walk-through-prop filter", "stand where props are on screen, re-run `setup`"},
     {terrain_ready(session), false, "terrain reachability", "stand on flat solid ground, re-run `setup` (or `worldscan`)"},
     {char_ctrl_ok, false, "character control (moveto/jump)", "be in-game, re-run `setup` (or `findmove`)"},
     {L.attack_range > 0, false, "attack range", "`set attack_range <n>` to your reach"},
+    {L.camera_rva != 0, false, "camera / tdbg cull-cone", "be in-game, re-run `setup` (or `findcam`)"},
+    {intersectobjline_rva_sane(session), false, "mesh-reach function (objline)", "re-run `setup` (or `findobjline`)"},
   }
 }
 
 // Optional layout pins that `setup` does NOT cover - each just enables an extra feature and is pinned by
 // its own finder (re-pin after a game patch). None is required for `auto`; surfaced under `status` so
 // they're discoverable. Reuses Setup_Group: `label` = the feature, `need` = the finder that pins it.
-optional_pins :: proc(session: ^Session) -> [3]Setup_Group {
+optional_pins :: proc(session: ^Session) -> [2]Setup_Group {
   L := session.layout
-  return [3]Setup_Group {
-    {L.camera_rva != 0, false, "camera / tdbg cull-cone", "findcam"},
-    {intersectobjline_rva_sane(session), false, "mesh-reach / objline / reachcmp", "findobjline"},
+  return [2]Setup_Group {
     {L.particlemng_rva != 0 && L.createparticle_rva != 0, false, "in-world markers / mark / ring", "findparticle"},
+    {L.penya_off != 0, false, "penya pop (radar juice)", "findpenya <current-penya>"},
   }
 }
 
@@ -142,7 +150,7 @@ setup_status_line :: proc(session: ^Session) -> string {
     }
   }
   if done == len(groups) {
-    return fmt.tprintf("SETUP %d/%d COMPLETE - run `auto` to farm.", done, len(groups))
+    return fmt.tprintf("SETUP %d/%d COMPLETE", done, len(groups))
   }
   return fmt.tprintf("SETUP %d/%d - NEXT: %s", done, len(groups), next)
 }

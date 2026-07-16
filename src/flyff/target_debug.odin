@@ -30,6 +30,8 @@ TC_Factors :: struct {
   d_player_3d:  f32,
   dy:           f32, // pos.y - player.y
   d_lastkill_h: f32, // -1 when there's no last-kill anchor
+  cluster:      int, // local pack size (# candidates within density_radius, incl. self)
+  density_score: f32, // pack * density_weight / (density_weight + d_horiz); 0 when weight is 0
   in_melee:     bool,
   in_engage:    bool,
   on_cooldown:  bool,
@@ -59,6 +61,7 @@ TC_Debug :: struct {
   melee:         f32,
   engage:        f32,
   attack_range:  f32,
+  density_weight: f32,
 }
 
 // Aggregate stats that differ between a "good" map (tower) and a "bad" one (cloakia) - the whole point
@@ -106,6 +109,10 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
 
   now := time.now()._nsec
   melee, engage := pick_ranges(session)
+  // Always compute pack sizes for the map/table (so you can see clusters even at weight 0 while tuning);
+  // the density-steer STAGE only fires when density_weight > 0 (see the Pick_Ctx below).
+  dw := session.layout.density_weight
+  dens := compute_densities(cands[:], density_radius(engage))
   lk_set := session.last_kill_set
   lk_pos := session.last_kill_pos
   anchor_src := "live last-kill anchor (auto running)"
@@ -142,6 +149,8 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
       d_player_3d  = engine.dist_3d(c.pos, player_pos),
       dy           = c.pos[1] - player_pos[1],
       d_lastkill_h = lk_set ? engine.dist_horizontal(c.pos, lk_pos) : -1,
+      cluster      = dens[i],
+      density_score = dw > 0 ? f32(dens[i]) * dw / (dw + c.d) : 0,
       in_melee     = c.d <= melee,
       in_engage    = c.d <= engage,
       on_cooldown  = recent_list_contains(session.tc_recent[:], c.obj, now, TC_RECENT_NS),
@@ -176,6 +185,8 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
     engage        = engage,
     recent        = local_recent[:],
     blocked       = session.auto_blocked[:],
+    density       = dens,
+    density_w     = dw,
   }
   order := make([dynamic]int, context.temp_allocator)
   for k in 0 ..< n {
@@ -211,6 +222,7 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
     melee         = melee,
     engage        = engage,
     attack_range  = session.layout.attack_range,
+    density_weight = dw,
   }
   return dbg, true
 }
@@ -291,6 +303,8 @@ stage_name :: proc(s: TC_Stage) -> string {
     return "pocket"
   case .Nearest:
     return "nearest"
+  case .Density:
+    return "density"
   case .None:
     return "-"
   case .Excluded:
@@ -312,6 +326,8 @@ fact_color :: proc(f: TC_Factors) -> string {
       return "#3498db"
     case .Nearest:
       return "#2ecc71"
+    case .Density:
+      return "#f1c40f"
     case .None, .Excluded:
       return "#8899aa"
     }
@@ -499,12 +515,14 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
   fmt.sbprintf(&b, "<h1>target order - %s%s</h1>\n", desc, label == "" ? "" : fmt.tprintf("  [%s]", label))
   fmt.sbprintf(
     &b,
-    "<p class=sub>%d candidates, %d ranked, %d excluded &nbsp;|&nbsp; attack_range=%.0f (engage), melee=%.0f &nbsp;|&nbsp; anchor: %s &nbsp;|&nbsp; view radius %.0f</p>\n",
+    "<p class=sub>%d candidates, %d ranked, %d excluded &nbsp;|&nbsp; attack_range=%.0f (engage), melee=%.0f, density_w=%.0f%s &nbsp;|&nbsp; anchor: %s &nbsp;|&nbsp; view radius %.0f</p>\n",
     s.n,
     s.ranked,
     s.excluded,
     dbg.attack_range,
     dbg.melee,
+    dbg.density_weight,
+    dbg.density_weight > 0 ? "" : " (off)",
     dbg.anchor_src,
     view_r,
   )
@@ -717,7 +735,7 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
   // ---- side panel: legend + summary ----
   fmt.sbprint(&b, "<div>\n")
   fmt.sbprint(&b, "<div class=card lg><h2>legend</h2>\n")
-  fmt.sbprint(&b, "<div><span style='background:#2ecc71'></span>nearest <span style='background:#3498db'></span>pocket <span style='background:#1abc9c'></span>melee <span style='background:#e67e22'></span>avoid</div>\n")
+  fmt.sbprint(&b, "<div><span style='background:#2ecc71'></span>nearest <span style='background:#f1c40f'></span>density <span style='background:#3498db'></span>pocket <span style='background:#1abc9c'></span>melee <span style='background:#e67e22'></span>avoid</div>\n")
   fmt.sbprint(&b, "<div><span style='background:#e74c3c'></span>stuck-blacklist <span style='background:#e67e22'></span>walled <span style='background:#9b59b6'></span>blocked by object <span style='background:#b8912f'></span>cooldown</div>\n")
   fmt.sbprintf(&b, "<div style='margin-top:4px;color:#7f8c98'>dot colour = predicted kill order: <b style='color:#ffec82'>warm/bright = next</b> &rarr; cool/dim = later. Numbers mark the first %d picks; small dots are later picks. Faint grey rings = distance markers (world units); cyan ring = attack_range; gold &times; = anchor. <b style='color:#9b59b6'>Solid purple boxes</b> = real object collision (trees/rocks/buildings), <b style='color:#8a95a5'>faint dashed boxes</b> = decorative props (bushes/grass) the game walks through, <b style='color:#e67e22'>orange squares</b> = terrain walls; a line from you to an excluded mob shows what its straight path clips. Toggle any layer with the checkboxes above the map.</div>\n", TDBG_NUM)
   fmt.sbprint(&b, "</div>\n")
@@ -728,7 +746,7 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
   }
   row(&b, "vertical spread |Δy|", fmt.tprintf("max %.1f, mean %.1f", s.dy_max, s.dy_mean))
   row(&b, "mob spacing (nn horiz)", fmt.tprintf("min %.1f, mean %.1f, max %.1f", s.spacing_min, s.spacing_mean, s.spacing_max))
-  row(&b, "stages", fmt.tprintf("melee %d, avoid %d, pocket %d, nearest %d", s.stage_counts[.Melee], s.stage_counts[.Avoid], s.stage_counts[.Pocket], s.stage_counts[.Nearest]))
+  row(&b, "stages", fmt.tprintf("melee %d, avoid %d, pocket %d, nearest %d, density %d", s.stage_counts[.Melee], s.stage_counts[.Avoid], s.stage_counts[.Pocket], s.stage_counts[.Nearest], s.stage_counts[.Density]))
   row(&b, "excluded", fmt.tprintf("%d  (cooldown %d, blocked %d, unreachable %d)", s.excluded, s.n_cooldown, s.n_blocked, s.n_unreach))
   fmt.sbprint(&b, "</div>\n")
   fmt.sbprint(&b, "</div>\n") // side panel
@@ -736,7 +754,7 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
 
   // ---- table ----
   fmt.sbprint(&b, "<h2 style='margin-top:16px;font-size:14px'>candidates (by predicted order)</h2>\n")
-  fmt.sbprint(&b, "<table><thead><tr><th>#</th><th class=l>name</th><th>d_horiz</th><th>d_3d</th><th>Δy</th><th>d_lastkill</th><th>melee</th><th>engage</th><th>reach</th><th>blkd</th><th>cd</th><th class=l>stage</th></tr></thead><tbody>\n")
+  fmt.sbprint(&b, "<table><thead><tr><th>#</th><th class=l>name</th><th>d_horiz</th><th>d_3d</th><th>Δy</th><th>d_lastkill</th><th>pack</th><th>score</th><th>melee</th><th>engage</th><th>reach</th><th>blkd</th><th>cd</th><th class=l>stage</th></tr></thead><tbody>\n")
   // rows sorted by rank (ranked ascending, excluded last)
   order := make([dynamic]int, context.temp_allocator)
   for _, i in dbg.facts {
@@ -766,11 +784,13 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
     html_escape(&b, f.name)
     fmt.sbprintf(
       &b,
-      "</td><td>%.1f</td><td>%.1f</td><td>%+.1f</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=l>%s</td></tr>\n",
+      "</td><td>%.1f</td><td>%.1f</td><td>%+.1f</td><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=l>%s</td></tr>\n",
       f.d_player_h,
       f.d_player_3d,
       f.dy,
       f.d_lastkill_h < 0 ? "-" : fmt.tprintf("%.1f", f.d_lastkill_h),
+      f.cluster,
+      dbg.density_weight > 0 ? fmt.tprintf("%.1f", f.density_score) : "-",
       yn(f.in_melee),
       yn(f.in_engage),
       reach_word(f.reach_status),
@@ -799,26 +819,29 @@ tc_print_console :: proc(dbg: TC_Debug, s: TC_Summary, names: []string) {
     )
   }
   fmt.printfln(
-    "  ranges: attack_range=%.0f melee=%.0f engage=%.0f | vert |Δy| max %.1f mean %.1f | spacing nn min %.1f mean %.1f",
+    "  ranges: attack_range=%.0f melee=%.0f engage=%.0f density_w=%.0f%s | vert |Δy| max %.1f mean %.1f | spacing nn min %.1f mean %.1f",
     dbg.attack_range,
     dbg.melee,
     dbg.engage,
+    dbg.density_weight,
+    dbg.density_weight > 0 ? "" : " (off)",
     s.dy_max,
     s.dy_mean,
     s.spacing_min,
     s.spacing_mean,
   )
   fmt.printfln(
-    "  stages: melee %d avoid %d pocket %d nearest %d | excluded: cooldown %d blocked %d unreach %d",
+    "  stages: melee %d avoid %d pocket %d nearest %d density %d | excluded: cooldown %d blocked %d unreach %d",
     s.stage_counts[.Melee],
     s.stage_counts[.Avoid],
     s.stage_counts[.Pocket],
     s.stage_counts[.Nearest],
+    s.stage_counts[.Density],
     s.n_cooldown,
     s.n_blocked,
     s.n_unreach,
   )
-  fmt.println("   #  d_horiz  d_3d    Δy   d_lkill  m e r b c  stage     name   (r reach: . clear / w wall / o object)")
+  fmt.println("   #  d_horiz  d_3d    Δy   d_lkill  pack  score  m e r b c  stage     name   (r reach: . clear / w wall / o object)")
   order := make([dynamic]int, context.temp_allocator)
   for idx in dbg.order {
     append(&order, idx)
@@ -838,12 +861,14 @@ tc_print_console :: proc(dbg: TC_Debug, s: TC_Summary, names: []string) {
     rank_s := f.rank >= 0 ? fmt.tprintf("%3d", f.rank + 1) : "  -"
     lk_s := f.d_lastkill_h < 0 ? "     -" : fmt.tprintf("%6.1f", f.d_lastkill_h)
     fmt.printfln(
-      "  %s %7.1f %6.1f %+5.1f  %s  %s %s %s %s %s  %-8s  %s",
+      "  %s %7.1f %6.1f %+5.1f  %s  %4d %6.1f  %s %s %s %s %s  %-8s  %s",
       rank_s,
       f.d_player_h,
       f.d_player_3d,
       f.dy,
       lk_s,
+      f.cluster,
+      f.density_score,
       yn(f.in_melee),
       yn(f.in_engage),
       f.reach_status == .Clear ? "." : (f.reach_status == .Blocked_Terrain ? "w" : "o"),
@@ -882,7 +907,7 @@ cli_tdbg :: proc(session: ^Session, args: []string) {
 
   dbg, ok := tc_predict_order(session, names)
   if !ok {
-    fmt.eprintln("could not read world/player anchors (wrong build or not in-game?). run 'calibrate' first.")
+    fmt.eprintln("could not read world/player anchors (wrong build or not in-game?). run 'setup <name>' first.")
     return
   }
   if len(dbg.facts) == 0 {

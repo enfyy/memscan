@@ -14,7 +14,10 @@ FLYFF_POS_OFF :: 0x160 // CObj.m_vPos (3x f32)
 FLYFF_TYPE_REL :: 0x10 // m_dwType, relative to m_vPos (so POS_OFF+0x10)
 FLYFF_NAME_OFF :: 0x1DB8 // CMover inline name char buffer
 FLYFF_MOVER_TYPE :: 5 // m_dwType for movers (players, pets, NPCs, monsters)
-FLYFF_HP_OFF :: 0x281C // CMover current HP (LONG); 0 => dead/despawning (don't target)
+FLYFF_HP_OFF :: 0x814 // CMover current HP (LONG); 0 => dead/despawning (don't target). maxHP is the
+// next field (+0x818) and equals currentHP at full health - calibrate_derive steps DOWN to this (lower)
+// offset so it never pins maxHP by mistake (maxHP never hits 0, so pets/corpses would misread as alive).
+FLYFF_PENYA_OFF :: 0 // player penya/gold (u32, inline in CMover); 0 => unpinned (run 'findpenya')
 FLYFF_MODEL_OFF :: 0x178 // CObj.m_pModel; NULL => not rendered/selectable (crashes on select)
 FLYFF_ANGLE_OFF :: 0x18 // CObj.m_fAngle (Y-yaw, DEGREES). Obj.cpp: RotationY(-m_fAngle) => forward=(-sin,0,cos)
 
@@ -46,6 +49,13 @@ FLYFF_HMAP_OFF :: 0x0 // CLandscape.m_pHeightMap (float*, 129x129 corner grid)
 // (you close to range, then attack - ranged has no LOS check on the shot). Per-character; `set
 // attack_range <n>`. 0 => test the full path to the mob's cell.
 FLYFF_ATTACK_RANGE :: 1.7
+
+// Density-prioritization weight (NOT a memory offset): world-unit scale that biases the auto picker's
+// walk-target choice toward dense mob clusters instead of the strict-nearest lone mob. 0 disables it
+// (backward-compatible: strict nearest, today's behavior). See compute_densities / tc_pick_one, and
+// tune it live with `tdbg` + `set density_weight <n>`. Small (~5) = mild bias, large (~40) = strongly
+// cluster-seeking. Default off so the picker is unchanged until you opt in.
+FLYFF_DENSITY_WEIGHT :: 0
 
 // Static CObj* CWorld::m_aobjCull[] - the render on-screen display array (World.cpp:69). The object
 // reach test reads this (fast, ~on-screen count) instead of scanning all of memory for CObj. Found by
@@ -183,6 +193,7 @@ Flyff_Layout :: struct {
   field_off:         i64,
   name_off:          i64,
   hp_off:            i64,
+  penya_off:         i64,
   model_off:         i64,
   angle_off:         i64,
   mover_type:        u32,
@@ -199,6 +210,7 @@ Flyff_Layout :: struct {
   mpu_off:           i64,
   hmap_off:          i64,
   attack_range:      f32,
+  density_weight:    f32,
   aobjcull_rva:      uintptr,
   camera_rva:        uintptr,
   coll_obj3d_off:    i64,
@@ -225,6 +237,7 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     field_off         = FLYFF_FIELD_OFF,
     name_off          = FLYFF_NAME_OFF,
     hp_off            = FLYFF_HP_OFF,
+    penya_off         = FLYFF_PENYA_OFF,
     model_off         = FLYFF_MODEL_OFF,
     angle_off         = FLYFF_ANGLE_OFF,
     mover_type        = FLYFF_MOVER_TYPE,
@@ -241,6 +254,7 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     mpu_off           = FLYFF_MPU_OFF,
     hmap_off          = FLYFF_HMAP_OFF,
     attack_range      = FLYFF_ATTACK_RANGE,
+    density_weight    = FLYFF_DENSITY_WEIGHT,
     aobjcull_rva      = FLYFF_AOBJCULL_RVA,
     camera_rva        = FLYFF_CAMERA_RVA,
     coll_obj3d_off    = FLYFF_COLL_OBJ3D_OFF,

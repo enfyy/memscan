@@ -230,7 +230,7 @@ cli_worldscan :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate' first.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>' first.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
@@ -407,7 +407,7 @@ cli_attr :: proc(session: ^Session, args: []string) {
   L := session.layout
   world := read_ptr_at(handle, base + L.world_rva, pt)
   if world == 0 {
-    fmt.eprintln("world not resolved - run 'calibrate'.")
+    fmt.eprintln("world not resolved - run 'setup <name>'.")
     return
   }
 
@@ -463,7 +463,7 @@ cli_reach :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
@@ -536,7 +536,7 @@ cli_attackable :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   focus := read_ptr_at(handle, world + uintptr(L.focus_off), pt)
@@ -588,7 +588,7 @@ cli_attrmap :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
@@ -774,7 +774,7 @@ cli_objects :: proc(session: ^Session, args: []string) {
   }
   wv, wok := engine.read_value(handle, base + L.world_rva, pt)
   if !wok {
-    fmt.eprintln("objects: world not resolved - run 'calibrate'.")
+    fmt.eprintln("objects: world not resolved - run 'setup <name>'.")
     return
   }
   world := uintptr(engine.value_as_u64(pt, wv))
@@ -1209,6 +1209,16 @@ collect_nearby_obbs :: proc(session: ^Session, cx, cz, radius: f32) -> [dynamic]
 COLLIDER_CACHE_MOVE :: f32(16) // refresh the cache once the player moves this far from its center
 COLLIDER_RADIUS :: f32(120) // gather colliders within this of the player (must cover reach segments)
 
+// Ground drops + skill/effect zones are OT_CTRL objects (this server renders ground loot as CCtrl, one
+// per item, with a small ~1x0.5x1 box) that pile up exactly where you farm. The game never blocks
+// movement on them, but the full-scan collider set would treat them as solid - drawing phantom purple
+// boxes on the radar and making reach call a mob behind them "unreachable". A real OT_CTRL blocker
+// (housing / walls / guild towers) is far larger, so we drop any OT_CTRL whose box is this small. OT_OBJ
+// static props are unaffected (they keep the GMT_ERROR walk-through filter). Tune if a real small OT_CTRL
+// blocker is ever missed.
+CTRL_DROP_MAX_XZ :: f32(1.5) // half-extent; a drop/effect box is <= this wide/deep
+CTRL_DROP_MAX_Y :: f32(0.75) // half-extent; and this short (real walls/housing are taller)
+
 // Read one live CObj into an Obb (m_OBB at pos_off-0x3C) + its position + decorative flag. ok=false if
 // it's not a live CObj (no module vtable) or the read fails.
 obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok: bool) {
@@ -1238,6 +1248,11 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
   oo := po - 0x3C
   o.center = {rf(buf[:], oo), rf(buf[:], oo + 4), rf(buf[:], oo + 8)}
   o.ext = {rf(buf[:], oo + 0xC), rf(buf[:], oo + 0x10), rf(buf[:], oo + 0x14)}
+  // Drop / effect controls: a small OT_CTRL box is ground loot or a skill zone, not a real blocker - skip
+  // it so it never draws as a phantom obstacle or fails a reach check. See CTRL_DROP_MAX_* above.
+  if ty == 3 && o.ext[0] <= CTRL_DROP_MAX_XZ && o.ext[2] <= CTRL_DROP_MAX_XZ && o.ext[1] <= CTRL_DROP_MAX_Y {
+    return
+  }
   o.axis[0] = {rf(buf[:], oo + 0x18), rf(buf[:], oo + 0x1C), rf(buf[:], oo + 0x20)}
   o.axis[1] = {rf(buf[:], oo + 0x24), rf(buf[:], oo + 0x28), rf(buf[:], oo + 0x2C)}
   o.axis[2] = {rf(buf[:], oo + 0x30), rf(buf[:], oo + 0x34), rf(buf[:], oo + 0x38)}
@@ -1666,7 +1681,7 @@ cli_collscan :: proc(session: ^Session, args: []string) {
   }
   world := read_ptr_at(handle, base + L.world_rva, engine.Value_Type.U32)
   if world == 0 {
-    fmt.eprintln("collscan: world not resolved - run 'setup' / 'calibrate' first.")
+    fmt.eprintln("collscan: world not resolved - run 'setup <name>' first.")
     return
   }
 
@@ -1844,7 +1859,7 @@ cli_linkscan :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
@@ -2114,7 +2129,7 @@ cli_objline :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
@@ -2184,7 +2199,7 @@ cli_reachcmp :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))

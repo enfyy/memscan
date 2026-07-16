@@ -75,6 +75,7 @@ Session :: struct {
   on_attach:       proc(^Session), // per-process setup (e.g. load config, defaults) after attach
   on_detach:       proc(^Session), // per-process teardown (e.g. free remote pages) before handle close
   on_close:        proc(^Session), // session-end teardown of module lifetime-owned resources
+  open_ui:         proc(^Session), // open the module's UI window (Phase 3); blocks until closed. nil = none
 }
 
 // Initialise a fresh Session (defaults + scan arena + exec_line). Returns false if the arena

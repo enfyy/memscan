@@ -42,6 +42,8 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.name_off = i64(v)
   case "hp_off":
     layout.hp_off = i64(v)
+  case "penya_off":
+    layout.penya_off = i64(v)
   case "model_off":
     layout.model_off = i64(v)
   case "angle_off":
@@ -74,6 +76,8 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.hmap_off = i64(v)
   case "attack_range":
     layout.attack_range = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
+  case "density_weight":
+    layout.density_weight = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
   case "aobjcull_rva":
     layout.aobjcull_rva = uintptr(v)
   case "camera_rva":
@@ -112,8 +116,8 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
 
 flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   b := strings.builder_make(context.temp_allocator)
-  fmt.sbprintln(&b, "# memscan Flyff layout - auto-written by 'calibrate' / 'set' / 'offsets save'.")
-  fmt.sbprintln(&b, "# Values may be hex (0x..) or decimal. Re-run 'calibrate' after a game patch.")
+  fmt.sbprintln(&b, "# memscan Flyff layout - auto-written by 'setup' / 'set' / 'offsets save'.")
+  fmt.sbprintln(&b, "# Values may be hex (0x..) or decimal. Re-run 'setup <name>' after a game patch.")
   fmt.sbprintfln(&b, "world_rva=0x%X", layout.world_rva)
   fmt.sbprintfln(&b, "player_rva=0x%X", layout.player_rva)
   fmt.sbprintfln(&b, "focus_off=0x%X", layout.focus_off)
@@ -121,6 +125,7 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "field_off=0x%X", layout.field_off)
   fmt.sbprintfln(&b, "name_off=0x%X", layout.name_off)
   fmt.sbprintfln(&b, "hp_off=0x%X", layout.hp_off)
+  fmt.sbprintfln(&b, "penya_off=0x%X", layout.penya_off)
   fmt.sbprintfln(&b, "model_off=0x%X", layout.model_off)
   fmt.sbprintfln(&b, "angle_off=0x%X", layout.angle_off)
   fmt.sbprintfln(&b, "mover_type=%d", layout.mover_type)
@@ -137,6 +142,7 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "mpu_off=0x%X", layout.mpu_off)
   fmt.sbprintfln(&b, "hmap_off=0x%X", layout.hmap_off)
   fmt.sbprintfln(&b, "attack_range=%v", layout.attack_range)
+  fmt.sbprintfln(&b, "density_weight=%v", layout.density_weight)
   fmt.sbprintfln(&b, "aobjcull_rva=0x%X", layout.aobjcull_rva)
   fmt.sbprintfln(&b, "camera_rva=0x%X", layout.camera_rva)
   fmt.sbprintfln(&b, "coll_obj3d_off=0x%X", layout.coll_obj3d_off)
@@ -176,7 +182,13 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     val := strings.trim_space(line[eq + 1:])
     if key == "attack_range" {
       if fv, ok := strconv.parse_f64(val); ok {
-        layout.attack_range = f32(fv) // the one fractional field (e.g. 1.75 melee)
+        layout.attack_range = f32(fv) // fractional field (e.g. 1.75 melee) - parse as float
+      }
+      continue
+    }
+    if key == "density_weight" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.density_weight = f32(fv) // fractional field - parse as float
       }
       continue
     }
@@ -263,21 +275,32 @@ cli_status_full :: proc(session: ^Session) {
   player := read_ptr_at(handle, base + L.player_rva, pt)
   player_vt_ok := player != 0 && in_module_range(read_ptr_at(handle, player, pt), base, mod_end)
   fmt.println("")
-  fmt.println("CORE LAYOUT (from 'calibrate') - needed to see & select targets:")
+  fmt.println("CORE LAYOUT (from 'setup') - needed to see & select targets:")
   fmt.printfln("  world_rva=0x%X player_rva=0x%X focus_off=0x%X pos_off=0x%X", L.world_rva, L.player_rva, L.focus_off, L.pos_off)
   fmt.printfln("  field_off=0x%X name_off=0x%X model_off=0x%X hp_off=0x%X", L.field_off, L.name_off, L.model_off, L.hp_off)
   if world != 0 && player_vt_ok {
     fmt.println("  [OK] anchors resolve to live objects - 'mobs' / 'target_closest' / 'auto' should work.")
   } else {
     fmt.println("  [BROKEN] world/player anchor doesn't resolve - enumeration will fail or crash.")
-    fmt.println("    fix: are you fully in-game? then select a mob and run:")
-    fmt.println("         calibrate <x,y,z> <name> <hp>   (x,y,z from /position)")
+    fmt.println("    fix: be fully in-game (not at a loading screen), then run:  setup <name> [hp]")
+  }
+  // penya_off (radar '+penya' kill pop) - optional inline player stat; live-read the current value if pinned.
+  if L.penya_off != 0 {
+    pv: u32 = 0
+    if player != 0 {
+      if v, ok := engine.read_value(handle, player + uintptr(L.penya_off), .U32); ok {
+        pv = u32(engine.value_as_u64(.U32, v))
+      }
+    }
+    fmt.printfln("  penya_off=0x%X  [OK] radar '+penya' pop live (current penya reads %d)", L.penya_off, pv)
+  } else {
+    fmt.println("  penya_off=0x0    [--] radar '+penya' pop off. fix: 'findpenya <current-penya>'")
   }
 
   // --- srvsync / anti-DC ---
   srv_cfg := L.objid_off != 0 && L.sendsettarget_rva != 0 && session.ptr_size == 4
   fmt.println("")
-  fmt.println("SRVSYNC / anti-disconnect (from 'calibrate' or 'findsettarget'):")
+  fmt.println("SRVSYNC / anti-disconnect (from 'setup' or 'findsettarget'):")
   fmt.printfln("  objid_off=0x%X  sendsettarget_rva=0x%X", L.objid_off, L.sendsettarget_rva)
   if srv_cfg {
     fmt.printfln("  [OK] configured; srvsync is %s. Each select is mirrored to the server, so you", session.srvsync_on ? "ON" : "OFF")
@@ -287,7 +310,7 @@ cli_status_full :: proc(session: ^Session) {
     }
   } else {
     fmt.println("  [MISSING] srvsync is INERT -> you WILL disconnect after farming a while.")
-    fmt.println("    fix: findsettarget    (or just re-run 'calibrate' - it derives these too)")
+    fmt.println("    fix: findsettarget    (or just re-run 'setup' - it derives these too)")
   }
 
   // --- Character control (moveto / jump) ---
@@ -336,7 +359,7 @@ cli_status_full :: proc(session: ^Session) {
     }
   } else {
     fmt.println("  [OFF] not configured - 'auto any' can target your pet / other pets / NPCs.")
-    fmt.println("    fix: target your PET (with monsters on screen) and run 'findprop' once.")
+    fmt.println("    fix: stand where a few distinct monsters are on screen and run 'findprop' once (no target needed).")
     fmt.println("    only matters if you use 'auto' with NO name; farming by name is unaffected.")
   }
 
@@ -345,6 +368,10 @@ cli_status_full :: proc(session: ^Session) {
   fmt.println("TERRAIN reachability oracle (from 'worldscan') - reach-gated target selection - OPTIONAL:")
   fmt.printfln("  land_off=0x%X landwidth_off=0x%X hmap_off=0x%X mpu_off=0x%X", L.land_off, L.landwidth_off, L.hmap_off, L.mpu_off)
   fmt.printfln("  attack_range=%v  <- your reach; drives target selection (the picker's engage range) AND 'reach'. 'set attack_range <n>' (floats ok, e.g. 1.75).", L.attack_range)
+  fmt.printfln(
+    "  density_weight=%v  <- auto steers its walk-target toward dense mob clusters (0=off, ~5 mild, ~40 strong). tune with 'tdbg' then 'set density_weight <n>'.",
+    L.density_weight,
+  )
   fmt.printfln(
     "  object reach: cached full-scan (finds every collidable prop; no findcull needed)   auto reach-gate: %s",
     session.reach_gate_on ? (world != 0 ? "ON" : "on (activates once in-game)") : "OFF",
@@ -407,7 +434,7 @@ cli_status_full :: proc(session: ^Session) {
     fmt.println("    fix: stand on solid flat ground and run 'worldscan' (repeat at a clearly")
     fmt.println("         different ground height until it PINS to one hypothesis).")
   } else if world == 0 {
-    fmt.println("  [BROKEN] terrain offsets pinned but world doesn't resolve - run 'calibrate'.")
+    fmt.println("  [BROKEN] terrain offsets pinned but world doesn't resolve - run 'setup <name>'.")
   } else {
     // Live probe: the player stands on walkable ground, so their own cell should decode as
     // NONE at ~their Y. A mismatch means the pinned offsets are wrong (e.g. a coincidental
@@ -428,17 +455,16 @@ cli_status_full :: proc(session: ^Session) {
 
   fmt.println("")
   fmt.println("SETUP - the whole thing is one command (re-run after a game patch):")
-  fmt.println("  setup <name> [hp]            stand in a field on the ground, target your PET with monsters on screen, then")
+  fmt.println("  setup <name> [hp]            stand in a field on the ground with a few distinct monsters on screen, then")
   fmt.println("                               run it. Anchors on your character NAME (no /position) and pins EVERYTHING:")
   fmt.println("                               core + srvsync + focus + prop-gate + coll-filter + terrain. Re-runnable.")
   fmt.println("  the finish checklist (above / the >> line) tells you exactly what still needs a different spot.")
   fmt.println("")
   fmt.println("manual / advanced pins (setup runs these for you; use standalone if something needs a specific spot):")
-  fmt.println("  calibrate <pos> <name> [hp]  core + srvsync from /position (name-anchor fallback for a recompiled client)")
   fmt.println("  findprop / collscan / worldscan   the prop-gate / walk-through filter / terrain pins individually")
-  fmt.println("  findcam / findobjline        optional: render camera (tdbg cone) / mesh-reach RVA (only for 'meshreach on')")
+  fmt.println("  findcam / findobjline             render camera (tdbg cone) / mesh-reach RVA (setup runs these too)")
   fmt.println("")
-  fmt.println("edit any field with 'set <field> <value>' (auto-saves flyff.cfg). 'setup'/'calibrate' preserve every non-core pin.")
+  fmt.println("edit any field with 'set <field> <value>' (auto-saves flyff.cfg). 'setup' preserves every non-core pin.")
 }
 
 // offsets              -> show the health-check ('status')
@@ -491,15 +517,19 @@ cli_set :: proc(session: ^Session, args: []string) {
     fmt.eprintln("usage: set <field> <value>   (field names: see 'offsets')")
     return
   }
-  // attack_range is the one fractional field (e.g. 1.75 melee) - parse it as a float, not an integer.
-  if args[0] == "attack_range" {
+  // attack_range / density_weight are the fractional fields (e.g. 1.75 melee) - parse as floats.
+  if args[0] == "attack_range" || args[0] == "density_weight" {
     fv, ok := strconv.parse_f64(args[1])
     if !ok || fv < 0 {
       fmt.eprintfln("invalid value: %s (want a number >= 0, e.g. 1.75)", args[1])
       return
     }
-    session.layout.attack_range = f32(fv)
-    fmt.printfln("set attack_range = %v", session.layout.attack_range)
+    if args[0] == "attack_range" {
+      session.layout.attack_range = f32(fv)
+    } else {
+      session.layout.density_weight = f32(fv)
+    }
+    fmt.printfln("set %s = %v", args[0], f32(fv))
     if flyff_save_cfg(session.layout, flyff_cfg_path()) {
       fmt.printfln("saved -> %s", flyff_cfg_path())
     }
@@ -571,7 +601,7 @@ cli_findplayer :: proc(session: ^Session, args: []string) {
   pt := session.ptr_size == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
   obj, noff, ok := find_player_by_name(session, name)
   if !ok {
-    fmt.eprintfln("findplayer: no mover named '%s' resolved (struct offsets may have moved - use 'calibrate <pos> <name>').", name)
+    fmt.eprintfln("findplayer: no mover named '%s' resolved (be fully in-game; if a patch moved the mover struct, the built-in defaults need updating).", name)
     return
   }
   pos, _ := engine.read_vec3(handle, obj + uintptr(session.layout.pos_off))
@@ -586,140 +616,14 @@ cli_findplayer :: proc(session: ^Session, args: []string) {
 }
 
 // ---------------------------------------------------------------------------
-// calibrate - re-derive the core targeting layout from in-game facts
+// calibrate_derive - re-derive the core targeting layout from an already-found player object
 // ---------------------------------------------------------------------------
 
-// calibrate <x,y,z> <name> [hp]
-// One-command layout setup/recovery from facts you can read in-game: <x,y,z> your character
-// position (type /position), <name> your character name, [hp] your current HP (optional; pins
-// hp_off). Finds pos_off/field_off/model_off/name_off + world_rva/player_rva (+hp_off); on the 32-bit
-// client also re-derives the srvsync offsets (sendsettarget_rva + objid_off); and if a mob is SELECTED
-// when you run it, also pins focus_off (folds in findfocus). Saves flyff.cfg. So the core setup is one
-// command: select a mob, then `calibrate <pos> <name> [hp]`. (The any-monster gate is separate: target
-// your pet with monsters on screen and run `findprop` once.)
-cli_calibrate :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 2 {
-    fmt.eprintln("usage: calibrate <x,y,z> <name> [hp]   (x,y,z from /position; name = your character)")
-    return
-  }
-  pos, pok := parse_vec3_literal(args[0])
-  if !pok {
-    fmt.eprintln("bad position - use the x,y,z /position shows (commas, no spaces).")
-    return
-  }
-  name := args[1]
-  has_hp := false
-  hp: i64 = 0
-  if len(args) >= 3 {
-    if h, hok := strconv.parse_i64(args[2]); hok {
-      hp = h
-      has_hp = true
-    }
-  }
-  run_calibrate(session, pos, name, has_hp, hp, 1.0)
-}
-
-// calibrate_house <name> [hp]
-// Convenience wrapper: in your personal house you always spawn at exactly (253, 100, 243) if you
-// don't move, so you only supply your character name (and optional HP) - no /position needed. Same
-// as `calibrate 253,100,243 <name> [hp]` with a slightly wider position tolerance.
-cli_calibrate_house :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 1 {
-    fmt.eprintln("usage: calibrate_house <name> [hp]   (stand still in your house first)")
-    return
-  }
-  name := args[0]
-  has_hp := false
-  hp: i64 = 0
-  if len(args) >= 2 {
-    if h, hok := strconv.parse_i64(args[1]); hok {
-      hp = h
-      has_hp = true
-    }
-  }
-  fmt.println("calibrate_house: using the fixed house spawn (253, 100, 243) - make sure you haven't moved.")
-  run_calibrate(session, {253, 100, 243}, name, has_hp, hp, 2.0)
-}
-
-// Shared calibration core: derive the layout from a known player position + name (+ optional HP).
-// `eps` is the position match tolerance (house spawn is a remembered constant, so it uses more).
-run_calibrate :: proc(session: ^Session, pos: [3]f32, name: string, has_hp: bool, hp: i64, eps: f32) {
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  size := session.proc_info.module_size
-  mod_end := base + uintptr(size)
-  ps := session.ptr_size
-  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
-  L := session.layout
-
-  // 1. Candidate m_vPos addresses at the player's position.
-  cands := engine.scan_vec3(handle, pos, eps, context.temp_allocator)
-  if len(cands) == 0 {
-    fmt.eprintln("no memory matches that position. Type the EXACT values /position shows, then retry.")
-    return
-  }
-
-  // 2. Identify the player object: for each candidate, try pos_off (current first, then a sweep)
-  //    until base = P - pos_off has a module vtable, m_dwType == mover, and holds our name.
-  cand_offs := make([dynamic]i64, context.temp_allocator)
-  append(&cand_offs, L.pos_off)
-  for po := i64(0x40); po <= 0x400; po += 4 {
-    if po != L.pos_off {
-      append(&cand_offs, po)
-    }
-  }
-  player: uintptr = 0
-  pos_off: i64 = 0
-  name_off: i64 = 0
-  found := false
-  outer: for P in cands {
-    for po in cand_offs {
-      if uintptr(po) > P {
-        continue
-      }
-      obj := P - uintptr(po)
-      if !in_module_range(read_ptr_at(handle, obj, pt), base, mod_end) {
-        continue // no module vtable at obj -> wrong pos_off / not an object
-      }
-      ty, tok := engine.read_value(handle, obj + uintptr(po) + 0x10, .U32)
-      if !tok || u32(engine.value_as_u64(.U32, ty)) != L.mover_type {
-        continue
-      }
-      noff, nok := find_name_offset(handle, obj, name, 0x4000)
-      if !nok {
-        continue
-      }
-      player = obj
-      pos_off = po
-      name_off = noff
-      found = true
-      break outer
-    }
-  }
-  if !found {
-    fmt.eprintfln(
-      "%d position match(es) but none is a mover named '%s'. Check the name and that you're in-game.",
-      len(cands),
-      name,
-    )
-    return
-  }
-
-  calibrate_derive(session, player, pos_off, name_off, has_hp, hp)
-}
-
 // Derive & save the full layout from an already-found player object: field_off/world/world_rva,
-// player_rva, hp_off, focus_off (if a mob is selected), and srvsync. Position-INDEPENDENT - shared by the
-// position-anchored `run_calibrate` and the name-anchored `setup`. Prints the report + writes flyff.cfg.
-// Returns the resolved world (0 if unresolved) so a caller can gate follow-on steps that need it.
+// player_rva, hp_off, focus_off (if a mob is selected), and srvsync. Position-INDEPENDENT - driven by the
+// name-anchored `setup` (via find_player_by_name). Prints the report + writes flyff.cfg. Returns the
+// resolved world (0 if unresolved) so a caller can gate follow-on steps that need it. (The old position-
+// anchored `calibrate`/`calibrate_house` commands are gone - `setup <name>` supersedes them.)
 calibrate_derive :: proc(session: ^Session, player: uintptr, pos_off, name_off: i64, has_hp: bool, hp: i64) -> (world: uintptr, world_ok: bool) {
   handle := session.proc_info.handle
   base := session.proc_info.base
@@ -763,14 +667,30 @@ calibrate_derive :: proc(session: ^Session, player: uintptr, pos_off, name_off: 
   pr := engine.scan_image_for_ptr(handle, base, size, player, ps, context.temp_allocator)
   player_rva := len(pr) > 0 ? pr[0] - base : L.player_rva
 
-  // 5. hp_off: confirm the current one, else search the object for the HP value.
+  // 5. hp_off: pin currentHP (NOT maxHP). Confirm the current offset, else search the object for the HP
+  //    value; THEN step DOWN through any equal-adjacent field. At full health currentHP == maxHP and they
+  //    sit as an adjacent pair (currentHP first, maxHP right after), so a raw value-match can land on maxHP
+  //    - which never drops to 0, so a pet (maxHP field reads 0) or a corpse would misread as alive and the
+  //    picker's currentHP>0 gate would keep them (this is exactly why `tc <pet>` broke after a patch).
+  //    Verified on this client: a damaged mob reads currentHP@+0x814=87, maxHP@+0x818=120. Stepping to the
+  //    lowest offset of the equal run pins currentHP whether or not the player is at full HP. See FLYFF_HP_OFF.
   hp_off := L.hp_off
   if has_hp {
-    cur, cok := engine.read_value(handle, player + uintptr(L.hp_off), .U32)
-    if cok && i64(u32(engine.value_as_u64(.U32, cur))) == hp {
-      hp_off = L.hp_off
+    cand := i64(-1)
+    if cur, cok := engine.read_value(handle, player + uintptr(L.hp_off), .U32); cok && i64(u32(engine.value_as_u64(.U32, cur))) == hp {
+      cand = L.hp_off
     } else if ho, hok := find_u32_offset(handle, player, u32(hp), 0x4000, L.hp_off); hok {
-      hp_off = ho
+      cand = ho
+    }
+    for cand >= 4 {
+      v, ok := engine.read_value(handle, player + uintptr(cand - 4), .U32)
+      if !ok || i64(u32(engine.value_as_u64(.U32, v))) != hp {
+        break // previous field differs -> `cand` is the lowest of the equal run = currentHP
+      }
+      cand -= 4
+    }
+    if cand >= 0 {
+      hp_off = cand
     }
   }
 
@@ -909,7 +829,7 @@ cli_findfocus :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + session.layout.world_rva, pt)
   player := read_ptr_at(handle, base + session.layout.player_rva, pt)
   if world == 0 {
-    fmt.eprintln("world not resolved - run calibrate / calibrate_house first.")
+    fmt.eprintln("world not resolved - run 'setup <name>' first.")
     return
   }
   cands := scan_focus_cands(session, world, player)
@@ -956,7 +876,7 @@ cli_findhp :: proc(session: ^Session, args: []string) {
   L := session.layout
   wv, wok := engine.read_value(handle, base + L.world_rva, pt)
   if !wok {
-    fmt.eprintln("could not read world anchor - run calibrate first.")
+    fmt.eprintln("could not read world anchor - run 'setup <name>' first.")
     return
   }
   world := uintptr(engine.value_as_u64(pt, wv))
@@ -1139,7 +1059,7 @@ cli_hpwatch :: proc(session: ^Session, args: []string) {
   L := session.layout
   world := read_ptr_at(handle, base + L.world_rva, pt)
   if world == 0 {
-    fmt.eprintln("world not resolved - run calibrate first.")
+    fmt.eprintln("world not resolved - run 'setup <name>' first.")
     return
   }
   focus := read_ptr_at(handle, world + uintptr(L.focus_off), pt)
@@ -1292,7 +1212,7 @@ cli_packetwatch :: proc(session: ^Session, args: []string) {
   }
   world := read_ptr_at(handle, base + L.world_rva, pt)
   if world == 0 {
-    fmt.eprintln("world not resolved - run calibrate first.")
+    fmt.eprintln("world not resolved - run 'setup <name>' first.")
     return
   }
   snap := engine.take_snapshot(handle, .U32, true, context.temp_allocator)

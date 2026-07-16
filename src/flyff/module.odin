@@ -31,6 +31,14 @@ flyff_register :: proc(session: ^Session) {
   session.on_attach = on_attach
   session.on_detach = on_detach
   session.on_close = on_close
+  session.open_ui = open_ui_hook
+}
+
+// `module flyff` (Phase 3) opens the radar with its control panel. Entered under exec_mutex (the REPL
+// holds it around dispatch), exactly like the `radar` command - cli_radar releases the lock per frame so
+// the watcher keeps farming while the panel is open. Both entry points open the same paneled window.
+open_ui_hook :: proc(es: ^engine.Session) {
+  cli_radar(flyff_of(es), {})
 }
 
 // The flyff command set - reached by engine.dispatch when it doesn't recognise a command. Returns
@@ -40,6 +48,8 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
   switch cmd {
   case "target_closest", "tc", "get":
     cli_target_closest(s, args)
+  case "target_at", "tat":
+    cli_target_at(s, args)
   case "tdbg", "tmap":
     cli_tdbg(s, args)
   case "auto":
@@ -50,6 +60,12 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_kills(s, args)
   case "stuck":
     cli_stuck(s, args)
+  case "preselect":
+    cli_preselect(s, args)
+  case "lookalive":
+    cli_lookalive(s, args)
+  case "density":
+    cli_density(s, args)
   case "reachgate":
     cli_reachgate(s, args)
   case "meshreach":
@@ -58,10 +74,6 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_pause(s, args)
   case "setup":
     cli_setup(s, args)
-  case "calibrate", "cal":
-    cli_calibrate(s, args)
-  case "calibrate_house", "calh":
-    cli_calibrate_house(s, args)
   case "offsets", "layout":
     cli_offsets(s, args)
   case "status", "doctor", "diag":
@@ -98,6 +110,8 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_deathscan(s, args)
   case "objscan":
     cli_objscan(s, args)
+  case "findpenya":
+    cli_findpenya(s, args)
   case "mobs":
     cli_mobs(s, args)
   case "mark":
@@ -192,7 +206,7 @@ on_attach :: proc(es: ^engine.Session) {
   if flyff_load_cfg(&s.layout, cfg) {
     fmt.printfln("layout: loaded %s", cfg)
   } else {
-    fmt.println("layout: built-in defaults (run 'calibrate' if the game was patched).")
+    fmt.println("layout: built-in defaults (run 'setup <name>' if the game was patched).")
   }
 
   // srvsync defaults ON now that the anti-DC path is proven - it's always needed. It stays inert
@@ -251,12 +265,18 @@ check the setup anytime with 'status'.
 farming (day to day)
   target_closest <name>... (tc)  select nearest mover named <name>; repeat to advance.
                              several names ok: tc 'Aibatt', 'Captain Aibatt'
+  target_at <addr>    (tat)  select the EXACT object at <addr> (a live CObj*, e.g. an address from
+                             'mobs'). the primitive behind the radar's click-to-target
   auto [name]...             hands-free farm: starts ARMED (paused) - kill the first mob to begin, then it
                              re-targets on each kill. no name = ANY monster; names comma-separated. 'auto off' stops
   pause                      toggle pause (default key: F10). killing the targeted mob resumes
   timer <minutes>            auto-disable 'auto' after N minutes (e.g. 'timer 60'); 'timer off' cancels
   kills <n>                  auto-disable 'auto' after N confirmed kills (e.g. 'kills 100'); 'kills off' cancels
   stuck [on|off]             toggle reactive obstacle skip-detection (on by default; 'stuck off' for ranged/standing)
+  density [on|off|<n>]       cluster steering: OFF (default) = target the plain nearest mob (simple, no zig-zag
+                             regardless of attack_range); ON steers toward dense packs + stays on the pack (~5 mild, ~40 strong)
+  preselect [on|off]         precompute the next target while fighting so auto advances instantly on kill (on by default)
+  lookalive [on|off]         human-like farming: random hesitation before each target + occasional jumps (opt-in; needs findmove for jumps)
   reachgate [on|off]         proactively skip mobs behind walls/trees/buildings when auto-picks a target
   meshreach [on|off]         confirm OBB-blocked mobs with the client's IntersectObjLine (opt-in; injects, crash-prone)
                              inert until 'findobjline' pins intersectobjline_rva (re-run it after a game patch)
@@ -268,7 +288,12 @@ farming (day to day)
                              the view radius in world units ('tdbg tower 30' to zoom in)
   radar [seconds]            open a LIVE top-down radar window (player + mobs + obstacles); wheel=zoom,
                              ESC=close. raylib is statically linked (no dll). seconds>0 auto-closes.
+                             LEFT-CLICK a mob to target it; SHIFT+LEFT-CLICK the ground to walk there
+                             (needs 'findmove'); a '+penya' pops on each pickup (needs 'findpenya').
                              press E in-window to draw a geo-fence (see 'fence').
+  module flyff               open the radar with the CONTROL PANEL: setup status lights (hover for the
+                             fix), a Setup dialog, the auto-farm toggle, a mob search + chip picker, the
+                             attack_range slider, and fence/view buttons. same window as 'radar'.
   fence [sub]                geo-fence: never target mobs outside a drawn area. no arg = status. subs:
                              add circle <r>|<x,z> <r> [-] / add rect <halfx,halfz>|<min> <max> [-] /
                              poly start|point|end / undo / erase <x,z> / clear / on / off / test <x,z> /
@@ -286,32 +311,27 @@ character control (no keypress simulation; run 'findmove' once to pin it)
   moveto <x,z> | <x,y,z>     walk to a world point - writes CMover's dest fields, so the client walks
                              there itself (like a ground click). Y defaults to your height. aliases: walkto, go
   jump                       jump (sends the client's own OBJMSG_JUMP; all in-game jump guards apply)
-  position (pos)             print your world position (copy-paste x,y,z for calibrate / moveto / findpos)
+  position (pos)             print your world position (copy-paste x,y,z for moveto / findpos)
   findmove                   pin the move/jump config (dest-field offsets + sendactmsg_rva via the
                              actmover vtable + actmover_off + jump_msg); re-run after a game patch. saves flyff.cfg
 
 setup & health (run once after a game patch)
-  setup <name> [hp]          ONE-STEP setup: stand in a field on the ground, target your PET with
-                             monsters on screen, then run it. Anchors on your character NAME (no
-                             /position to type) and runs the whole pipeline (core + srvsync + focus +
-                             prop-gate + coll-filter + terrain), ending with a checklist of anything
-                             that still needs a different spot. Re-runnable. saves flyff.cfg
+  setup <name> [hp]          ONE-STEP setup: stand in a field on the ground with a few DISTINCT monster
+                             species on screen, then run it (no target needed). Anchors on your character
+                             NAME (no /position to type) and runs the whole pipeline (core + srvsync +
+                             focus + prop-gate + coll-filter + terrain), ending with a checklist of
+                             anything that still needs a different spot. Re-runnable. saves flyff.cfg
   status              (doctor)  health-check: what's configured, what's missing, and how to fix it
-  calibrate <x,y,z> <name> [hp]  (cal) manual/fallback: re-derive the layout from /position + your
-                             character name; also finds srvsync offsets, and focus_off if a mob
-                             is selected. select a mob first for full setup. saves flyff.cfg
-  calibrate_house <name> [hp]  (calh) same, from your house's fixed spawn (no /position; but no
-                             mobs in the house, so focus_off is kept - pin it later in the field)
   offsets [save|load|reset] (layout)  no-arg = status; or persist/restore the layout
   set <field> <value>        set one layout field (see 'status'); auto-saves flyff.cfg
 
 offset finders (one-time; each fills part of the layout)
   findfocus                  click a mob, then run: derives focus_off
   hpwatch                    target a mob and hit it: the field that drops is currentHP (hp_off)
-  findsettarget              derive the srvsync offsets by signature (calibrate does this too)
-  findprop                   target your PET (monsters on screen), then run: derives the any-monster gate
-                             (species MoverProp array -> GetProp()->dwAI==AII_MONSTER). Excludes pets /
-                             eggs / NPCs / players / bosses. One-time; re-run after a game patch.
+  findsettarget              derive the srvsync offsets by signature (setup does this too)
+  findprop                   stand where a few DISTINCT monsters are on screen, then run (no target needed):
+                             derives the any-monster gate (species MoverProp array -> GetProp()->dwAI==
+                             AII_MONSTER). Excludes pets / eggs / NPCs / players / bosses. Re-run after a patch.
   findaii                    diagnostic: dump a mover's AI-region fields / find pet tags (RE only)
 
 terrain / obstacle reach oracle ('setup' pins these; commands below are for standalone use / diagnostics)
@@ -336,4 +356,6 @@ deep recon (rarely needed)
   findpacket [objid]         scan for the outgoing SETTARGET packet id
   packetwatch                snapshot, click a mob, catch the fresh SETTARGET packet
   deathscan <name>           find a corpse despawn-countdown field
-  objscan <value> <name>     find offsets holding <value> across <name> movers`
+  objscan <value> <name>     find offsets holding <value> across <name> movers
+  findpenya <penya> [span]   pin penya_off (your gold field) by its value -> radar '+penya' pop.
+                             read your penya off the UI; if ambiguous, kill a mob + re-run w/ the new value`
