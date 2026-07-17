@@ -183,12 +183,12 @@ tc_pick_one :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: [
     }
   }
   // Bow-range retarget ("stay on the pack"): if an eligible mob is within engage range, pick the in-range
-  // mob nearest the last kill's spot rather than the one nearest us. This is part of the CLUSTERING brain,
-  // so it's gated behind density steering (density_w > 0) - with density OFF the picker falls straight to
-  // plain nearest, i.e. the simple/legacy behaviour, no matter how large attack_range (engage) is. (Before,
-  // this pass only ever fired point-blank because attack_range was tiny; a large attack_range turned it on
-  // and spread picks across the whole range - hence "density off must behave exactly like before".)
-  if ctx.require_fresh && ctx.density_w > 0 && ctx.last_kill_set {
+  // mob nearest the last kill's spot rather than the one nearest us. This is what stops a ranged/AoE char
+  // from ping-ponging: it keeps re-targeting the pack it's already shooting instead of chasing whatever is
+  // momentarily nearest. It's driven by engage (= attack_range), so it's only useful when attack_range is
+  // set to your REAL hit range; with a too-small attack_range nothing is ever in engage and this is inert
+  // (strict nearest, which ping-pongs). NOT gated by density - density is a separate, additive stage below.
+  if ctx.require_fresh && ctx.last_kill_set {
     best := -1
     best_ad := f32(1e30)
     for c, i in cands {

@@ -26,7 +26,9 @@ FLYFF_ANGLE_OFF :: 0x18 // CObj.m_fAngle (Y-yaw, DEGREES). Obj.cpp: RotationY(-m
 // (codescan for the code addresses, idscan for the offset). 0 means "not yet found": while
 // any is 0, `srvsync`/`srvtest` refuse to run and notify_server_target is a no-op.
 FLYFF_SENDSETTARGET_RVA :: 0x0 // entry of CDPClient::SendSetTarget (thiscall(OBJID, BYTE))
-FLYFF_GDPLAY_RVA :: 0x58CCC0 // &g_DPlay (global CDPClient object). Used for moveto server-sync (below).
+FLYFF_GDPLAY_RVA :: 0x58CCC0 // &g_DPlay (global CDPClient object) - a static that SHIFTS on patches
+// like the rest; findmove re-derives it from the `mov ecx, offset g_DPlay` at the senders' call sites
+// (derive_gdplay_rva), so this seed is only the pre-derivation fallback. Used for moveto/jump server-sync.
 FLYFF_OBJID_OFF :: 0x0 // CObj.m_objid (GetId) - value sent as idTarget
 
 // In-world debug markers (see draw.odin / remote_spawn_particles). We call the client's own

@@ -229,11 +229,30 @@ cli_findmove :: proc(session: ^Session, args: []string) {
     L.destpos_off, L.iddest_off, L.forward_off,
   )
 
-  // 5. moveto SERVER-SYNC (so other clients see a walk, not a teleport). gdplay_rva + dplay_destpos_off
-  //    are data-stable (seeded); sendsnapshot_rva is code (re-patches per launch) so it's AUTO-DERIVED
-  //    from the SendSnapshot code that reads playerdestpos.vPos - keeps move-sync alive across patches.
+  // 5. moveto SERVER-SYNC (so other clients see a walk, not a teleport). dplay_destpos_off is
+  //    data-stable (seeded); gdplay_rva is a STATIC THAT SHIFTS per patch, so it's re-derived from the
+  //    `mov ecx, offset g_DPlay` loads at the call sites of the known g_DPlay thiscalls (which is why
+  //    sendplayermoved derives first - it doubles as the caller anchor); sendsnapshot_rva is code
+  //    (re-patches per launch), auto-derived from the SendSnapshot code that reads playerdestpos.vPos
+  //    - and that scan needs the CORRECT gdplay_rva, so it runs last.
   if L.gdplay_rva == 0 {L.gdplay_rva = FLYFF_GDPLAY_RVA}
   if L.dplay_destpos_off == 0 {L.dplay_destpos_off = FLYFF_DPLAY_DESTPOS_OFF}
+  if pm, pok := derive_sendplayermoved_rva(session); pok {
+    L.sendplayermoved_rva = pm
+    fmt.printfln("  sendplayermoved_rva = 0x%X   (derived: local-player state sender - jump-sync)", pm)
+  } else if L.sendplayermoved_rva != 0 && sendplayermoved_rva_sane(session) {
+    fmt.printfln("  sendplayermoved_rva = 0x%X   (kept)", L.sendplayermoved_rva)
+  } else {
+    fmt.println("  sendplayermoved_rva NOT derived - jump still works but stays LOCAL-ONLY (others don't see it).")
+  }
+  if gd, gok := derive_gdplay_rva(session); gok {
+    if gd != L.gdplay_rva {
+      fmt.printfln("  gdplay_rva = 0x%X   (derived: ecx load at the senders' call sites; was 0x%X)", gd, L.gdplay_rva)
+    } else {
+      fmt.printfln("  gdplay_rva = 0x%X   (derived; confirms current)", gd)
+    }
+    L.gdplay_rva = gd
+  }
   gd_ok := L.gdplay_rva != 0 && in_module_range(read_ptr_at(handle, base + L.gdplay_rva, pt), base, mod_end)
   if ss, sok := derive_sendsnapshot_rva(session); sok {
     L.sendsnapshot_rva = ss
@@ -242,14 +261,6 @@ cli_findmove :: proc(session: ^Session, args: []string) {
     fmt.printfln("  sendsnapshot_rva = 0x%X   (kept)", L.sendsnapshot_rva)
   } else {
     fmt.println("  sendsnapshot_rva NOT derived - moveto still works but stays LOCAL-ONLY (others see a teleport).")
-  }
-  if pm, pok := derive_sendplayermoved_rva(session); pok {
-    L.sendplayermoved_rva = pm
-    fmt.printfln("  sendplayermoved_rva = 0x%X   (derived: local-player state sender - jump-sync)", pm)
-  } else if L.sendplayermoved_rva != 0 && sendplayermoved_rva_sane(session) {
-    fmt.printfln("  sendplayermoved_rva = 0x%X   (kept)", L.sendplayermoved_rva)
-  } else {
-    fmt.println("  sendplayermoved_rva NOT derived - jump still works but stays LOCAL-ONLY (others don't see it).")
   }
   fmt.printfln(
     "  server-sync: gdplay_rva=0x%X %s  dplay_destpos_off=0x%X (fForward +0xC, fValid +0x10)",
@@ -282,6 +293,59 @@ func_start :: proc(handle: win.HANDLE, addr: uintptr) -> uintptr {
     }
   }
   return 0
+}
+
+// Auto-derive gdplay_rva (&g_DPlay, the static CDPClient every packet sender is thiscall'd on - it
+// SHIFTS with the other statics on a patch, and a stale value poisons both the sendsnapshot derivation
+// and the ecx of the injected sync calls). Callers load ecx with the object's absolute address right
+// before the call (`mov ecx, imm32` = B9 <imm>), so majority-vote that imm across every direct call
+// site of the g_DPlay methods we already derived (SendPlayerMoved, SendSetTarget). The winner must be
+// a module-static address holding a module vtable (an object, not code) and win a clear majority of
+// the qualifying sites. Read-only.
+derive_gdplay_rva :: proc(session: ^Session) -> (rva: uintptr, ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  pt := engine.Value_Type.U32
+  L := session.layout
+  anchors := [2]uintptr{L.sendplayermoved_rva, L.sendsettarget_rva}
+  votes := make(map[u32]int, 8, context.temp_allocator)
+  total := 0
+  for a in anchors {
+    if a == 0 {
+      continue
+    }
+    sites := engine.codescan_calls(handle, base + a, context.temp_allocator)
+    for site in sites {
+      pre: [5]byte // `mov ecx, imm32` directly before the E8 call
+      n, rok := engine.read_into(handle, site - 5, pre[:])
+      if !rok || int(n) < 5 || pre[0] != 0xB9 {
+        continue
+      }
+      imm := u32(pre[1]) | u32(pre[2]) << 8 | u32(pre[3]) << 16 | u32(pre[4]) << 24
+      obj := uintptr(imm)
+      if obj <= base || obj >= mod_end {
+        continue // ecx isn't a static in this module - hoisted load or other object
+      }
+      if !in_module_range(read_ptr_at(handle, obj, pt), base, mod_end) {
+        continue // no module vtable at +0 -> not the CDPClient instance
+      }
+      votes[imm] += 1
+      total += 1
+    }
+  }
+  best: u32
+  best_n := 0
+  for imm, n in votes {
+    if n > best_n {
+      best = imm
+      best_n = n
+    }
+  }
+  if best_n < 2 || best_n * 2 <= total {
+    return 0, false // no clear majority - keep what's configured
+  }
+  return uintptr(best) - base, true
 }
 
 // Auto-derive sendsnapshot_rva: codescan the destpos.vPos ABSOLUTE address; the instruction that READS it

@@ -1303,13 +1303,15 @@ report_off :: proc(field: string, old, new: i64) {
 // Find the offset within [obj, obj+span) where `name` appears as an ASCII (NUL/ctrl-terminated)
 // or UTF-16LE string. Returns the byte offset. Used to locate the inline name buffer.
 find_name_offset :: proc(handle: win.HANDLE, obj: uintptr, name: string, span: int) -> (off: i64, ok: bool) {
-  buf := make([]byte, span, context.temp_allocator)
-  n, rok := engine.read_into(handle, obj, buf)
-  if !rok {
-    return 0, false
-  }
   nb := transmute([]byte)name
   if len(nb) == 0 {
+    return 0, false
+  }
+  // Prefix-partial read: obj+span can run past the end of the object's heap region (whole-read
+  // ReadProcessMemory would then fail even though the name IS mapped); the valid prefix suffices.
+  buf := make([]byte, span, context.temp_allocator)
+  n := engine.read_into_partial(handle, obj, buf)
+  if int(n) < len(nb) {
     return 0, false
   }
   // ASCII, requiring a terminator so we match the whole field, not a longer name's prefix.
@@ -1349,9 +1351,10 @@ find_name_offset :: proc(handle: win.HANDLE, obj: uintptr, name: string, span: i
 // Find the offset within [obj, obj+span) whose u32 equals `val`, preferring the one nearest
 // `prefer` (so a known-good default wins ties). 4-aligned. Used to pin hp_off.
 find_u32_offset :: proc(handle: win.HANDLE, obj: uintptr, val: u32, span: int, prefer: i64) -> (off: i64, ok: bool) {
+  // Prefix-partial read - same reason as find_name_offset: don't fail on a span past the region end.
   buf := make([]byte, span, context.temp_allocator)
-  n, rok := engine.read_into(handle, obj, buf)
-  if !rok {
+  n := engine.read_into_partial(handle, obj, buf)
+  if n < 4 {
     return 0, false
   }
   best: i64 = -1
@@ -1425,13 +1428,17 @@ find_player_by_name :: proc(session: ^Session, name: string) -> (player: uintptr
     if wlen < 4 {
       continue
     }
+    // Tail-partial read: the window ends at the name (known mapped) but may START in an unmapped
+    // hole below the enclosing object's heap block - a single whole-window read would fail and
+    // silently drop the one hit that IS the player (patch-day allocation luck). The object is
+    // contiguous with its name, so the valid tail is all we need.
     buf := make([]byte, wlen, context.temp_allocator)
-    rn, _ := engine.read_into(handle, lo, buf)
-    if int(rn) < 4 {
+    start := int(engine.read_into_partial_tail(handle, lo, buf))
+    if wlen - start < 4 {
       continue
     }
     // Scan backward from the name for the nearest preceding module-vtable that begins a named mover.
-    for off := ((int(rn) - 4) / 4) * 4; off >= 0; off -= 4 {
+    for off := ((wlen - 4) / 4) * 4; off >= start; off -= 4 {
       v := uintptr(rd_u32le(buf, off))
       if v < base || v >= mod_end {
         continue // not an in-module vtable
