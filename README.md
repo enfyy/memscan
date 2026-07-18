@@ -126,9 +126,9 @@ offset finders (one-time; each fills part of the layout)
   findfocus                  click a mob, then run: derives focus_off
   hpwatch                    target a mob and hit it: the field that drops is currentHP (hp_off)
   findsettarget              derive the srvsync offsets by signature (calibrate does this too)
-  findprop                   target your PET (monsters on screen), run: derives the any-monster gate
-                             (species MoverProp array -> GetProp()->dwAI==AII_MONSTER). one-time; skips
-                             pets/eggs/NPCs/players/bosses. re-run after a game patch.
+  findprop                   a few distinct monsters on screen (no target needed), run: derives the
+                             any-monster gate (species MoverProp array -> GetProp()->dwAI==AII_MONSTER).
+                             one-time; skips pets/eggs/NPCs/players/bosses. re-run after a game patch.
 
 terrain / obstacle recon (spike)
   worldscan [reset]          pin the terrain-grid offsets from your ground height (stand on solid

@@ -7,7 +7,7 @@ import "core:fmt"
 // generated build_hash.g.odin and is refreshed from the current source tree on every
 // build.bat run - so 'version' tells you exactly which build you are running and makes a
 // stale build easy to spot (compare the hash against the one build.bat printed).
-VERSION :: "0.2.1"
+VERSION :: "1.0.0"
 
 cli_version :: proc() {
   fmt.printfln("memscan v%s (build %s)", VERSION, BUILD_HASH)

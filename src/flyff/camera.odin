@@ -58,7 +58,7 @@ cli_findcam :: proc(session: ^Session, args: []string) {
 
   ppos, pok := read_player_pos(session)
   if !pok {
-    fmt.eprintln("couldn't read player position - run 'calibrate' first.")
+    fmt.eprintln("couldn't read player position - run 'setup <name>' first (be in-game).")
     return
   }
 

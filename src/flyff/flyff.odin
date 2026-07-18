@@ -14,7 +14,10 @@ FLYFF_POS_OFF :: 0x160 // CObj.m_vPos (3x f32)
 FLYFF_TYPE_REL :: 0x10 // m_dwType, relative to m_vPos (so POS_OFF+0x10)
 FLYFF_NAME_OFF :: 0x1DB8 // CMover inline name char buffer
 FLYFF_MOVER_TYPE :: 5 // m_dwType for movers (players, pets, NPCs, monsters)
-FLYFF_HP_OFF :: 0x281C // CMover current HP (LONG); 0 => dead/despawning (don't target)
+FLYFF_HP_OFF :: 0x814 // CMover current HP (LONG); 0 => dead/despawning (don't target). maxHP is the
+// next field (+0x818) and equals currentHP at full health - calibrate_derive steps DOWN to this (lower)
+// offset so it never pins maxHP by mistake (maxHP never hits 0, so pets/corpses would misread as alive).
+FLYFF_PENYA_OFF :: 0 // player penya/gold (u32, inline in CMover); 0 => unpinned (run 'findpenya')
 FLYFF_MODEL_OFF :: 0x178 // CObj.m_pModel; NULL => not rendered/selectable (crashes on select)
 FLYFF_ANGLE_OFF :: 0x18 // CObj.m_fAngle (Y-yaw, DEGREES). Obj.cpp: RotationY(-m_fAngle) => forward=(-sin,0,cos)
 
@@ -23,7 +26,9 @@ FLYFF_ANGLE_OFF :: 0x18 // CObj.m_fAngle (Y-yaw, DEGREES). Obj.cpp: RotationY(-m
 // (codescan for the code addresses, idscan for the offset). 0 means "not yet found": while
 // any is 0, `srvsync`/`srvtest` refuse to run and notify_server_target is a no-op.
 FLYFF_SENDSETTARGET_RVA :: 0x0 // entry of CDPClient::SendSetTarget (thiscall(OBJID, BYTE))
-FLYFF_GDPLAY_RVA :: 0x0 // &g_DPlay (global CDPClient) - the thiscall `this`
+FLYFF_GDPLAY_RVA :: 0x58CCC0 // &g_DPlay (global CDPClient object) - a static that SHIFTS on patches
+// like the rest; findmove re-derives it from the `mov ecx, offset g_DPlay` at the senders' call sites
+// (derive_gdplay_rva), so this seed is only the pre-derivation fallback. Used for moveto/jump server-sync.
 FLYFF_OBJID_OFF :: 0x0 // CObj.m_objid (GetId) - value sent as idTarget
 
 // In-world debug markers (see draw.odin / remote_spawn_particles). We call the client's own
@@ -46,6 +51,29 @@ FLYFF_HMAP_OFF :: 0x0 // CLandscape.m_pHeightMap (float*, 129x129 corner grid)
 // (you close to range, then attack - ranged has no LOS check on the shot). Per-character; `set
 // attack_range <n>`. 0 => test the full path to the mob's cell.
 FLYFF_ATTACK_RANGE :: 1.7
+
+// Density / cluster steering (NOT memory offsets). density_on gates the whole feature: OFF = the plain
+// nearest-mob cascade (v0.4.0-identical); ON = auto commits to a mob pack until it's wiped
+// (cluster_advance) and only detours to a denser pack past a double gate - at least density_min_gain
+// more pack members AND at most density_max_detour extra walk distance (world units). Tune live with
+// `density mingain <n>` / `density detour <n>` + `tdbg`. density_weight is the RETIRED pre-rework
+// continuous weight, kept only so old flyff.cfg files still parse; a positive value migrates to
+// density_on=true on load (flyff_load_cfg). Default off so the picker is unchanged until you opt in.
+FLYFF_DENSITY_WEIGHT :: 0
+FLYFF_DENSITY_ON :: false
+FLYFF_DENSITY_MIN_GAIN :: 3
+FLYFF_DENSITY_MAX_DETOUR :: f32(20)
+
+// Persisted runtime toggles (NOT memory offsets). preselect/lookalive/reachgate mirror the Session
+// bools so they survive restarts: session.X stays authoritative at runtime, layout.X exists only for
+// the flyff.cfg round-trip (loaded into the session on attach - see on_attach - and written back by
+// cli_preselect / cli_lookalive / cli_reachgate). sfx_on / fx_laser_on are radar-only juice toggles
+// with the layout as their single source of truth (cli_sfx / cli_fxlaser).
+FLYFF_PRESELECT_ON :: true
+FLYFF_LOOKALIVE_ON :: false
+FLYFF_REACH_GATE_ON :: true
+FLYFF_SFX_ON :: true
+FLYFF_FX_LASER_ON :: true
 
 // Static CObj* CWorld::m_aobjCull[] - the render on-screen display array (World.cpp:69). The object
 // reach test reads this (fast, ~on-screen count) instead of scanning all of memory for CObj. Found by
@@ -77,6 +105,61 @@ FLYFF_COLL_TYPE_OFF :: 0x104
 // prologue bytes before every call. Re-find after a patch (string "CWorld::IntersectObjLine" ->
 // codescan -> func prologue). 0 => disabled.
 FLYFF_INTERSECTOBJLINE_RVA :: 0x44AA10
+
+// Character control - `moveto` (field-write) + `jump` (client-call). See move.odin / remotecall.odin.
+//
+// moveto is CLIENT-AUTHORITATIVE and needs NO code call: a ground click just sets CMover's dest fields
+// and the client's own ProcessMove walks there each tick, re-reporting position continuously (so no
+// anti-DC concern). CMover::SetDestPos is INLINED into its callers in this build (no standalone function
+// to call), so moveto writes the same fields directly via WriteProcessMemory. These are DATA offsets and
+// stayed stable across the fork's code re-patches (unlike RVAs). Found/validated by `findmove`.
+//   destpos_off - m_vDestPos (3x f32). Non-zero (IsEmptyDestPos false) is what makes ProcessMove walk.
+//   iddest_off  - m_idDest (OBJID). Set to NULL_ID (0xFFFFFFFF) so it's dest-POS mode, not dest-object.
+//   forward_off - m_bForward (byte, =1 to walk toward the dest). m_bPositiveX = +1, m_bPositiveZ = +2
+//                 (consecutive bytes): the arrival-sign bits ProcessMove compares against each tick -
+//                 must equal (m_vPos.x - dest.x)>0 / (m_vPos.z - dest.z)>0 at write time or it insta-arrives.
+//
+// jump DOES call the client: CActionMover::SendActMsg(jump_msg, 0,0,0,0,0) from an injected thread, so
+// every in-client guard (grounded / not casting/attacking/sitting) applies. SendActMsg is VIRTUAL
+// (vtable[1] on m_pActMover), thiscall(ecx=m_pActMover), takes SIX stack args -> ret 0x18. findmove
+// auto-derives its RVA from the vtable (robust across code re-patches) and verifies the prologue before
+// each call (a stale RVA would jump into wrong code = client crash). 0 => jump stays inert.
+//   sendactmsg_rva - RVA of CActionMover::SendActMsg (derived from actmover vtable[1]).
+//   actmover_off   - CMover.m_pActMover offset (the CActionMover* jump needs as `this`; CAction::m_pObj,
+//                    the backref to the owning CMover, sits at +0xC inside it - how findmove pins it).
+//   jump_msg       - OBJMSG_JUMP enum value. The base source has 0x11, but THIS fork shifted the enum
+//                    +1 (0x11 plays a stun) so it's 0x12 here. findmove auto-derives it from the
+//                    SendActMsg switch (the case that writes OBJSTA_SJUMP1) so an enum renumber is handled.
+FLYFF_SENDACTMSG_RVA :: 0x0
+FLYFF_ACTMOVER_OFF :: 0x0
+FLYFF_JUMP_MSG :: u32(0x12)
+FLYFF_DESTPOS_OFF :: 0x38C
+FLYFF_IDDEST_OFF :: 0x388
+FLYFF_FORWARD_OFF :: 0x39C
+
+// moveto SERVER-SYNC. The field-write above only makes OUR client walk; other clients see a teleport
+// unless the client tells the SERVER its destination. The click-path does that via
+// g_DPlay.PutPlayerDestPos + SendSnapshot, which just set m_ss.playerdestpos {fValid, vPos, fForward} and
+// let the client's per-frame SendSnapshot broadcast SNAPSHOTTYPE_DESTPOS. So we write that struct directly
+// (in g_DPlay = base+gdplay_rva) and rely on the client's own periodic snapshot - no injected call.
+//   dplay_destpos_off - offset of m_ss.playerdestpos.vPos inside g_DPlay (found by findpos after a real
+//                       click-to-move). fForward (byte) sits at +0xC, fValid (BOOL) at +0x10 (verified
+//                       against the inlined PutPlayerDestPos). 0 => sync off.
+//   sendsnapshot_rva  - CDPClient::SendSnapshot(BOOL fUnconditional); thiscall(ecx=&g_DPlay), 1 arg,
+//                       ret 4. Writing playerdestpos.fValid alone does NOT broadcast (the client's own
+//                       periodic snapshot won't flush an externally-set flag), so moveto injects
+//                       SendSnapshot(TRUE) to flush it immediately - exactly what a ground click does.
+//                       Code RVA (re-patches per launch); derived by findmove (codescan the destpos.vPos
+//                       absolute -> the reader that builds the packet). 0 => sync off.
+FLYFF_DPLAY_DESTPOS_OFF :: 0x2C
+FLYFF_SENDSNAPSHOT_RVA :: 0x0
+
+// jump SERVER-SYNC. SendActMsg(OBJMSG_JUMP) only sets the jump STATE locally; other clients don't see it
+// until the client sends its state. The periodic sync driver does this via the local-player state sender
+// (a SendPlayerMoved-style fn: thiscall ecx=&g_DPlay, 1 arg = the player CMover*, bails unless arg ==
+// g_pPlayer, sends pos/velocity/GetState/motion, ret 4). jump injects it right after SendActMsg so the
+// jump state broadcasts. Code RVA (re-patches per launch); prologue-guarded. 0 => jump stays local-only.
+FLYFF_SENDPLAYERMOVED_RVA :: 0x0
 
 // Camera-INDEPENDENT obstacle source (see terrain.odin collect_area_colliders). Each CLandscape tile
 // keeps a flat array of every object on it, unlike m_aobjCull which only holds what the render frustum
@@ -128,6 +211,7 @@ Flyff_Layout :: struct {
   field_off:         i64,
   name_off:          i64,
   hp_off:            i64,
+  penya_off:         i64,
   model_off:         i64,
   angle_off:         i64,
   mover_type:        u32,
@@ -144,12 +228,30 @@ Flyff_Layout :: struct {
   mpu_off:           i64,
   hmap_off:          i64,
   attack_range:      f32,
+  density_weight:    f32, // retired (pre-rework continuous weight); kept so old cfgs parse + migrate
+  density_on:        bool,
+  density_min_gain:  int,
+  density_max_detour: f32,
+  preselect_on:      bool, // cfg mirror of Session.preselect_on (see FLYFF_PRESELECT_ON note)
+  lookalive_on:      bool, // cfg mirror of Session.lookalive_on
+  reach_gate_on:     bool, // cfg mirror of Session.reach_gate_on
+  sfx_on:            bool, // radar sound effects (penya chime + kill zap)
+  fx_laser_on:       bool, // radar kill laser-beam effect
   aobjcull_rva:      uintptr,
   camera_rva:        uintptr,
   coll_obj3d_off:    i64,
   coll_type_off:     i64,
   intersectobjline_rva: uintptr,
   landobj_off:       i64,
+  sendactmsg_rva:    uintptr,
+  actmover_off:      i64,
+  jump_msg:          u32,
+  destpos_off:       i64,
+  iddest_off:        i64,
+  forward_off:       i64,
+  dplay_destpos_off: i64,
+  sendsnapshot_rva:  uintptr,
+  sendplayermoved_rva: uintptr,
 }
 
 flyff_layout_default :: proc() -> Flyff_Layout {
@@ -161,6 +263,7 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     field_off         = FLYFF_FIELD_OFF,
     name_off          = FLYFF_NAME_OFF,
     hp_off            = FLYFF_HP_OFF,
+    penya_off         = FLYFF_PENYA_OFF,
     model_off         = FLYFF_MODEL_OFF,
     angle_off         = FLYFF_ANGLE_OFF,
     mover_type        = FLYFF_MOVER_TYPE,
@@ -177,11 +280,29 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     mpu_off           = FLYFF_MPU_OFF,
     hmap_off          = FLYFF_HMAP_OFF,
     attack_range      = FLYFF_ATTACK_RANGE,
+    density_weight    = FLYFF_DENSITY_WEIGHT,
+    density_on        = FLYFF_DENSITY_ON,
+    density_min_gain  = FLYFF_DENSITY_MIN_GAIN,
+    density_max_detour = FLYFF_DENSITY_MAX_DETOUR,
+    preselect_on      = FLYFF_PRESELECT_ON,
+    lookalive_on      = FLYFF_LOOKALIVE_ON,
+    reach_gate_on     = FLYFF_REACH_GATE_ON,
+    sfx_on            = FLYFF_SFX_ON,
+    fx_laser_on       = FLYFF_FX_LASER_ON,
     aobjcull_rva      = FLYFF_AOBJCULL_RVA,
     camera_rva        = FLYFF_CAMERA_RVA,
     coll_obj3d_off    = FLYFF_COLL_OBJ3D_OFF,
     coll_type_off     = FLYFF_COLL_TYPE_OFF,
     intersectobjline_rva = FLYFF_INTERSECTOBJLINE_RVA,
     landobj_off       = FLYFF_LANDOBJ_OFF,
+    sendactmsg_rva    = FLYFF_SENDACTMSG_RVA,
+    actmover_off      = FLYFF_ACTMOVER_OFF,
+    jump_msg          = FLYFF_JUMP_MSG,
+    destpos_off       = FLYFF_DESTPOS_OFF,
+    iddest_off        = FLYFF_IDDEST_OFF,
+    forward_off       = FLYFF_FORWARD_OFF,
+    dplay_destpos_off = FLYFF_DPLAY_DESTPOS_OFF,
+    sendsnapshot_rva  = FLYFF_SENDSNAPSHOT_RVA,
+    sendplayermoved_rva = FLYFF_SENDPLAYERMOVED_RVA,
   }
 }

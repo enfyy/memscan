@@ -5,6 +5,8 @@ import "core:fmt"
 import "core:math"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
+import "core:time"
 import win "core:sys/windows"
 
 // ===========================================================================
@@ -230,7 +232,7 @@ cli_worldscan :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate' first.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>' first.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
@@ -407,7 +409,7 @@ cli_attr :: proc(session: ^Session, args: []string) {
   L := session.layout
   world := read_ptr_at(handle, base + L.world_rva, pt)
   if world == 0 {
-    fmt.eprintln("world not resolved - run 'calibrate'.")
+    fmt.eprintln("world not resolved - run 'setup <name>'.")
     return
   }
 
@@ -463,7 +465,7 @@ cli_reach :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
@@ -536,7 +538,7 @@ cli_attackable :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   focus := read_ptr_at(handle, world + uintptr(L.focus_off), pt)
@@ -588,7 +590,7 @@ cli_attrmap :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
@@ -774,7 +776,7 @@ cli_objects :: proc(session: ^Session, args: []string) {
   }
   wv, wok := engine.read_value(handle, base + L.world_rva, pt)
   if !wok {
-    fmt.eprintln("objects: world not resolved - run 'calibrate'.")
+    fmt.eprintln("objects: world not resolved - run 'setup <name>'.")
     return
   }
   world := uintptr(engine.value_as_u64(pt, wv))
@@ -1209,6 +1211,16 @@ collect_nearby_obbs :: proc(session: ^Session, cx, cz, radius: f32) -> [dynamic]
 COLLIDER_CACHE_MOVE :: f32(16) // refresh the cache once the player moves this far from its center
 COLLIDER_RADIUS :: f32(120) // gather colliders within this of the player (must cover reach segments)
 
+// Ground drops + skill/effect zones are OT_CTRL objects (this server renders ground loot as CCtrl, one
+// per item, with a small ~1x0.5x1 box) that pile up exactly where you farm. The game never blocks
+// movement on them, but the full-scan collider set would treat them as solid - drawing phantom purple
+// boxes on the radar and making reach call a mob behind them "unreachable". A real OT_CTRL blocker
+// (housing / walls / guild towers) is far larger, so we drop any OT_CTRL whose box is this small. OT_OBJ
+// static props are unaffected (they keep the GMT_ERROR walk-through filter). Tune if a real small OT_CTRL
+// blocker is ever missed.
+CTRL_DROP_MAX_XZ :: f32(1.5) // half-extent; a drop/effect box is <= this wide/deep
+CTRL_DROP_MAX_Y :: f32(0.75) // half-extent; and this short (real walls/housing are taller)
+
 // Read one live CObj into an Obb (m_OBB at pos_off-0x3C) + its position + decorative flag. ok=false if
 // it's not a live CObj (no module vtable) or the read fails.
 obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok: bool) {
@@ -1230,11 +1242,19 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
     return
   }
   ty := rd_u32le(buf[:], po + 0x10)
+  if ty != 0 && ty != 3 {
+    return // OT_OBJ (trees/rocks/buildings) or OT_CTRL (walls/housing) only - the collidable props
+  }
   rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
   pos = {rf(buf[:], po), rf(buf[:], po + 4), rf(buf[:], po + 8)}
   oo := po - 0x3C
   o.center = {rf(buf[:], oo), rf(buf[:], oo + 4), rf(buf[:], oo + 8)}
   o.ext = {rf(buf[:], oo + 0xC), rf(buf[:], oo + 0x10), rf(buf[:], oo + 0x14)}
+  // Drop / effect controls: a small OT_CTRL box is ground loot or a skill zone, not a real blocker - skip
+  // it so it never draws as a phantom obstacle or fails a reach check. See CTRL_DROP_MAX_* above.
+  if ty == 3 && o.ext[0] <= CTRL_DROP_MAX_XZ && o.ext[2] <= CTRL_DROP_MAX_XZ && o.ext[1] <= CTRL_DROP_MAX_Y {
+    return
+  }
   o.axis[0] = {rf(buf[:], oo + 0x18), rf(buf[:], oo + 0x1C), rf(buf[:], oo + 0x20)}
   o.axis[1] = {rf(buf[:], oo + 0x24), rf(buf[:], oo + 0x28), rf(buf[:], oo + 0x2C)}
   o.axis[2] = {rf(buf[:], oo + 0x30), rf(buf[:], oo + 0x34), rf(buf[:], oo + 0x38)}
@@ -1243,53 +1263,17 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
   return
 }
 
-// Append OT_OBJ + OT_CTRL colliders from one tile's flat m_apObject arrays into `out`, radius-filtered
-// around (cx,cz). Camera-independent: m_apObject[type] holds every object on the tile with a live count.
-gather_tile_colliders :: proc(session: ^Session, pland: uintptr, cx, cz, radius: f32, out: ^[dynamic]Obb) {
-  handle := session.proc_info.handle
-  pt := engine.Value_Type.U32
-  L := session.layout
-  types := [?]i64{0, 3} // OT_OBJ, OT_CTRL
-  for ti in types {
-    arrp := read_ptr_at(handle, pland + uintptr(L.landobj_off + ti * 4), pt)
-    if !is_heap_ptr(session, arrp) {
-      continue
-    }
-    cnt := read_i32_at(handle, pland + uintptr(L.landobj_off + LANDOBJ_MAX_ARRAY * 4 + ti * 4))
-    if cnt <= 0 || cnt > 200000 {
-      continue
-    }
-    ab := make([]byte, int(cnt) * 4, context.temp_allocator)
-    rn, _ := engine.read_into(handle, arrp, ab)
-    r2 := radius * radius
-    for k in 0 ..< int(rn) / 4 {
-      obj := uintptr(rd_u32le(ab, k * 4))
-      if obj < 0x10000 {
-        continue // freed / empty slot
-      }
-      // cheap radius reject on a 12-byte position read before the full OBB read
-      opos, ook := engine.read_vec3(handle, obj + uintptr(L.pos_off))
-      if !ook {
-        continue
-      }
-      dx := opos[0] - cx
-      dz := opos[2] - cz
-      if dx * dx + dz * dz > r2 {
-        continue
-      }
-      if o, _, ok := obj_to_obb(session, obj); ok {
-        append(out, o)
-      }
-    }
-  }
-}
-
-// Gather (and cache) every collidable prop within COLLIDER_RADIUS of the player from the CLandscape tile
-// arrays - the player's tile plus any neighbour tile the radius reaches. Camera-independent. Rebuilt only
-// when the player leaves the cached area, so segment tests hit the cache (pure math, no reads).
+// Gather (and cache) every collidable prop within COLLIDER_RADIUS of the player. Uses a FULL writable-
+// memory scan for the world pointer (each CObj holds m_pWorld at field_off), then keeps OT_OBJ/OT_CTRL
+// with a live OBB. Complete by construction: it finds every prop the game collides against regardless of
+// which spatial list holds it. This matters on maps like Azria, where big static ice rocks live only in
+// the CLandscape LINK MAP (m_apObjLink[linkStatic], what CWorld::ProcessCollision walks) and are ABSENT
+// from the flat per-tile m_apObject array the old walk read - so reach/radar saw straight through them
+// (path in, get stuck; not drawn). The picker already full-scans every tick, so this is the same cost
+// class. Rebuilt only when the player leaves the cached area, so segment tests hit the cache (pure math).
 collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32) -> []Obb {
   L := session.layout
-  if world == 0 || L.landobj_off == 0 || L.land_off == 0 || L.landwidth_off == 0 || session.ptr_size != 4 {
+  if world == 0 || session.ptr_size != 4 {
     return nil
   }
   if session.collider_cache_valid {
@@ -1301,35 +1285,32 @@ collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32) -
   }
   handle := session.proc_info.handle
   pt := engine.Value_Type.U32
-  mpu := f32(world_mpu(session, world))
-  land_width := read_i32_at(handle, world + uintptr(L.landwidth_off))
-  land_height := read_i32_at(handle, world + uintptr(L.landwidth_off + 4))
-  arr := read_ptr_at(handle, world + uintptr(L.land_off), pt)
-  if !is_heap_ptr(session, arr) || land_width <= 0 || land_height <= 0 {
-    return nil
-  }
   clear(&session.collider_cache)
-  tile_world := f32(MAP_SIZE) * mpu
-  m_x := int(px / mpu) / MAP_SIZE
-  m_z := int(pz / mpu) / MAP_SIZE
-  for tz := m_z - 1; tz <= m_z + 1; tz += 1 {
-    for tx := m_x - 1; tx <= m_x + 1; tx += 1 {
-      if tx < 0 || tz < 0 || tx >= int(land_width) || tz >= int(land_height) {
-        continue
-      }
-      // include a neighbour tile only if the gather radius actually reaches it
-      lo_x := f32(tx) * tile_world
-      lo_z := f32(tz) * tile_world
-      if px + COLLIDER_RADIUS < lo_x || px - COLLIDER_RADIUS > lo_x + tile_world ||
-         pz + COLLIDER_RADIUS < lo_z || pz - COLLIDER_RADIUS > lo_z + tile_world {
-        continue
-      }
-      pland := read_ptr_at(handle, arr + uintptr((tx + tz * int(land_width)) * session.ptr_size), pt)
-      if !is_heap_ptr(session, pland) {
-        continue
-      }
-      gather_tile_colliders(session, pland, px, pz, COLLIDER_RADIUS, &session.collider_cache)
+  wval := engine.ptr_to_value(world, session.ptr_size)
+  regions := engine.collect_regions(handle, true)
+  defer delete(regions)
+  set := engine.scan_exact_parallel(handle, pt, wval, regions[:], context.temp_allocator)
+  r2 := COLLIDER_RADIUS * COLLIDER_RADIUS
+  seen := make(map[uintptr]bool, 2048, context.temp_allocator) // an object holds m_pWorld once, but guard anyway
+  for m in set.matches {
+    obj := uintptr(i64(m.addr) - L.field_off)
+    if obj in seen {
+      continue
     }
+    seen[obj] = true
+    o, _, ok := obj_to_obb(session, obj) // vtable-checked + type-filtered to OT_OBJ/OT_CTRL
+    if !ok {
+      continue
+    }
+    if o.ext[0] <= 0.01 && o.ext[2] <= 0.01 {
+      continue // degenerate / uninitialised OBB - nothing to test or draw
+    }
+    dx := o.center[0] - px
+    dz := o.center[2] - pz
+    if dx * dx + dz * dz > r2 {
+      continue
+    }
+    append(&session.collider_cache, o)
   }
   session.collider_cache_center = {px, 0, pz}
   session.collider_cache_valid = true
@@ -1677,10 +1658,10 @@ obj_is_decorative :: proc(session: ^Session, obj: uintptr, ty: u32) -> bool {
   return false
 }
 
-// collscan [radius] - for each nearby OT_OBJ / OT_CTRL prop (from the on-screen cull array), read its
-// model filename + collision-mesh type. The decorative-prop recon: it shows, per prop, whether the .o3d
-// has a dedicated collision mesh (NORMAL) or falls back to the render mesh (ERROR). Read-only; also
-// reports a consensus (elem_off, name_off) so those two inner offsets can be pinned for a fast filter.
+// collscan [radius] - for each nearby OT_OBJ / OT_CTRL prop (found by a full memory scan, so all props
+// count, not just the on-screen ones), read its model filename + collision-mesh type. The decorative-prop
+// recon: it shows, per prop, whether the .o3d has a dedicated collision mesh (NORMAL) or falls back to the
+// render mesh (ERROR). Read-only; auto-pins the consensus (coll_obj3d_off, coll_type_off) for the filter.
 cli_collscan :: proc(session: ^Session, args: []string) {
   if !session.attached {
     fmt.eprintln("not attached.")
@@ -1691,10 +1672,6 @@ cli_collscan :: proc(session: ^Session, args: []string) {
     return
   }
   L := session.layout
-  if L.aobjcull_rva == 0 {
-    fmt.eprintln("collscan: needs the on-screen cull array - run 'findcull' first.")
-    return
-  }
   handle := session.proc_info.handle
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
@@ -1702,6 +1679,11 @@ cli_collscan :: proc(session: ^Session, args: []string) {
   wlen := po + 0x1C
   if wlen > 512 {
     fmt.eprintln("collscan: implausible pos_off.")
+    return
+  }
+  world := read_ptr_at(handle, base + L.world_rva, engine.Value_Type.U32)
+  if world == 0 {
+    fmt.eprintln("collscan: world not resolved - run 'setup <name>' first.")
     return
   }
 
@@ -1717,9 +1699,6 @@ cli_collscan :: proc(session: ^Session, args: []string) {
     }
   }
 
-  CAP :: 8192
-  idx := make([]byte, CAP * 4, context.temp_allocator)
-  n, _ := engine.read_into(handle, base + L.aobjcull_rva, idx)
   buf: [512]byte
   rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
 
@@ -1733,45 +1712,46 @@ cli_collscan :: proc(session: ^Session, args: []string) {
   }
   rows := make([dynamic]Row, context.temp_allocator)
   votes := make(map[[2]i64]int, 8, context.temp_allocator)
-  seen := make(map[uintptr]bool, 512, context.temp_allocator) // m_aobjCull repeats the same CObj* across slots
+  seen := make(map[uintptr]bool, 512, context.temp_allocator)
   n_props := 0
   n_probed := 0
-  for k in 0 ..< int(n) / 4 {
-    p := uintptr(rd_u32le(idx, k * 4))
-    if p < 0x10000 {
-      break // null slot = past the live entries
+  // Full writable-memory scan for the world pointer -> every CObj (holds m_pWorld at field_off), so we
+  // see all nearby props (better consensus + no findcull/aobjcull dependency), not just the on-screen set.
+  wval := engine.ptr_to_value(world, session.ptr_size)
+  regions := engine.collect_regions(handle, true)
+  defer delete(regions)
+  set := engine.scan_exact_parallel(handle, engine.Value_Type.U32, wval, regions[:], context.temp_allocator)
+  for m in set.matches {
+    obj := uintptr(i64(m.addr) - L.field_off)
+    if seen[obj] {
+      continue
     }
-    rn, rok := engine.read_into(handle, p, buf[:wlen])
+    rn, rok := engine.read_into(handle, obj, buf[:wlen])
     if !rok || int(rn) < wlen {
-      break
+      continue
     }
     vt := uintptr(rd_u32le(buf[:], 0))
     if vt < base || vt >= mod_end {
-      break // end of the live cull prefix
+      continue // not a live CObj
     }
     ty := rd_u32le(buf[:], po + 0x10)
     if ty != 0 && ty != 3 {
       continue // OT_OBJ / OT_CTRL only (the collidable props)
     }
-    if seen[p] {
-      continue // already listed this prop
-    }
-    seen[p] = true
-    ocx := rf(buf[:], po)
-    ocz := rf(buf[:], po + 8)
-    dx := ocx - ppos[0]
-    dz := ocz - ppos[2]
+    seen[obj] = true
+    dx := rf(buf[:], po) - ppos[0]
+    dz := rf(buf[:], po + 8) - ppos[2]
     dist := math.sqrt(dx * dx + dz * dz)
     if dist > radius {
       continue
     }
     n_props += 1
-    fname, eoff, noff, coll, cok := probe_model_coll(session, p)
+    fname, eoff, noff, coll, cok := probe_model_coll(session, obj)
     if cok {
       n_probed += 1
       votes[[2]i64{eoff, noff}] += 1
     }
-    append(&rows, Row{p, ty, dist, coll, cok, fname})
+    append(&rows, Row{obj, ty, dist, coll, cok, fname})
   }
 
   // sort by distance (selection sort; small near-set)
@@ -1824,6 +1804,181 @@ cli_collscan :: proc(session: ^Session, args: []string) {
       fmt.println("  => not saved (props disagree on the offsets). Re-run somewhere with more props in view.")
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// collwatch - catch a TRANSIENT collider (a mob-respawn VFX / pet-activation effect that's only up for a
+// fraction of a second, so a one-shot `collscan` can't be timed to it). Polls the object set every
+// ~300ms for <seconds>; the instant an object APPEARS (after a baseline snapshot) it's logged with its
+// full identity (type, model, collision mesh, box) and flagged [COLLIDER] if our reach filter would
+// treat it as solid; when it vanishes, its lifetime is printed. Just run it and re-trigger the effect
+// (activate the pick-up pet / farm at a spawn) - no timing needed. Read-only; releases exec_mutex
+// between polls so auto-farm keeps running. Diagnostic only (pins nothing), so it's not in setup/status.
+// ---------------------------------------------------------------------------
+
+COLLWATCH_INTERVAL_MS :: u32(300)
+
+Collwatch_Seen :: struct {
+  first_ns:      i64,
+  last_iter:     int, // last poll index this object was present in
+  ident:         string, // cloned identity line (printed on vanish, after the object is freed)
+  is_coll:       bool,
+  reported_gone: bool,
+}
+
+// Format one object's identity for collwatch, and decide whether our reach filter would treat it as a
+// solid collider (mirrors the obj_to_obb gate). within=false if it's outside <radius> of the player.
+collwatch_identify :: proc(session: ^Session, obj: uintptr, ppos: [3]f32, radius: f32) -> (line: string, is_coll: bool, within: bool, ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  po := int(session.layout.pos_off)
+  wlen := po + 0x1C
+  if wlen > 512 {
+    return
+  }
+  buf: [512]byte
+  n, rok := engine.read_into(handle, obj, buf[:wlen])
+  if !rok || int(n) < wlen {
+    return
+  }
+  vt := uintptr(rd_u32le(buf[:], 0))
+  if vt < base || vt >= mod_end {
+    return // not a live CObj
+  }
+  rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
+  ty := rd_u32le(buf[:], po + 0x10)
+  pos := [3]f32{rf(buf[:], po), rf(buf[:], po + 4), rf(buf[:], po + 8)}
+  dx := pos[0] - ppos[0]
+  dz := pos[2] - ppos[2]
+  d := math.sqrt(dx * dx + dz * dz)
+  if d > radius {
+    return "", false, false, true // valid object, just out of range
+  }
+  oo := po - 0x3C
+  ext := [3]f32{rf(buf[:], oo + 0xC), rf(buf[:], oo + 0x10), rf(buf[:], oo + 0x14)}
+  // Would obj_to_obb keep this as a solid collider? Type gate + degenerate-box drop + small-OT_CTRL drop.
+  is_coll = (ty == 0 || ty == 3) && (ext[0] > 0.01 || ext[2] > 0.01)
+  if is_coll && ty == 3 && ext[0] <= CTRL_DROP_MAX_XZ && ext[2] <= CTRL_DROP_MAX_XZ && ext[1] <= CTRL_DROP_MAX_Y {
+    is_coll = false // small OT_CTRL = ground drop / effect zone, already dropped
+  }
+  coll_s := "-"
+  if fname, _, _, coll, cok := probe_model_coll(session, obj); cok {
+    coll_s = fmt.tprintf("%s '%s'", gmt_name(coll), fname)
+  }
+  line = fmt.tprintf(
+    "0x%08X %s(%d) d=%4.1f box=(%.1f,%.1f,%.1f) mesh=%s",
+    obj, ot_name(ty), ty, d, ext[0], ext[1], ext[2], coll_s,
+  )
+  return line, is_coll, true, true
+}
+
+// collwatch [seconds] [radius] - see the section header above.
+cli_collwatch :: proc(session: ^Session, args: []string) {
+  if !session.attached || session.ptr_size != 4 {
+    fmt.eprintln("collwatch: attach a 32-bit Neuz first.")
+    return
+  }
+  L := session.layout
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  world := read_ptr_at(handle, base + L.world_rva, engine.Value_Type.U32)
+  if world == 0 {
+    fmt.eprintln("collwatch: world not resolved - run 'setup <name>' first.")
+    return
+  }
+  // Args are position-free: 'all'/'v'/'verbose' -> also show non-collider objects (mobs/items/effects);
+  // the first numeric = seconds, the second numeric = radius.
+  secs := 30
+  radius := f32(60)
+  verbose := false
+  nnum := 0
+  for a in args {
+    if a == "all" || a == "v" || a == "verbose" {
+      verbose = true
+      continue
+    }
+    if v, ok := strconv.parse_f64(a); ok && v > 0 {
+      if nnum == 0 {
+        secs = min(int(v), 600)
+      } else if nnum == 1 {
+        radius = f32(v)
+      }
+      nnum += 1
+    }
+  }
+
+  seen := make(map[uintptr]Collwatch_Seen, 512) // default allocator - persists across polls
+  defer {
+    for _, s in seen {
+      delete(s.ident)
+    }
+    delete(seen)
+  }
+
+  wval := engine.ptr_to_value(world, session.ptr_size)
+  deadline := time.now()._nsec + i64(secs) * 1_000_000_000
+  fmt.printfln(
+    "collwatch: polling every %dms for %ds within %.0f, %s. Farm the spawn (tower map); each SOLID box logs as it appears - [COLLIDER] lines are the phantom-obstacle candidates.",
+    COLLWATCH_INTERVAL_MS, secs, radius, verbose ? "ALL objects" : "colliders only (mobs/items hidden)",
+  )
+  iter := 0
+  n_new := 0
+  for {
+    now_ns := time.now()._nsec
+    // Re-resolve world + player each poll (zoning / re-log changes them).
+    w := read_ptr_at(handle, base + L.world_rva, engine.Value_Type.U32)
+    ppos, pok := read_player_pos(session)
+    if w != 0 && pok {
+      regions := engine.collect_regions(handle, true)
+      set := engine.scan_exact_parallel(handle, engine.Value_Type.U32, wval, regions[:], context.temp_allocator)
+      delete(regions)
+      for m in set.matches {
+        obj := uintptr(i64(m.addr) - L.field_off)
+        line, is_coll, within, ok := collwatch_identify(session, obj, ppos, radius)
+        if !ok || !within {
+          continue
+        }
+        // COLLIDERS ONLY: the phantom is a solid OBJ/CTRL box (that's exactly what the radar draws as a
+        // purple box). Movers (mobs), items, effects reach ignores are dropped here so they can't bury
+        // the signal - unless <verbose> was passed (2nd... 'all' or 'v').
+        if !is_coll && !verbose {
+          continue
+        }
+        if s, found := &seen[obj]; found {
+          s.last_iter = iter
+        } else {
+          seen[obj] = Collwatch_Seen{first_ns = now_ns, last_iter = iter, ident = strings.clone(line), is_coll = is_coll}
+          if iter > 0 { // don't spam the baseline set on the first poll
+            n_new += 1
+            fmt.printfln("[collwatch +] %s%s", is_coll ? "[COLLIDER] " : "[non-coll] ", line)
+          }
+        }
+      }
+      // Vanished-since-last-poll -> print lifetime once (confirms transience; the memory is freed by now).
+      for obj, &s in seen {
+        if !s.reported_gone && s.last_iter < iter {
+          fmt.printfln("[collwatch -] gone after %.1fs: %s", f32(now_ns - s.first_ns) / 1e9, s.ident)
+          s.reported_gone = true
+        }
+        _ = obj
+      }
+      if iter == 0 {
+        fmt.printfln("[collwatch] baseline: %d %s in range - now watching for new ones...", len(seen), verbose ? "object(s)" : "collider(s)")
+      }
+    }
+    free_all(context.temp_allocator)
+    iter += 1
+    if time.now()._nsec >= deadline {
+      break
+    }
+    // Release the lock across the sleep so the watcher keeps farming; re-acquire before the next poll
+    // (cli_collwatch is entered holding exec_mutex and must return holding it).
+    sync.mutex_unlock(&session.exec_mutex)
+    win.Sleep(COLLWATCH_INTERVAL_MS)
+    sync.mutex_lock(&session.exec_mutex)
+  }
+  fmt.printfln("collwatch: done. %d new object(s) appeared during the watch (look for [COLLIDER] lines).", n_new)
 }
 
 // ---------------------------------------------------------------------------
@@ -1881,7 +2036,7 @@ cli_linkscan :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
@@ -2151,7 +2306,7 @@ cli_objline :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))
@@ -2221,7 +2376,7 @@ cli_reachcmp :: proc(session: ^Session, args: []string) {
   world := read_ptr_at(handle, base + L.world_rva, pt)
   player := read_ptr_at(handle, base + L.player_rva, pt)
   if world == 0 || player == 0 {
-    fmt.eprintln("world/player not resolved - run 'calibrate'.")
+    fmt.eprintln("world/player not resolved - run 'setup <name>'.")
     return
   }
   ppos, pok := engine.read_vec3(handle, player + uintptr(L.pos_off))

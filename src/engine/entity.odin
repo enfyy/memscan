@@ -215,8 +215,8 @@ read_cstring :: proc(
   ok: bool,
 ) {
   buf := make([]byte, max, allocator)
-  n, rok := read_into(handle, addr, buf)
-  if !rok || n == 0 {
+  n := read_into_partial(handle, addr, buf) // partial: a name near a region end still reads
+  if n == 0 {
     return "", false
   }
   end := 0
@@ -243,11 +243,18 @@ read_obj_name :: proc(
   string,
   bool,
 ) {
+  field := uintptr(i64(obj) + name_off)
+  // Inline buffer FIRST: that's how this game stores mover names, and read_cstring is strict
+  // (all-printable up to a NUL), so a real pointer value in the field practically never passes.
+  // Deref-first got this backwards: a lowercase inline name IS a plausible mapped address
+  // ('nayr...' = 0x7279616E), and dereferencing it returned garbage from whatever lives there.
+  if s, sok := read_cstring(handle, field); sok {
+    return s, true
+  }
   pt := Value_Type.U64
   if ptr_size == 4 {
     pt = .U32
   }
-  field := uintptr(i64(obj) + name_off)
   if v, ok := read_value(handle, field, pt); ok {
     p := uintptr(value_as_u64(pt, v))
     if p != 0 {
@@ -256,7 +263,7 @@ read_obj_name :: proc(
       }
     }
   }
-  return read_cstring(handle, field) // inline buffer fallback
+  return "", false
 }
 
 // Encode a pointer as `size` little-endian bytes for write_value/scan targets.

@@ -1,4 +1,4 @@
-package flyff
+package engine
 
 import "base:runtime"
 import "core:fmt"
@@ -6,10 +6,18 @@ import "core:strings"
 import "core:sync"
 import win "core:sys/windows"
 
-PAUSE_VK :: u32(0x79) // F10 - default key that toggles the auto-farm pause
+// ===========================================================================
+// Global hotkeys + background watcher (generic; process-agnostic).
+//
+// A watcher thread polls physical key state (focus-independent) and fires each
+// bound command through session.exec_line. The same loop drives an optional
+// per-module tick (session.module_tick) - e.g. the flyff auto-farm and overlay
+// redraw - so a module can run background work without owning a thread. All
+// session access is serialized with the REPL through session.exec_mutex.
+// ===========================================================================
 
 // A global hotkey: when `vk` transitions from up to down (anywhere, even while
-// memscan is in the background), run `command` through the normal CLI. `was_down`
+// the app is in the background), run `command` through the normal CLI. `was_down`
 // is the watcher's edge-detection state.
 Hotkey :: struct {
   vk:       u32,
@@ -18,9 +26,6 @@ Hotkey :: struct {
   was_down: bool,
 }
 
-// Background thread that polls every registered hotkey's physical key state via
-// GetAsyncKeyState (focus-independent) and fires its command on a fresh key press.
-// All session access is serialized with the REPL through session.exec_mutex.
 hotkey_thread_start :: proc "system" (param: rawptr) -> win.DWORD {
   context = runtime.default_context()
   hotkey_watch_loop(cast(^Session)param)
@@ -28,24 +33,12 @@ hotkey_thread_start :: proc "system" (param: rawptr) -> win.DWORD {
 }
 
 hotkey_watch_loop :: proc(session: ^Session) {
-  pause_prev := false // F10 edge-detection for the pause binding
   for {
     sync.mutex_lock(&session.exec_mutex)
     if session.hk_stop {
       sync.mutex_unlock(&session.exec_mutex)
       return
     }
-    // Default pause binding: F10 toggles the auto-farm pause (only while auto is on, so a stray press
-    // off the clock does nothing).
-    pause_down := hotkey_key_down(PAUSE_VK)
-    if pause_down && !pause_prev {
-      if session.auto_on && session.exec_line != nil {
-        fmt.printf("\n[F10] pause\n")
-        session.exec_line(session, "pause")
-        fmt.print("memscan> ")
-      }
-    }
-    pause_prev = pause_down
     for &hk in session.hotkeys {
       down := hotkey_key_down(hk.vk)
       if down && !hk.was_down {
@@ -57,14 +50,16 @@ hotkey_watch_loop :: proc(session: ^Session) {
       }
       hk.was_down = down
     }
-    auto_tick(session) // hands-free farm: advance focus when the target dies
-    range_ring_tick(session) // attack-range circle overlay (ring / draw_range) - non-blocking
+    // Per-module background work (flyff: F10 pause + auto_tick + range_ring_tick).
+    if session.module_active && session.module_tick != nil {
+      session.module_tick(session)
+    }
     sync.mutex_unlock(&session.exec_mutex)
     win.Sleep(20)
   }
 }
 
-// Lazily start the watcher on the first bound hotkey.
+// Lazily start the watcher on the first bound hotkey (or first module feature that needs it).
 ensure_hotkey_thread :: proc(session: ^Session) {
   if session.hk_running {
     return
@@ -82,9 +77,9 @@ ensure_hotkey_thread :: proc(session: ^Session) {
 // hotkey <command...>   -> prompt for a key, then bind it
 // hotkey list           -> show bindings
 // hotkey clear          -> remove all bindings
-cli_hotkey :: proc(session: ^Session, args: []string) {
+cmd_hotkey :: proc(session: ^Session, args: []string) {
   if len(args) == 0 || args[0] == "list" {
-    cli_hotkey_list(session)
+    cmd_hotkey_list(session)
     return
   }
   if args[0] == "clear" {
@@ -123,7 +118,7 @@ cli_hotkey :: proc(session: ^Session, args: []string) {
   ensure_hotkey_thread(session)
 }
 
-cli_hotkey_list :: proc(session: ^Session) {
+cmd_hotkey_list :: proc(session: ^Session) {
   if len(session.hotkeys) == 0 {
     fmt.println("no hotkeys bound. usage: hotkey <command>  (then press a key)")
     return

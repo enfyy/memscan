@@ -1,38 +1,17 @@
 package flyff
 
-import "core:fmt"
-import "core:mem"
-import "core:mem/virtual"
-import "core:sync"
-import win "core:sys/windows"
 import "../engine"
 
-Attached_Process :: struct {
-  pid:          u32,
-  name:         string,
-  window_title: string,
-  handle:       win.HANDLE,
-  base:         uintptr,
-  module_size:  u32,
-  is_wow64:     bool,
-}
-
+// The flyff automation session. It EMBEDS the generic engine.Session as its first field so all
+// the generic scan/process/watcher state is shared, and adds the Flyff-specific automation state
+// on top. engine.Session must stay first (offset 0): the module hooks are handed a ^engine.Session
+// and recover this struct with an offset-0 cast (see flyff_of in module.odin).
 Session :: struct {
-  attached:      bool,
-  proc_info:     Attached_Process,
-  vtype:         engine.Value_Type,
-  ptr_size:      int,
-  writable_only: bool,
+  using eng: engine.Session,
 
   // Live Flyff memory layout (RVAs + offsets). Seeded from flyff_layout_default(), overwritten
   // by flyff.cfg on attach, re-derived by `calibrate`. See flyff.odin Flyff_Layout / layout.odin.
   layout:        Flyff_Layout,
-  scan_arena:    virtual.Arena,
-  has_snapshot:  bool,
-  snapshot:      engine.Mem_Snapshot,
-  has_matches:   bool,
-  matches:       engine.Match_Set,
-  targets:       [dynamic]engine.Nearest_Entry, // last 'nearest' result, sorted by distance
   tc_recent:     [dynamic]TC_Recent, // objs target_closest picked recently (skip just-killed)
 
   // Auto-farm mode (see auto_tick / cli_auto in target.odin). When on, the watcher thread
@@ -85,10 +64,90 @@ Session :: struct {
   last_kill_pos:    [3]f32, // selection pos of the last mob actually killed - the in-range retarget anchor
   last_kill_set:    bool,
 
+  // Cluster commitment (density feature; see cluster_advance + the cluster stage in tc_pick_one). When
+  // a pick lands in a real mob pack, auto commits to that pack and keeps killing members until none are
+  // eligible - cluster_origin_pos is where the commitment started (the leash reference, so a line-spawn
+  // can't chain-drag the commitment across the map). Mutated only by the pick paths under exec_mutex;
+  // forced false whenever density is off.
+  cluster_committed:  bool,
+  cluster_origin_pos: [3]f32,
+
   // Pause (see pause_tick / cli_pause). auto_paused holds a running auto without advancing; killing the
   // watched mob resumes it. 'auto' starts paused (armed), so the first kill kicks off farming.
   auto_paused:      bool,
   pause_obj:        uintptr, // mob watched for a kill while paused (0 = none)
+  pause_key_prev:   bool, // F10 edge-detection state for the default auto-toggle binding (see module_tick)
+
+  // Last-used auto target spec, for the F10 full toggle (see module_tick / auto_rearm_command). Set on
+  // every 'auto <spec>' start/switch; survives 'auto off' so F10 re-arms the same hunt. Freed on close.
+  last_auto_names: [dynamic]string,
+  last_auto_set:   bool,
+
+  // Background candidate-collect job (see tc_scan_request / tc_scan_worker in target.odin). The
+  // expensive enumeration (full region walk + parallel value scan) runs on a one-shot worker thread
+  // WITHOUT exec_mutex; only the publish takes the lock. auto_tick consumes res_* on a later tick, so
+  // the watcher never blocks the radar's frame pump on a kill (the kill-tick stutter fix).
+  scan_job: Scan_Job,
+
+  // Reach re-watch while a target is locked (see auto_reach_watch). Probes the straight approach every
+  // REACH_RECHECK_NS; consecutive blocked probes (debounce) skip the mob like a stuck-skip.
+  auto_reach_obj:        uintptr, // focus the current debounce window belongs to (0 = none)
+  auto_reach_next_check: i64, // nsec of the next scheduled reach probe
+  auto_reach_fail_count: int, // consecutive blocked probes so far
+
+  // Async setup progress (see cli_setup / setup_step_mark). setup_running guards re-entry (one run at
+  // a time, REPL or panel); setup_step (1..8, 0 = idle) feeds the radar panel's live step counter.
+  setup_running: bool,
+  setup_step:    int,
+
+  // Penya gain tracking (Phase 6 C1). penya_tick (watcher tick + radar frame) watches the live penya
+  // field: a rise adds to penya_total, bumps penya_seq, and appends a Penya_Event the radar drains into
+  // a "+penya" pop + chime; a fall (spend) just re-baselines. penya_total accrues even with the radar
+  // closed. Events are seq-tagged so the radar only replays ones newer than when it opened, and pruned
+  // after PENYA_EVENT_TTL. Reset on attach, freed on close.
+  penya_total:   i64,
+  penya_last:    i64, // last-seen live penya (delta baseline)
+  penya_seeded:  bool,
+  penya_seq:     i64, // monotonic id of the latest penya-gain event
+  penya_events:  [dynamic]Penya_Event,
+
+  // Kill events (Phase 6 C2): appended at each confirmed kill (both kill sites) for the radar's laser
+  // beam + zap. Seq-tagged + pruned like penya_events. Reset on attach, freed on close.
+  kill_seq:      i64,
+  kill_events:   [dynamic]Kill_Event,
+
+  // Manual-kill watch (kill_watch_tick): while auto is OFF, watch the player's own selected target so a
+  // hand-killed mob still fires the radar laser/zap (auto_tick only detects kills while auto is running).
+  manual_kill_obj:      uintptr, // the focus currently being watched (0 = none)
+  manual_kill_pos:      [3]f32, // its last-known position (the death spot)
+  manual_kill_recorded: bool, // already fired the event for this obj's death (guard against re-firing per tick)
+
+  // Timestamp (nsec) of the last CONFIRMED jump - set by cli_jump and lookalive_do_jump on success, so
+  // the radar can play a dot-hop animation for every jump (manual + autonomous look-alive). 0 = none.
+  jump_fired_at: i64,
+
+  // Pre-select / precompute-next (see tc_precompute_next / auto_tick). While a target is focused, auto
+  // precomputes the mob it will advance to next, so it can be committed the INSTANT focus clears on a
+  // kill - removing the ~0.5s post-kill enumeration gap. One precompute per locked target: auto_next_for
+  // is the focus obj the cache was computed against. The cached pick is re-validated at commit time
+  // (focus_set_obj); if it went stale, auto falls back to the reactive tc_select scan. Default on.
+  preselect_on:     bool,
+  auto_next_obj:    uintptr, // the precomputed next target (0 / auto_next_set=false = none cached)
+  auto_next_pos:    [3]f32, // its world pos (seeds the kill-anchor bookkeeping on commit)
+  auto_next_set:    bool,
+  auto_next_for:    uintptr, // the focused obj this cache is for (re-arm the precompute when focus changes)
+  auto_next_stage:  TC_Stage, // which cascade stage produced the cached pick (drives cluster_advance on commit)
+  auto_next_pack:   int, // the cached pick's local pack size (drives cluster_advance on commit)
+  auto_next_anchor: [3]f32, // the stand-point the cache was measured from (re-arm if the fight drags away)
+
+  // Look-alive mode (see cli_lookalive + the lookalive_* hooks in auto_tick). Opt-in human-like farming
+  // for low-spawn quest grinds: a randomized hesitation before engaging each new target (delayed lock-on,
+  // which also holds the pre-select fast-commit) and occasional jumps while travelling to a far target.
+  // Deliberately less efficient than the snappy loop, so default OFF. Jumps reuse the 'findmove' primitive
+  // and are skipped when char-control isn't configured. RNG = core:math/rand (see lookalive_rand_ns).
+  lookalive_on:         bool,
+  lookalive_hold_until: i64, // nsec deadline for the post-kill hesitation (0 = no active hold)
+  lookalive_jump_at:    i64, // nsec of the next scheduled travel-jump attempt (0 = (re)seed on next tick)
 
   // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
@@ -119,6 +178,14 @@ Session :: struct {
   // fixed-size (input vecs + result slot + shim), so it's allocated once and reused per query. 0 = none.
   objline_page: uintptr,
 
+  // Cached RWX page for the jump remote call (remote_send_actmsg). Fixed small layout (result slot +
+  // shim), allocated once and reused. Freed with the other remote pages on detach/close. 0 = none.
+  actmsg_page: uintptr,
+
+  // Cached RWX page for g_DPlay method calls (remote_send_snapshot - moveto's server-sync flush). moveto
+  // field-writes the destpos then injects SendSnapshot(TRUE) so other clients see a walk. 0 = none.
+  dplay_page: uintptr,
+
   // Camera-independent nearby-collider cache (see collect_area_colliders). Built by walking the player's
   // tile + neighbours' flat CLandscape object arrays (m_apObject), so reach sees off-camera obstacles the
   // render cull list misses. Static props don't move, so it's refreshed only when the player leaves the
@@ -126,83 +193,31 @@ Session :: struct {
   collider_cache:        [dynamic]Obb,
   collider_cache_center: [3]f32,
   collider_cache_valid:  bool,
-
-  // Global hotkeys (see hotkey.odin). exec_mutex serializes command execution between the REPL
-  // thread and the hotkey watcher thread. exec_line runs a CLI line (set by main to the REPL's
-  // dispatcher); the watcher calls it through this pointer so flyff never imports the cli/main
-  // package (breaks what would otherwise be a flyff<->main cycle).
-  hotkeys:       [dynamic]Hotkey,
-  exec_mutex:    sync.Mutex,
-  hk_thread:     win.HANDLE,
-  hk_running:    bool,
-  hk_stop:       bool,
-  exec_line:     proc(^Session, string) -> bool,
 }
 
-// Initialise a fresh Session (defaults + scan arena). Returns false if the arena can't be created.
+#assert(offset_of(Session, eng) == 0) // module hooks recover ^Session from ^engine.Session (offset-0 cast)
+
+// Initialise a fresh Session: the generic engine state, then the Flyff automation defaults, then
+// register the flyff module (hooks). Returns false if the engine arena can't be created.
 session_init :: proc(session: ^Session) -> bool {
-  session.vtype = .U32
-  session.ptr_size = 8
-  session.writable_only = true
+  if !engine.session_init(&session.eng) {
+    return false
+  }
   session.auto_stuck_on = true // obstacle/stuck detection on by default (see auto_monitor)
   session.reach_gate_on = true // proactive reach gate on by default (inert until findcull sets aobjcull_rva)
+  session.preselect_on = true // precompute the next target during combat -> instant advance on kill
   // Mesh-accurate reach confirm defaults OFF: it injects a game-code thread (IntersectObjLine) per
   // OBB-blocked candidate, which walks the live collision linkmaps concurrently with the main thread -
   // a real race that correlated with more client crashes during sustained farming. The zero-injection
   // decorative filter (collscan) delivers most of the benefit safely. Opt in per session with 'meshreach on'.
   session.mesh_reach_on = false
   session.layout = flyff_layout_default()
-  if err := virtual.arena_init_growing(&session.scan_arena); err != .None {
-    fmt.eprintln("failed to initialise scan arena")
-    return false
-  }
+  flyff_register(session)
   return true
 }
 
-session_scan_allocator :: proc(session: ^Session) -> mem.Allocator {
-  return virtual.arena_allocator(&session.scan_arena)
-}
-
-// Drops the current match set but keeps any snapshot alive.
-session_clear_matches :: proc(session: ^Session) {
-  session.has_matches = false
-  session.matches = {}
-}
-
-// Fully resets the scan working set (matches + snapshot) and reclaims arena memory.
-session_reset_scan :: proc(session: ^Session) {
-  free_all(virtual.arena_allocator(&session.scan_arena))
-  session.has_snapshot = false
-  session.has_matches = false
-  session.snapshot = {}
-  session.matches = {}
-  delete(session.targets)
-  session.targets = nil
-  delete(session.tc_recent)
-  session.tc_recent = nil
-}
-
+// Thin wrapper: engine.session_close stops the watcher, runs the module on_close hook (which frees
+// the flyff remote pages + lifetime-owned data), closes the handle, and frees generic state.
 session_close :: proc(session: ^Session) {
-  // Stop the hotkey watcher before closing the process handle it may be using.
-  if session.hk_running {
-    sync.mutex_lock(&session.exec_mutex)
-    session.hk_stop = true
-    sync.mutex_unlock(&session.exec_mutex)
-    win.WaitForSingleObject(session.hk_thread, 1000)
-    win.CloseHandle(session.hk_thread)
-    session.hk_running = false
-  }
-  if session.attached {
-    remote_free_shim(session)
-    remote_free_spawn_page(session)
-    win.CloseHandle(session.proc_info.handle)
-  }
-  free_all(virtual.arena_allocator(&session.scan_arena))
-  delete(session.targets)
-  delete(session.hotkeys)
-  delete(session.tc_recent)
-  delete(session.auto_blocked)
-  delete(session.world_cal)
-  fence_destroy(&session.fence)
-  auto_free_names(session)
+  engine.session_close(&session.eng)
 }

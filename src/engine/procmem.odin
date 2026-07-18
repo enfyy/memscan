@@ -35,6 +35,32 @@ read_into_partial :: proc(handle: win.HANDLE, addr: uintptr, buf: []byte) -> (n:
   return off
 }
 
+// The backward mirror of read_into_partial: fill as much of the TAIL of buf as is mapped, page by
+// page backward from addr+len(buf), stopping at the first unreadable page. For windows that END at a
+// known-good address (e.g. scanning back from a name hit for its enclosing object): an unmapped hole
+// below the object fails the whole single read, losing the mapped tail that actually contains it.
+// Returns the start index of the valid tail - buf[start:] is valid, buf[:start] is left untouched.
+read_into_partial_tail :: proc(handle: win.HANDLE, addr: uintptr, buf: []byte) -> (start: uint) {
+  if _, ok := read_into(handle, addr, buf); ok {
+    return 0 // fast path: whole range mapped
+  }
+  start = uint(len(buf))
+  for start > 0 {
+    cur_end := addr + uintptr(start)
+    from_boundary := uint(cur_end) & 0xFFF // read down to the previous page boundary
+    if from_boundary == 0 {
+      from_boundary = 0x1000
+    }
+    chunk := min(from_boundary, start)
+    got, ok := read_into(handle, addr + uintptr(start - chunk), buf[start - chunk:start])
+    if !ok || got < chunk {
+      break // hit an unmapped page - stop; buf[start:] is the valid tail
+    }
+    start -= chunk
+  }
+  return start
+}
+
 read_value :: proc(handle: win.HANDLE, addr: uintptr, t: Value_Type) -> (out: Value, ok: bool) {
   size := value_size(t)
   read: uint

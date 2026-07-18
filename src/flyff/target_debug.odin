@@ -30,6 +30,7 @@ TC_Factors :: struct {
   d_player_3d:  f32,
   dy:           f32, // pos.y - player.y
   d_lastkill_h: f32, // -1 when there's no last-kill anchor
+  cluster:      int, // local pack size (# candidates within density_radius, incl. self)
   in_melee:     bool,
   in_engage:    bool,
   on_cooldown:  bool,
@@ -59,6 +60,11 @@ TC_Debug :: struct {
   melee:         f32,
   engage:        f32,
   attack_range:  f32,
+  density_on:    bool,
+  min_gain:      int,
+  max_detour:    f32,
+  cluster_committed: bool, // the LIVE session commitment at snapshot time (seeds the simulation)
+  reversals:     int, // simulated-walk direction reversals among ranked picks (anti-turn-around metric)
 }
 
 // Aggregate stats that differ between a "good" map (tower) and a "bad" one (cloakia) - the whole point
@@ -72,9 +78,11 @@ TC_Summary :: struct {
 }
 
 // Simulate the full auto kill-order from the CURRENT snapshot, without mutating the session. Answers
-// "from where I'm standing, in what order does the picker yield these mobs" - player-fixed, but the
-// last-kill anchor walks with each simulated kill so the bow-pocket behaviour is reflected (that's what
-// determines the first, most telling, picks). Uses the live picker's own cascade (tc_pick_one).
+// "starting from here, in what order does the picker yield these mobs". The simulated STAND-POINT walks
+// with each kill: candidate distances are re-measured and re-sorted from the rolling kill spot before
+// every simulated pick, exactly like the live loop re-scans from wherever the player actually stands
+// (a player-fixed view would mispredict every later pick as "nearest to where you started" - the same
+// backward bias the pre-select anchor fix removed). Uses the live picker's own cascade (tc_pick_one).
 tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, ok: bool) {
   handle := session.proc_info.handle
   base := session.proc_info.base
@@ -106,6 +114,10 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
 
   now := time.now()._nsec
   melee, engage := pick_ranges(session)
+  // Always compute pack sizes for the map/table (so you can see clusters even with density off while
+  // tuning); the cluster/density STAGES only fire when density_on (see the Pick_Ctx below).
+  don := session.layout.density_on
+  dens := compute_densities(cands[:], density_radius(engage))
   lk_set := session.last_kill_set
   lk_pos := session.last_kill_pos
   anchor_src := "live last-kill anchor (auto running)"
@@ -142,6 +154,7 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
       d_player_3d  = engine.dist_3d(c.pos, player_pos),
       dy           = c.pos[1] - player_pos[1],
       d_lastkill_h = lk_set ? engine.dist_horizontal(c.pos, lk_pos) : -1,
+      cluster      = dens[i],
       in_melee     = c.d <= melee,
       in_engage    = c.d <= engage,
       on_cooldown  = recent_list_contains(session.tc_recent[:], c.obj, now, TC_RECENT_NS),
@@ -176,21 +189,79 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
     engage        = engage,
     recent        = local_recent[:],
     blocked       = session.auto_blocked[:],
+    density       = dens,
+    density_on    = don,
+    min_gain      = session.layout.density_min_gain,
+    max_detour    = session.layout.density_max_detour,
+    cluster_committed  = session.cluster_committed, // seed the sim from the live commitment
+    cluster_origin_pos = session.cluster_origin_pos,
   }
   order := make([dynamic]int, context.temp_allocator)
+  reversals := 0
+  prev_step: [2]f32
+  have_step := false
+  // Rolling stand-point view: before each simulated pick, re-measure and re-sort every candidate from
+  // the spot we'd be standing at (the previous sim-kill's position; the seeded anchor for the first).
+  // The cascade requires cands sorted nearest-first with d relative to the stand-point, and alive/
+  // density are index-aligned to it, so the view carries a back-mapping (View_Ref.i) to snapshot order.
+  View_Ref :: struct {
+    i: int, // index into cands/facts (snapshot order)
+    d: f32, // horizontal distance from the current stand-point
+  }
+  cur_pos := player_pos // the player's simulated stand-point: starts where you ACTUALLY are, and only
+  // moves when a pick was out of range (a walk) - an in-range pick keeps you put (a stationary ranged char)
+  refs := make([]View_Ref, n, context.temp_allocator)
+  view := make([]TC_Cand, n, context.temp_allocator)
+  view_alive := make([]bool, n, context.temp_allocator)
+  view_dens := make([]int, n, context.temp_allocator)
   for k in 0 ..< n {
-    idx, stage := tc_pick_one(session, cands[:], ctx, alive)
-    if idx < 0 {
+    for c, i in cands {
+      refs[i] = View_Ref{i = i, d = engine.dist_horizontal(c.pos, cur_pos)}
+    }
+    slice.sort_by(refs, proc(a, b: View_Ref) -> bool {return a.d < b.d})
+    for r, j in refs {
+      view[j] = TC_Cand{obj = cands[r.i].obj, d = r.d, pos = cands[r.i].pos}
+      view_alive[j] = alive[r.i]
+      view_dens[j] = dens[r.i]
+    }
+    ctx.player_pos = cur_pos // ranges + reach start from the stand-point, like the live re-scan would
+    ctx.live_player = cur_pos // in-range gate measures from where we stand this step
+    ctx.density = view_dens
+    vidx, stage := tc_pick_one(session, view, ctx, view_alive)
+    if vidx < 0 {
       break // everything left is excluded (cooldown / blocked / unreachable)
     }
+    idx := refs[vidx].i
     facts[idx].rank = k
     facts[idx].stage = stage
     append(&order, idx)
     alive[idx] = false
     append(&local_recent, TC_Recent{obj = cands[idx].obj, t = now}) // consume: on cooldown for later picks
     ctx.recent = local_recent[:]
+    // Direction-reversal metric: the horizontal step from the previous stand-point to this pick, against
+    // the previous step - dot < 0 means the walk turned around. The objective input for deciding
+    // whether an explicit anti-turn-around bias is still needed (deferred; see ONEPOINTO phase 6).
+    step := [2]f32{cands[idx].pos[0] - cur_pos[0], cands[idx].pos[2] - cur_pos[2]}
+    if step[0] != 0 || step[1] != 0 {
+      if have_step && step[0] * prev_step[0] + step[1] * prev_step[1] < 0 {
+        reversals += 1
+      }
+      prev_step = step
+      have_step = true
+    }
+    // Walk the commitment state forward exactly like the live pick paths (tc_select / auto_tick) do.
+    if don {
+      ctx.cluster_committed, ctx.cluster_origin_pos = cluster_advance(
+        ctx.cluster_committed, ctx.cluster_origin_pos, stage, cands[idx].pos, dens[idx], density_radius(engage),
+      )
+    }
     ctx.last_kill_set = true
     ctx.last_kill_pos = cands[idx].pos
+    // Move the stand-point ONLY when we had to leave our range to take this pick (Melee/Pocket are
+    // in-range, so a ranged char stays put; Nearest/Cluster/Density/Avoid are walks toward the mob).
+    if stage != .Melee && stage != .Pocket {
+      cur_pos = cands[idx].pos
+    }
     ctx.avoid_on = false // one-shot, consumed by the first pick
   }
 
@@ -211,6 +282,11 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
     melee         = melee,
     engage        = engage,
     attack_range  = session.layout.attack_range,
+    density_on    = don,
+    min_gain      = session.layout.density_min_gain,
+    max_detour    = session.layout.density_max_detour,
+    cluster_committed = session.cluster_committed,
+    reversals     = reversals,
   }
   return dbg, true
 }
@@ -287,10 +363,14 @@ stage_name :: proc(s: TC_Stage) -> string {
     return "melee"
   case .Avoid:
     return "avoid"
+  case .Cluster:
+    return "cluster"
   case .Pocket:
     return "pocket"
   case .Nearest:
     return "nearest"
+  case .Density:
+    return "density"
   case .None:
     return "-"
   case .Excluded:
@@ -308,10 +388,14 @@ fact_color :: proc(f: TC_Factors) -> string {
       return "#1abc9c"
     case .Avoid:
       return "#e67e22"
+    case .Cluster:
+      return "#e84393"
     case .Pocket:
       return "#3498db"
     case .Nearest:
       return "#2ecc71"
+    case .Density:
+      return "#f1c40f"
     case .None, .Excluded:
       return "#8899aa"
     }
@@ -499,12 +583,13 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
   fmt.sbprintf(&b, "<h1>target order - %s%s</h1>\n", desc, label == "" ? "" : fmt.tprintf("  [%s]", label))
   fmt.sbprintf(
     &b,
-    "<p class=sub>%d candidates, %d ranked, %d excluded &nbsp;|&nbsp; attack_range=%.0f (engage), melee=%.0f &nbsp;|&nbsp; anchor: %s &nbsp;|&nbsp; view radius %.0f</p>\n",
+    "<p class=sub>%d candidates, %d ranked, %d excluded &nbsp;|&nbsp; attack_range=%.0f (engage), melee=%.0f, density=%s &nbsp;|&nbsp; anchor: %s &nbsp;|&nbsp; view radius %.0f</p>\n",
     s.n,
     s.ranked,
     s.excluded,
     dbg.attack_range,
     dbg.melee,
+    dbg.density_on ? fmt.tprintf("on (mingain=%d detour=%.0f)", dbg.min_gain, dbg.max_detour) : "off",
     dbg.anchor_src,
     view_r,
   )
@@ -717,7 +802,7 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
   // ---- side panel: legend + summary ----
   fmt.sbprint(&b, "<div>\n")
   fmt.sbprint(&b, "<div class=card lg><h2>legend</h2>\n")
-  fmt.sbprint(&b, "<div><span style='background:#2ecc71'></span>nearest <span style='background:#3498db'></span>pocket <span style='background:#1abc9c'></span>melee <span style='background:#e67e22'></span>avoid</div>\n")
+  fmt.sbprint(&b, "<div><span style='background:#2ecc71'></span>nearest <span style='background:#e84393'></span>cluster <span style='background:#f1c40f'></span>density <span style='background:#3498db'></span>pocket <span style='background:#1abc9c'></span>melee <span style='background:#e67e22'></span>avoid</div>\n")
   fmt.sbprint(&b, "<div><span style='background:#e74c3c'></span>stuck-blacklist <span style='background:#e67e22'></span>walled <span style='background:#9b59b6'></span>blocked by object <span style='background:#b8912f'></span>cooldown</div>\n")
   fmt.sbprintf(&b, "<div style='margin-top:4px;color:#7f8c98'>dot colour = predicted kill order: <b style='color:#ffec82'>warm/bright = next</b> &rarr; cool/dim = later. Numbers mark the first %d picks; small dots are later picks. Faint grey rings = distance markers (world units); cyan ring = attack_range; gold &times; = anchor. <b style='color:#9b59b6'>Solid purple boxes</b> = real object collision (trees/rocks/buildings), <b style='color:#8a95a5'>faint dashed boxes</b> = decorative props (bushes/grass) the game walks through, <b style='color:#e67e22'>orange squares</b> = terrain walls; a line from you to an excluded mob shows what its straight path clips. Toggle any layer with the checkboxes above the map.</div>\n", TDBG_NUM)
   fmt.sbprint(&b, "</div>\n")
@@ -728,7 +813,8 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
   }
   row(&b, "vertical spread |Δy|", fmt.tprintf("max %.1f, mean %.1f", s.dy_max, s.dy_mean))
   row(&b, "mob spacing (nn horiz)", fmt.tprintf("min %.1f, mean %.1f, max %.1f", s.spacing_min, s.spacing_mean, s.spacing_max))
-  row(&b, "stages", fmt.tprintf("melee %d, avoid %d, pocket %d, nearest %d", s.stage_counts[.Melee], s.stage_counts[.Avoid], s.stage_counts[.Pocket], s.stage_counts[.Nearest]))
+  row(&b, "stages", fmt.tprintf("melee %d, avoid %d, cluster %d, pocket %d, nearest %d, density %d", s.stage_counts[.Melee], s.stage_counts[.Avoid], s.stage_counts[.Cluster], s.stage_counts[.Pocket], s.stage_counts[.Nearest], s.stage_counts[.Density]))
+  row(&b, "walk reversals", fmt.tprintf("%d of %d picks turned around", dbg.reversals, len(dbg.order)))
   row(&b, "excluded", fmt.tprintf("%d  (cooldown %d, blocked %d, unreachable %d)", s.excluded, s.n_cooldown, s.n_blocked, s.n_unreach))
   fmt.sbprint(&b, "</div>\n")
   fmt.sbprint(&b, "</div>\n") // side panel
@@ -736,7 +822,7 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
 
   // ---- table ----
   fmt.sbprint(&b, "<h2 style='margin-top:16px;font-size:14px'>candidates (by predicted order)</h2>\n")
-  fmt.sbprint(&b, "<table><thead><tr><th>#</th><th class=l>name</th><th>d_horiz</th><th>d_3d</th><th>Δy</th><th>d_lastkill</th><th>melee</th><th>engage</th><th>reach</th><th>blkd</th><th>cd</th><th class=l>stage</th></tr></thead><tbody>\n")
+  fmt.sbprint(&b, "<table><thead><tr><th>#</th><th class=l>name</th><th>d_horiz</th><th>d_3d</th><th>Δy</th><th>d_lastkill</th><th>pack</th><th>melee</th><th>engage</th><th>reach</th><th>blkd</th><th>cd</th><th class=l>stage</th></tr></thead><tbody>\n")
   // rows sorted by rank (ranked ascending, excluded last)
   order := make([dynamic]int, context.temp_allocator)
   for _, i in dbg.facts {
@@ -766,11 +852,12 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
     html_escape(&b, f.name)
     fmt.sbprintf(
       &b,
-      "</td><td>%.1f</td><td>%.1f</td><td>%+.1f</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=l>%s</td></tr>\n",
+      "</td><td>%.1f</td><td>%.1f</td><td>%+.1f</td><td>%s</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=l>%s</td></tr>\n",
       f.d_player_h,
       f.d_player_3d,
       f.dy,
       f.d_lastkill_h < 0 ? "-" : fmt.tprintf("%.1f", f.d_lastkill_h),
+      f.cluster,
       yn(f.in_melee),
       yn(f.in_engage),
       reach_word(f.reach_status),
@@ -799,26 +886,31 @@ tc_print_console :: proc(dbg: TC_Debug, s: TC_Summary, names: []string) {
     )
   }
   fmt.printfln(
-    "  ranges: attack_range=%.0f melee=%.0f engage=%.0f | vert |Δy| max %.1f mean %.1f | spacing nn min %.1f mean %.1f",
+    "  ranges: attack_range=%.0f melee=%.0f engage=%.0f density=%s | vert |Δy| max %.1f mean %.1f | spacing nn min %.1f mean %.1f",
     dbg.attack_range,
     dbg.melee,
     dbg.engage,
+    dbg.density_on ? fmt.tprintf("on (mingain=%d detour=%.0f)", dbg.min_gain, dbg.max_detour) : "off",
     s.dy_max,
     s.dy_mean,
     s.spacing_min,
     s.spacing_mean,
   )
   fmt.printfln(
-    "  stages: melee %d avoid %d pocket %d nearest %d | excluded: cooldown %d blocked %d unreach %d",
+    "  stages: melee %d avoid %d cluster %d pocket %d nearest %d density %d | reversals %d/%d | excluded: cooldown %d blocked %d unreach %d",
     s.stage_counts[.Melee],
     s.stage_counts[.Avoid],
+    s.stage_counts[.Cluster],
     s.stage_counts[.Pocket],
     s.stage_counts[.Nearest],
+    s.stage_counts[.Density],
+    dbg.reversals,
+    len(dbg.order),
     s.n_cooldown,
     s.n_blocked,
     s.n_unreach,
   )
-  fmt.println("   #  d_horiz  d_3d    Δy   d_lkill  m e r b c  stage     name   (r reach: . clear / w wall / o object)")
+  fmt.println("   #  d_horiz  d_3d    Δy   d_lkill  pack  m e r b c  stage     name   (r reach: . clear / w wall / o object)")
   order := make([dynamic]int, context.temp_allocator)
   for idx in dbg.order {
     append(&order, idx)
@@ -838,12 +930,13 @@ tc_print_console :: proc(dbg: TC_Debug, s: TC_Summary, names: []string) {
     rank_s := f.rank >= 0 ? fmt.tprintf("%3d", f.rank + 1) : "  -"
     lk_s := f.d_lastkill_h < 0 ? "     -" : fmt.tprintf("%6.1f", f.d_lastkill_h)
     fmt.printfln(
-      "  %s %7.1f %6.1f %+5.1f  %s  %s %s %s %s %s  %-8s  %s",
+      "  %s %7.1f %6.1f %+5.1f  %s  %4d  %s %s %s %s %s  %-8s  %s",
       rank_s,
       f.d_player_h,
       f.d_player_3d,
       f.dy,
       lk_s,
+      f.cluster,
       yn(f.in_melee),
       yn(f.in_engage),
       f.reach_status == .Clear ? "." : (f.reach_status == .Blocked_Terrain ? "w" : "o"),
@@ -882,7 +975,7 @@ cli_tdbg :: proc(session: ^Session, args: []string) {
 
   dbg, ok := tc_predict_order(session, names)
   if !ok {
-    fmt.eprintln("could not read world/player anchors (wrong build or not in-game?). run 'calibrate' first.")
+    fmt.eprintln("could not read world/player anchors (wrong build or not in-game?). run 'setup <name>' first.")
     return
   }
   if len(dbg.facts) == 0 {
