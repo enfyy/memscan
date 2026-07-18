@@ -3,6 +3,7 @@ package flyff
 import "core:fmt"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 
 import "../engine"
 
@@ -21,7 +22,41 @@ import "../engine"
 // collision filter (props on screen) all at once. No target needs to be selected.
 // ===========================================================================
 
+// Human-readable label per pipeline step, indexed by Session.setup_step - 1. Drawn by the radar panel
+// while a setup runs (see the async progress notes on cli_setup). A global (not a constant) so it can
+// be indexed with the runtime step value.
+@(rodata)
+SETUP_STEP_LABELS := [8]string {
+  "core + srvsync + focus",
+  "attackable-monster prop gate",
+  "walk-through-prop filter",
+  "terrain reachability",
+  "character control (moveto/jump)",
+  "render camera",
+  "mesh-reach function",
+  "attack range",
+}
+
+// Briefly release exec_mutex so other threads (the radar frame pump, the watcher) can run between two
+// setup steps. cli_setup is always entered WITH the lock held (REPL dispatch or the panel's async
+// worker), so a matched unlock/relock is safe - the same discipline cli_radar uses per frame.
+setup_yield :: proc(session: ^Session) {
+  sync.mutex_unlock(&session.exec_mutex)
+  sync.mutex_lock(&session.exec_mutex)
+}
+
+// Publish "step <n> is about to run" for the radar's progress display, then yield once so an open
+// radar window actually gets a frame in to draw it.
+setup_step_mark :: proc(session: ^Session, n: int) {
+  session.setup_step = n
+  setup_yield(session)
+}
+
 cli_setup :: proc(session: ^Session, args: []string) {
+  if session.setup_running {
+    fmt.eprintln("setup is already running - wait for it to finish.")
+    return
+  }
   if !session.attached {
     fmt.eprintln("not attached. attach a 32-bit Neuz first, then: setup <name> [hp]")
     return
@@ -45,9 +80,18 @@ cli_setup :: proc(session: ^Session, args: []string) {
     }
   }
 
+  // Progress state for the radar panel (drawn between the setup_step_mark yields). One run at a time -
+  // the guard above rejects a concurrent REPL/panel invocation instead of blocking it forever.
+  session.setup_running = true
+  defer {
+    session.setup_running = false
+    session.setup_step = 0
+  }
+
   fmt.println("=== setup ===")
 
   // [1] Core + srvsync + focus - anchor by name (position-free), then derive everything downstream.
+  setup_step_mark(session, 1)
   fmt.printfln("[1/8] core + srvsync + focus  (anchoring on '%s')", name)
   player, noff, ok := find_player_by_name(session, name)
   if !ok {
@@ -57,30 +101,37 @@ cli_setup :: proc(session: ^Session, args: []string) {
   calibrate_derive(session, player, session.layout.pos_off, noff, has_hp, hp)
 
   // [2] Attackable-monster prop gate - just needs a few distinct monster species on screen (no target).
+  setup_step_mark(session, 2)
   fmt.println("\n[2/8] attackable-monster prop gate (findprop - a few distinct monsters on screen)")
   cli_findprop(session, {})
 
   // [3] Decorative (walk-through) prop filter - full-scan, so all nearby props feed the consensus.
+  setup_step_mark(session, 3)
   fmt.println("\n[3/8] walk-through-prop collision filter (collscan)")
   cli_collscan(session, {})
 
   // [4] Terrain reachability - best effort; wants flat solid ground.
+  setup_step_mark(session, 4)
   fmt.println("\n[4/8] terrain reachability (worldscan - stand on flat ground; may need a 2nd sample)")
   cli_worldscan(session, {})
 
   // [5] Character control (moveto / jump) - derives the dest-field offsets + SendActMsg RVA + jump_msg.
+  setup_step_mark(session, 5)
   fmt.println("\n[5/8] character control (findmove - moveto + jump)")
   cli_findmove(session, {})
 
   // [6] Render camera - enables the tdbg cull-cone overlay + the radar's camera frustum (F). Read-only scan.
+  setup_step_mark(session, 6)
   fmt.println("\n[6/8] render camera (findcam)")
   cli_findcam(session, {})
 
   // [7] Mesh-reach RVA - pins IntersectObjLine so `meshreach`/`objline`/`reachcmp` work. Read-only scan.
+  setup_step_mark(session, 7)
   fmt.println("\n[7/8] mesh-reach function (findobjline)")
   cli_findobjline(session, {})
 
   // [8] Attack range - drives the picker's engage/melee ranges.
+  setup_step_mark(session, 8)
   fmt.println("\n[8/8] attack range")
   if session.layout.attack_range <= 0 {
     session.layout.attack_range = 1.75 // melee default; the user should set their real reach

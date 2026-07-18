@@ -52,12 +52,28 @@ FLYFF_HMAP_OFF :: 0x0 // CLandscape.m_pHeightMap (float*, 129x129 corner grid)
 // attack_range <n>`. 0 => test the full path to the mob's cell.
 FLYFF_ATTACK_RANGE :: 1.7
 
-// Density-prioritization weight (NOT a memory offset): world-unit scale that biases the auto picker's
-// walk-target choice toward dense mob clusters instead of the strict-nearest lone mob. 0 disables it
-// (backward-compatible: strict nearest, today's behavior). See compute_densities / tc_pick_one, and
-// tune it live with `tdbg` + `set density_weight <n>`. Small (~5) = mild bias, large (~40) = strongly
-// cluster-seeking. Default off so the picker is unchanged until you opt in.
+// Density / cluster steering (NOT memory offsets). density_on gates the whole feature: OFF = the plain
+// nearest-mob cascade (v0.4.0-identical); ON = auto commits to a mob pack until it's wiped
+// (cluster_advance) and only detours to a denser pack past a double gate - at least density_min_gain
+// more pack members AND at most density_max_detour extra walk distance (world units). Tune live with
+// `density mingain <n>` / `density detour <n>` + `tdbg`. density_weight is the RETIRED pre-rework
+// continuous weight, kept only so old flyff.cfg files still parse; a positive value migrates to
+// density_on=true on load (flyff_load_cfg). Default off so the picker is unchanged until you opt in.
 FLYFF_DENSITY_WEIGHT :: 0
+FLYFF_DENSITY_ON :: false
+FLYFF_DENSITY_MIN_GAIN :: 3
+FLYFF_DENSITY_MAX_DETOUR :: f32(20)
+
+// Persisted runtime toggles (NOT memory offsets). preselect/lookalive/reachgate mirror the Session
+// bools so they survive restarts: session.X stays authoritative at runtime, layout.X exists only for
+// the flyff.cfg round-trip (loaded into the session on attach - see on_attach - and written back by
+// cli_preselect / cli_lookalive / cli_reachgate). sfx_on / fx_laser_on are radar-only juice toggles
+// with the layout as their single source of truth (cli_sfx / cli_fxlaser).
+FLYFF_PRESELECT_ON :: true
+FLYFF_LOOKALIVE_ON :: false
+FLYFF_REACH_GATE_ON :: true
+FLYFF_SFX_ON :: true
+FLYFF_FX_LASER_ON :: true
 
 // Static CObj* CWorld::m_aobjCull[] - the render on-screen display array (World.cpp:69). The object
 // reach test reads this (fast, ~on-screen count) instead of scanning all of memory for CObj. Found by
@@ -212,7 +228,15 @@ Flyff_Layout :: struct {
   mpu_off:           i64,
   hmap_off:          i64,
   attack_range:      f32,
-  density_weight:    f32,
+  density_weight:    f32, // retired (pre-rework continuous weight); kept so old cfgs parse + migrate
+  density_on:        bool,
+  density_min_gain:  int,
+  density_max_detour: f32,
+  preselect_on:      bool, // cfg mirror of Session.preselect_on (see FLYFF_PRESELECT_ON note)
+  lookalive_on:      bool, // cfg mirror of Session.lookalive_on
+  reach_gate_on:     bool, // cfg mirror of Session.reach_gate_on
+  sfx_on:            bool, // radar sound effects (penya chime + kill zap)
+  fx_laser_on:       bool, // radar kill laser-beam effect
   aobjcull_rva:      uintptr,
   camera_rva:        uintptr,
   coll_obj3d_off:    i64,
@@ -257,6 +281,14 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     hmap_off          = FLYFF_HMAP_OFF,
     attack_range      = FLYFF_ATTACK_RANGE,
     density_weight    = FLYFF_DENSITY_WEIGHT,
+    density_on        = FLYFF_DENSITY_ON,
+    density_min_gain  = FLYFF_DENSITY_MIN_GAIN,
+    density_max_detour = FLYFF_DENSITY_MAX_DETOUR,
+    preselect_on      = FLYFF_PRESELECT_ON,
+    lookalive_on      = FLYFF_LOOKALIVE_ON,
+    reach_gate_on     = FLYFF_REACH_GATE_ON,
+    sfx_on            = FLYFF_SFX_ON,
+    fx_laser_on       = FLYFF_FX_LASER_ON,
     aobjcull_rva      = FLYFF_AOBJCULL_RVA,
     camera_rva        = FLYFF_CAMERA_RVA,
     coll_obj3d_off    = FLYFF_COLL_OBJ3D_OFF,

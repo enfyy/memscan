@@ -64,11 +64,67 @@ Session :: struct {
   last_kill_pos:    [3]f32, // selection pos of the last mob actually killed - the in-range retarget anchor
   last_kill_set:    bool,
 
+  // Cluster commitment (density feature; see cluster_advance + the cluster stage in tc_pick_one). When
+  // a pick lands in a real mob pack, auto commits to that pack and keeps killing members until none are
+  // eligible - cluster_origin_pos is where the commitment started (the leash reference, so a line-spawn
+  // can't chain-drag the commitment across the map). Mutated only by the pick paths under exec_mutex;
+  // forced false whenever density is off.
+  cluster_committed:  bool,
+  cluster_origin_pos: [3]f32,
+
   // Pause (see pause_tick / cli_pause). auto_paused holds a running auto without advancing; killing the
   // watched mob resumes it. 'auto' starts paused (armed), so the first kill kicks off farming.
   auto_paused:      bool,
   pause_obj:        uintptr, // mob watched for a kill while paused (0 = none)
-  pause_key_prev:   bool, // F10 edge-detection state for the default pause binding (see module_tick)
+  pause_key_prev:   bool, // F10 edge-detection state for the default auto-toggle binding (see module_tick)
+
+  // Last-used auto target spec, for the F10 full toggle (see module_tick / auto_rearm_command). Set on
+  // every 'auto <spec>' start/switch; survives 'auto off' so F10 re-arms the same hunt. Freed on close.
+  last_auto_names: [dynamic]string,
+  last_auto_set:   bool,
+
+  // Background candidate-collect job (see tc_scan_request / tc_scan_worker in target.odin). The
+  // expensive enumeration (full region walk + parallel value scan) runs on a one-shot worker thread
+  // WITHOUT exec_mutex; only the publish takes the lock. auto_tick consumes res_* on a later tick, so
+  // the watcher never blocks the radar's frame pump on a kill (the kill-tick stutter fix).
+  scan_job: Scan_Job,
+
+  // Reach re-watch while a target is locked (see auto_reach_watch). Probes the straight approach every
+  // REACH_RECHECK_NS; consecutive blocked probes (debounce) skip the mob like a stuck-skip.
+  auto_reach_obj:        uintptr, // focus the current debounce window belongs to (0 = none)
+  auto_reach_next_check: i64, // nsec of the next scheduled reach probe
+  auto_reach_fail_count: int, // consecutive blocked probes so far
+
+  // Async setup progress (see cli_setup / setup_step_mark). setup_running guards re-entry (one run at
+  // a time, REPL or panel); setup_step (1..8, 0 = idle) feeds the radar panel's live step counter.
+  setup_running: bool,
+  setup_step:    int,
+
+  // Penya gain tracking (Phase 6 C1). penya_tick (watcher tick + radar frame) watches the live penya
+  // field: a rise adds to penya_total, bumps penya_seq, and appends a Penya_Event the radar drains into
+  // a "+penya" pop + chime; a fall (spend) just re-baselines. penya_total accrues even with the radar
+  // closed. Events are seq-tagged so the radar only replays ones newer than when it opened, and pruned
+  // after PENYA_EVENT_TTL. Reset on attach, freed on close.
+  penya_total:   i64,
+  penya_last:    i64, // last-seen live penya (delta baseline)
+  penya_seeded:  bool,
+  penya_seq:     i64, // monotonic id of the latest penya-gain event
+  penya_events:  [dynamic]Penya_Event,
+
+  // Kill events (Phase 6 C2): appended at each confirmed kill (both kill sites) for the radar's laser
+  // beam + zap. Seq-tagged + pruned like penya_events. Reset on attach, freed on close.
+  kill_seq:      i64,
+  kill_events:   [dynamic]Kill_Event,
+
+  // Manual-kill watch (kill_watch_tick): while auto is OFF, watch the player's own selected target so a
+  // hand-killed mob still fires the radar laser/zap (auto_tick only detects kills while auto is running).
+  manual_kill_obj:      uintptr, // the focus currently being watched (0 = none)
+  manual_kill_pos:      [3]f32, // its last-known position (the death spot)
+  manual_kill_recorded: bool, // already fired the event for this obj's death (guard against re-firing per tick)
+
+  // Timestamp (nsec) of the last CONFIRMED jump - set by cli_jump and lookalive_do_jump on success, so
+  // the radar can play a dot-hop animation for every jump (manual + autonomous look-alive). 0 = none.
+  jump_fired_at: i64,
 
   // Pre-select / precompute-next (see tc_precompute_next / auto_tick). While a target is focused, auto
   // precomputes the mob it will advance to next, so it can be committed the INSTANT focus clears on a
@@ -80,6 +136,9 @@ Session :: struct {
   auto_next_pos:    [3]f32, // its world pos (seeds the kill-anchor bookkeeping on commit)
   auto_next_set:    bool,
   auto_next_for:    uintptr, // the focused obj this cache is for (re-arm the precompute when focus changes)
+  auto_next_stage:  TC_Stage, // which cascade stage produced the cached pick (drives cluster_advance on commit)
+  auto_next_pack:   int, // the cached pick's local pack size (drives cluster_advance on commit)
+  auto_next_anchor: [3]f32, // the stand-point the cache was measured from (re-arm if the fight drags away)
 
   // Look-alive mode (see cli_lookalive + the lookalive_* hooks in auto_tick). Opt-in human-like farming
   // for low-spawn quest grinds: a randomized hesitation before engaging each new target (delayed lock-on,

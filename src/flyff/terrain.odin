@@ -5,6 +5,8 @@ import "core:fmt"
 import "core:math"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
+import "core:time"
 import win "core:sys/windows"
 
 // ===========================================================================
@@ -1802,6 +1804,181 @@ cli_collscan :: proc(session: ^Session, args: []string) {
       fmt.println("  => not saved (props disagree on the offsets). Re-run somewhere with more props in view.")
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// collwatch - catch a TRANSIENT collider (a mob-respawn VFX / pet-activation effect that's only up for a
+// fraction of a second, so a one-shot `collscan` can't be timed to it). Polls the object set every
+// ~300ms for <seconds>; the instant an object APPEARS (after a baseline snapshot) it's logged with its
+// full identity (type, model, collision mesh, box) and flagged [COLLIDER] if our reach filter would
+// treat it as solid; when it vanishes, its lifetime is printed. Just run it and re-trigger the effect
+// (activate the pick-up pet / farm at a spawn) - no timing needed. Read-only; releases exec_mutex
+// between polls so auto-farm keeps running. Diagnostic only (pins nothing), so it's not in setup/status.
+// ---------------------------------------------------------------------------
+
+COLLWATCH_INTERVAL_MS :: u32(300)
+
+Collwatch_Seen :: struct {
+  first_ns:      i64,
+  last_iter:     int, // last poll index this object was present in
+  ident:         string, // cloned identity line (printed on vanish, after the object is freed)
+  is_coll:       bool,
+  reported_gone: bool,
+}
+
+// Format one object's identity for collwatch, and decide whether our reach filter would treat it as a
+// solid collider (mirrors the obj_to_obb gate). within=false if it's outside <radius> of the player.
+collwatch_identify :: proc(session: ^Session, obj: uintptr, ppos: [3]f32, radius: f32) -> (line: string, is_coll: bool, within: bool, ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  po := int(session.layout.pos_off)
+  wlen := po + 0x1C
+  if wlen > 512 {
+    return
+  }
+  buf: [512]byte
+  n, rok := engine.read_into(handle, obj, buf[:wlen])
+  if !rok || int(n) < wlen {
+    return
+  }
+  vt := uintptr(rd_u32le(buf[:], 0))
+  if vt < base || vt >= mod_end {
+    return // not a live CObj
+  }
+  rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
+  ty := rd_u32le(buf[:], po + 0x10)
+  pos := [3]f32{rf(buf[:], po), rf(buf[:], po + 4), rf(buf[:], po + 8)}
+  dx := pos[0] - ppos[0]
+  dz := pos[2] - ppos[2]
+  d := math.sqrt(dx * dx + dz * dz)
+  if d > radius {
+    return "", false, false, true // valid object, just out of range
+  }
+  oo := po - 0x3C
+  ext := [3]f32{rf(buf[:], oo + 0xC), rf(buf[:], oo + 0x10), rf(buf[:], oo + 0x14)}
+  // Would obj_to_obb keep this as a solid collider? Type gate + degenerate-box drop + small-OT_CTRL drop.
+  is_coll = (ty == 0 || ty == 3) && (ext[0] > 0.01 || ext[2] > 0.01)
+  if is_coll && ty == 3 && ext[0] <= CTRL_DROP_MAX_XZ && ext[2] <= CTRL_DROP_MAX_XZ && ext[1] <= CTRL_DROP_MAX_Y {
+    is_coll = false // small OT_CTRL = ground drop / effect zone, already dropped
+  }
+  coll_s := "-"
+  if fname, _, _, coll, cok := probe_model_coll(session, obj); cok {
+    coll_s = fmt.tprintf("%s '%s'", gmt_name(coll), fname)
+  }
+  line = fmt.tprintf(
+    "0x%08X %s(%d) d=%4.1f box=(%.1f,%.1f,%.1f) mesh=%s",
+    obj, ot_name(ty), ty, d, ext[0], ext[1], ext[2], coll_s,
+  )
+  return line, is_coll, true, true
+}
+
+// collwatch [seconds] [radius] - see the section header above.
+cli_collwatch :: proc(session: ^Session, args: []string) {
+  if !session.attached || session.ptr_size != 4 {
+    fmt.eprintln("collwatch: attach a 32-bit Neuz first.")
+    return
+  }
+  L := session.layout
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  world := read_ptr_at(handle, base + L.world_rva, engine.Value_Type.U32)
+  if world == 0 {
+    fmt.eprintln("collwatch: world not resolved - run 'setup <name>' first.")
+    return
+  }
+  // Args are position-free: 'all'/'v'/'verbose' -> also show non-collider objects (mobs/items/effects);
+  // the first numeric = seconds, the second numeric = radius.
+  secs := 30
+  radius := f32(60)
+  verbose := false
+  nnum := 0
+  for a in args {
+    if a == "all" || a == "v" || a == "verbose" {
+      verbose = true
+      continue
+    }
+    if v, ok := strconv.parse_f64(a); ok && v > 0 {
+      if nnum == 0 {
+        secs = min(int(v), 600)
+      } else if nnum == 1 {
+        radius = f32(v)
+      }
+      nnum += 1
+    }
+  }
+
+  seen := make(map[uintptr]Collwatch_Seen, 512) // default allocator - persists across polls
+  defer {
+    for _, s in seen {
+      delete(s.ident)
+    }
+    delete(seen)
+  }
+
+  wval := engine.ptr_to_value(world, session.ptr_size)
+  deadline := time.now()._nsec + i64(secs) * 1_000_000_000
+  fmt.printfln(
+    "collwatch: polling every %dms for %ds within %.0f, %s. Farm the spawn (tower map); each SOLID box logs as it appears - [COLLIDER] lines are the phantom-obstacle candidates.",
+    COLLWATCH_INTERVAL_MS, secs, radius, verbose ? "ALL objects" : "colliders only (mobs/items hidden)",
+  )
+  iter := 0
+  n_new := 0
+  for {
+    now_ns := time.now()._nsec
+    // Re-resolve world + player each poll (zoning / re-log changes them).
+    w := read_ptr_at(handle, base + L.world_rva, engine.Value_Type.U32)
+    ppos, pok := read_player_pos(session)
+    if w != 0 && pok {
+      regions := engine.collect_regions(handle, true)
+      set := engine.scan_exact_parallel(handle, engine.Value_Type.U32, wval, regions[:], context.temp_allocator)
+      delete(regions)
+      for m in set.matches {
+        obj := uintptr(i64(m.addr) - L.field_off)
+        line, is_coll, within, ok := collwatch_identify(session, obj, ppos, radius)
+        if !ok || !within {
+          continue
+        }
+        // COLLIDERS ONLY: the phantom is a solid OBJ/CTRL box (that's exactly what the radar draws as a
+        // purple box). Movers (mobs), items, effects reach ignores are dropped here so they can't bury
+        // the signal - unless <verbose> was passed (2nd... 'all' or 'v').
+        if !is_coll && !verbose {
+          continue
+        }
+        if s, found := &seen[obj]; found {
+          s.last_iter = iter
+        } else {
+          seen[obj] = Collwatch_Seen{first_ns = now_ns, last_iter = iter, ident = strings.clone(line), is_coll = is_coll}
+          if iter > 0 { // don't spam the baseline set on the first poll
+            n_new += 1
+            fmt.printfln("[collwatch +] %s%s", is_coll ? "[COLLIDER] " : "[non-coll] ", line)
+          }
+        }
+      }
+      // Vanished-since-last-poll -> print lifetime once (confirms transience; the memory is freed by now).
+      for obj, &s in seen {
+        if !s.reported_gone && s.last_iter < iter {
+          fmt.printfln("[collwatch -] gone after %.1fs: %s", f32(now_ns - s.first_ns) / 1e9, s.ident)
+          s.reported_gone = true
+        }
+        _ = obj
+      }
+      if iter == 0 {
+        fmt.printfln("[collwatch] baseline: %d %s in range - now watching for new ones...", len(seen), verbose ? "object(s)" : "collider(s)")
+      }
+    }
+    free_all(context.temp_allocator)
+    iter += 1
+    if time.now()._nsec >= deadline {
+      break
+    }
+    // Release the lock across the sleep so the watcher keeps farming; re-acquire before the next poll
+    // (cli_collwatch is entered holding exec_mutex and must return holding it).
+    sync.mutex_unlock(&session.exec_mutex)
+    win.Sleep(COLLWATCH_INTERVAL_MS)
+    sync.mutex_lock(&session.exec_mutex)
+  }
+  fmt.printfln("collwatch: done. %d new object(s) appeared during the watch (look for [COLLIDER] lines).", n_new)
 }
 
 // ---------------------------------------------------------------------------

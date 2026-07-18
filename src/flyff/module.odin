@@ -13,7 +13,7 @@ import "../engine"
 // because engine.Session is the first field of flyff.Session - see session.odin).
 // ===========================================================================
 
-PAUSE_VK :: u32(0x79) // F10 - default key that toggles the auto-farm pause
+PAUSE_VK :: u32(0x79) // F10 - default key that stops/starts the auto-farm (full toggle, see module_tick)
 
 // Recover the flyff Session from the embedded engine.Session pointer (offset-0 cast).
 flyff_of :: #force_inline proc(es: ^engine.Session) -> ^Session {
@@ -70,6 +70,12 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_reachgate(s, args)
   case "meshreach":
     cli_meshreach(s, args)
+  case "sfx":
+    cli_sfx(s, args)
+  case "fxlaser":
+    cli_fxlaser(s, args)
+  case "collwatch":
+    cli_collwatch(s, args)
   case "pause":
     cli_pause(s, args)
   case "setup":
@@ -172,22 +178,30 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
   return true
 }
 
-// Per-watcher-loop background work: the default F10 pause binding, the auto-farm advance, and the
-// attack-range overlay redraw. Runs under exec_mutex (the engine watcher holds it).
+// Per-watcher-loop background work: the default F10 stop/start binding, the auto-farm advance, and
+// the attack-range overlay redraw. Runs under exec_mutex (the engine watcher holds it).
 module_tick :: proc(es: ^engine.Session) {
   s := flyff_of(es)
-  // Default pause binding: F10 toggles the auto-farm pause (only while auto is on, so a stray press
-  // off the clock does nothing).
-  pause_down := engine.hotkey_key_down(PAUSE_VK)
-  if pause_down && !s.pause_key_prev {
-    if s.auto_on && es.exec_line != nil {
-      fmt.printf("\n[F10] pause\n")
-      es.exec_line(es, "pause")
+  // Default F10 binding: a FULL auto toggle. Running -> 'auto off'; off -> re-arm with the last-used
+  // target spec (or any-monster). The re-arm goes through cli_auto, so it starts ARMED-paused exactly
+  // like typing the command (first manual kill kicks it off). 'pause' is still typeable, just unbound.
+  toggle_down := engine.hotkey_key_down(PAUSE_VK)
+  if toggle_down && !s.pause_key_prev {
+    if s.attached && es.exec_line != nil {
+      if s.auto_on {
+        fmt.printf("\n[F10] auto off\n")
+        es.exec_line(es, "auto off")
+      } else {
+        cmd := auto_rearm_command(s)
+        fmt.printf("\n[F10] %s\n", cmd)
+        es.exec_line(es, cmd)
+      }
       fmt.print("memscan> ")
     }
   }
-  s.pause_key_prev = pause_down
+  s.pause_key_prev = toggle_down
   auto_tick(s) // hands-free farm: advance focus when the target dies
+  penya_tick(s) // accrue penya total + record gains for the radar (works with the radar closed)
   range_ring_tick(s) // attack-range circle overlay (ring / draw_range) - non-blocking
 }
 
@@ -209,10 +223,29 @@ on_attach :: proc(es: ^engine.Session) {
     fmt.println("layout: built-in defaults (run 'setup <name>' if the game was patched).")
   }
 
+  // Runtime-toggle mirrors: the session bools stay authoritative at runtime; the layout copies exist
+  // only so they persist through flyff.cfg. Load them into the live session here; their CLI toggles
+  // (preselect / lookalive / reachgate) write both sides + save. sfx/fxlaser live on the layout only.
+  s.preselect_on = s.layout.preselect_on
+  s.lookalive_on = s.layout.lookalive_on
+  s.reach_gate_on = s.layout.reach_gate_on
+
   // srvsync defaults ON now that the anti-DC path is proven - it's always needed. It stays inert
   // (notify_server_target no-ops) until sendsettarget_rva/objid_off are set on a 32-bit client, so
   // enabling it unconditionally is safe. 'srvsync off' still disables it for the rest of the session.
   s.srvsync_on = true
+
+  // Fresh penya/kill juice state for the new process (the total is per-session).
+  s.penya_total = 0
+  s.penya_last = 0
+  s.penya_seeded = false
+  s.penya_seq = 0
+  clear(&s.penya_events)
+  s.kill_seq = 0
+  clear(&s.kill_events)
+  s.manual_kill_obj = 0
+  s.manual_kill_recorded = false
+
   if s.ptr_size == 4 && s.layout.sendsettarget_rva != 0 && s.layout.objid_off != 0 {
     fmt.println("srvsync: ON (default). 'srvsync off' to disable.")
   } else {
@@ -247,6 +280,13 @@ on_close :: proc(es: ^engine.Session) {
   }
   fence_destroy(&s.fence)
   auto_free_names(s)
+  for n in s.last_auto_names {
+    delete(n)
+  }
+  delete(s.last_auto_names)
+  tc_scan_invalidate(s) // free an unconsumed background batch; an in-flight worker self-discards
+  delete(s.penya_events)
+  delete(s.kill_events)
   delete(s.tc_recent)
   delete(s.auto_blocked)
   delete(s.world_cal)
@@ -269,15 +309,20 @@ farming (day to day)
                              'mobs'). the primitive behind the radar's click-to-target
   auto [name]...             hands-free farm: starts ARMED (paused) - kill the first mob to begin, then it
                              re-targets on each kill. no name = ANY monster; names comma-separated. 'auto off' stops
-  pause                      toggle pause (default key: F10). killing the targeted mob resumes
+  pause                      toggle pause (auto stays on, stops advancing). killing the targeted mob
+                             resumes. F10 = full auto stop/start toggle (re-arms the last target spec)
   timer <minutes>            auto-disable 'auto' after N minutes (e.g. 'timer 60'); 'timer off' cancels
   kills <n>                  auto-disable 'auto' after N confirmed kills (e.g. 'kills 100'); 'kills off' cancels
   stuck [on|off]             toggle reactive obstacle skip-detection (on by default; 'stuck off' for ranged/standing)
-  density [on|off|<n>]       cluster steering: OFF (default) = target the plain nearest mob (simple, no zig-zag
-                             regardless of attack_range); ON steers toward dense packs + stays on the pack (~5 mild, ~40 strong)
+  density [on|off]           cluster steering: OFF (default) = target the plain nearest mob (v0.4.0 behaviour).
+                             ON commits to a mob pack until it's wiped; a farther pack steals the pick only past the gates below
+  density mingain <n>        gate 1: extra pack members a farther pack needs to steal the pick (default 3)
+  density detour <n>         gate 2: max extra walk distance (world units) for that detour (default 20)
   preselect [on|off]         precompute the next target while fighting so auto advances instantly on kill (on by default)
   lookalive [on|off]         human-like farming: random hesitation before each target + occasional jumps (opt-in; needs findmove for jumps)
   reachgate [on|off]         proactively skip mobs behind walls/trees/buildings when auto-picks a target
+  sfx [on|off]               radar sound effects (penya chime + kill zap); persisted to flyff.cfg
+  fxlaser [on|off]           radar kill laser-beam effect; persisted to flyff.cfg
   meshreach [on|off]         confirm OBB-blocked mobs with the client's IntersectObjLine (opt-in; injects, crash-prone)
                              inert until 'findobjline' pins intersectobjline_rva (re-run it after a game patch)
   findobjline                re-pin intersectobjline_rva by signature so meshreach / objline / reachcmp work again
@@ -343,6 +388,8 @@ terrain / obstacle reach oracle ('setup' pins these; commands below are for stan
   attrmap [radius] [step]    ASCII map of terrain attributes around you (reveals invisible walls)
   objects [radius]           list nearby CObj of any type + locate m_OBB (props the grid misses)
   collscan [radius]          per nearby prop: model .o3d filename + collision-mesh type (NORMAL vs ERROR)
+  collwatch [secs] [radius] [all]  catch a TRANSIENT collider (respawn VFX): polls + logs each SOLID
+                             box the instant it appears (mobs/items hidden unless 'all'). [COLLIDER] = culprit
   reach [x,z]                is the straight path player->point (or ->selected target) walkable?
   attackable          (canhit)  is the SELECTED mob reachable to attack? (terrain + object obstacles,
                              within attack_range). select a mob, stand behind cover, run it.

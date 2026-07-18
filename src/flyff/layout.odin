@@ -78,6 +78,12 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.attack_range = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
   case "density_weight":
     layout.density_weight = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
+  case "density_on":
+    layout.density_on = v != 0
+  case "density_min_gain":
+    layout.density_min_gain = int(v)
+  case "density_max_detour":
+    layout.density_max_detour = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
   case "aobjcull_rva":
     layout.aobjcull_rva = uintptr(v)
   case "camera_rva":
@@ -143,6 +149,14 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "hmap_off=0x%X", layout.hmap_off)
   fmt.sbprintfln(&b, "attack_range=%v", layout.attack_range)
   fmt.sbprintfln(&b, "density_weight=%v", layout.density_weight)
+  fmt.sbprintfln(&b, "density_on=%d", layout.density_on ? 1 : 0)
+  fmt.sbprintfln(&b, "density_min_gain=%d", layout.density_min_gain)
+  fmt.sbprintfln(&b, "density_max_detour=%v", layout.density_max_detour)
+  fmt.sbprintfln(&b, "preselect_on=%d", layout.preselect_on ? 1 : 0)
+  fmt.sbprintfln(&b, "lookalive_on=%d", layout.lookalive_on ? 1 : 0)
+  fmt.sbprintfln(&b, "reach_gate_on=%d", layout.reach_gate_on ? 1 : 0)
+  fmt.sbprintfln(&b, "sfx_on=%d", layout.sfx_on ? 1 : 0)
+  fmt.sbprintfln(&b, "fx_laser_on=%d", layout.fx_laser_on ? 1 : 0)
   fmt.sbprintfln(&b, "aobjcull_rva=0x%X", layout.aobjcull_rva)
   fmt.sbprintfln(&b, "camera_rva=0x%X", layout.camera_rva)
   fmt.sbprintfln(&b, "coll_obj3d_off=0x%X", layout.coll_obj3d_off)
@@ -169,6 +183,7 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
   }
   content := string(data)
   lines := strings.split(content, "\n", context.temp_allocator)
+  saw_density_on := false // for the legacy density_weight migration below
   for raw in lines {
     line := strings.trim_space(raw)
     if line == "" || strings.has_prefix(line, "#") {
@@ -192,11 +207,46 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
       }
       continue
     }
+    if key == "density_max_detour" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.density_max_detour = f32(fv) // fractional field - parse as float
+      }
+      continue
+    }
+    if key == "density_on" {
+      saw_density_on = true
+      layout.density_on = val == "1" || strings.equal_fold(val, "true") || strings.equal_fold(val, "on")
+      continue
+    }
+    // Persisted runtime toggles - bool-parsed like density_on. Deliberately NOT in layout_set_field:
+    // the first three are session-mirrored (their CLI toggles keep both sides in sync; a raw `set`
+    // would silently desync), and sfx/fxlaser have their own commands.
+    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "sfx_on" || key == "fx_laser_on" {
+      bv := val == "1" || strings.equal_fold(val, "true") || strings.equal_fold(val, "on")
+      switch key {
+      case "preselect_on":
+        layout.preselect_on = bv
+      case "lookalive_on":
+        layout.lookalive_on = bv
+      case "reach_gate_on":
+        layout.reach_gate_on = bv
+      case "sfx_on":
+        layout.sfx_on = bv
+      case "fx_laser_on":
+        layout.fx_laser_on = bv
+      }
+      continue
+    }
     v, vok := engine.parse_addr(val)
     if !vok {
       continue
     }
     layout_set_field(layout, key, u64(v))
+  }
+  // Migration: a cfg written before the density rework has only the legacy continuous weight. A positive
+  // weight meant "density on", so carry the intent over; the next save writes the new keys explicitly.
+  if !saw_density_on && layout.density_weight > 0 {
+    layout.density_on = true
   }
   return true
 }
@@ -369,8 +419,10 @@ cli_status_full :: proc(session: ^Session) {
   fmt.printfln("  land_off=0x%X landwidth_off=0x%X hmap_off=0x%X mpu_off=0x%X", L.land_off, L.landwidth_off, L.hmap_off, L.mpu_off)
   fmt.printfln("  attack_range=%v  <- your reach; drives target selection (the picker's engage range) AND 'reach'. 'set attack_range <n>' (floats ok, e.g. 1.75).", L.attack_range)
   fmt.printfln(
-    "  density_weight=%v  <- auto steers its walk-target toward dense mob clusters (0=off, ~5 mild, ~40 strong). tune with 'tdbg' then 'set density_weight <n>'.",
-    L.density_weight,
+    "  density: %s  <- auto's cluster steering. OFF = plain nearest (v0.4.0 behaviour). ON commits to a mob pack until it's wiped and only detours to a denser pack past the gate. 'density on|off', 'density mingain <n>' (default %d), 'density detour <n>' (default %v).",
+    L.density_on ? fmt.tprintf("ON (mingain=%d detour=%v)", L.density_min_gain, L.density_max_detour) : "OFF",
+    FLYFF_DENSITY_MIN_GAIN,
+    FLYFF_DENSITY_MAX_DETOUR,
   )
   fmt.printfln(
     "  object reach: cached full-scan (finds every collidable prop; no findcull needed)   auto reach-gate: %s",
@@ -517,17 +569,20 @@ cli_set :: proc(session: ^Session, args: []string) {
     fmt.eprintln("usage: set <field> <value>   (field names: see 'offsets')")
     return
   }
-  // attack_range / density_weight are the fractional fields (e.g. 1.75 melee) - parse as floats.
-  if args[0] == "attack_range" || args[0] == "density_weight" {
+  // attack_range / density_weight / density_max_detour are the fractional fields - parse as floats.
+  if args[0] == "attack_range" || args[0] == "density_weight" || args[0] == "density_max_detour" {
     fv, ok := strconv.parse_f64(args[1])
     if !ok || fv < 0 {
       fmt.eprintfln("invalid value: %s (want a number >= 0, e.g. 1.75)", args[1])
       return
     }
-    if args[0] == "attack_range" {
+    switch args[0] {
+    case "attack_range":
       session.layout.attack_range = f32(fv)
-    } else {
+    case "density_weight":
       session.layout.density_weight = f32(fv)
+    case "density_max_detour":
+      session.layout.density_max_detour = f32(fv)
     }
     fmt.printfln("set %s = %v", args[0], f32(fv))
     if flyff_save_cfg(session.layout, flyff_cfg_path()) {

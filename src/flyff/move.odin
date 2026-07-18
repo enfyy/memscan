@@ -3,6 +3,7 @@ package flyff
 import "core:fmt"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 import win "core:sys/windows"
 
 import "../engine"
@@ -112,6 +113,7 @@ cli_jump :: proc(session: ^Session, args: []string) {
     return
   }
   if ret == 1 {
+    session.jump_fired_at = time.now()._nsec // radar dot-hop animation (see cli_radar)
     // Broadcast the jump state so OTHER clients see it (SendActMsg only set it locally).
     synced := remote_send_playermoved(session)
     fmt.printfln("jump.%s", synced ? "" : "  (local only - others won't see it; run 'findmove')")
