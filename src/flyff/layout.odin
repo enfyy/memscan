@@ -44,6 +44,10 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.hp_off = i64(v)
   case "penya_off":
     layout.penya_off = i64(v)
+  case "inv_off":
+    layout.inv_off = i64(v)
+  case "item_stride":
+    layout.item_stride = i64(v)
   case "model_off":
     layout.model_off = i64(v)
   case "angle_off":
@@ -76,6 +80,8 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.hmap_off = i64(v)
   case "attack_range":
     layout.attack_range = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
+  case "radar_range":
+    layout.radar_range = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
   case "density_weight":
     layout.density_weight = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
   case "density_on":
@@ -84,6 +90,22 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.density_min_gain = int(v)
   case "density_max_detour":
     layout.density_max_detour = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
+  case "la_hold_min":
+    layout.la_hold_min = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
+  case "la_hold_max":
+    layout.la_hold_max = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
+  case "la_jump_min":
+    layout.la_jump_min = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
+  case "la_jump_max":
+    layout.la_jump_max = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
+  case "la_jump_chance":
+    layout.la_jump_chance = int(v)
+  case "la_step_chance":
+    layout.la_step_chance = int(v)
+  case "la_step_spread":
+    layout.la_step_spread = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
+  case "la_max_range":
+    layout.la_max_range = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
   case "aobjcull_rva":
     layout.aobjcull_rva = uintptr(v)
   case "camera_rva":
@@ -132,6 +154,8 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "name_off=0x%X", layout.name_off)
   fmt.sbprintfln(&b, "hp_off=0x%X", layout.hp_off)
   fmt.sbprintfln(&b, "penya_off=0x%X", layout.penya_off)
+  fmt.sbprintfln(&b, "inv_off=0x%X", layout.inv_off)
+  fmt.sbprintfln(&b, "item_stride=0x%X", layout.item_stride)
   fmt.sbprintfln(&b, "model_off=0x%X", layout.model_off)
   fmt.sbprintfln(&b, "angle_off=0x%X", layout.angle_off)
   fmt.sbprintfln(&b, "mover_type=%d", layout.mover_type)
@@ -148,15 +172,33 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "mpu_off=0x%X", layout.mpu_off)
   fmt.sbprintfln(&b, "hmap_off=0x%X", layout.hmap_off)
   fmt.sbprintfln(&b, "attack_range=%v", layout.attack_range)
+  fmt.sbprintfln(&b, "radar_range=%v", layout.radar_range)
   fmt.sbprintfln(&b, "density_weight=%v", layout.density_weight)
   fmt.sbprintfln(&b, "density_on=%d", layout.density_on ? 1 : 0)
   fmt.sbprintfln(&b, "density_min_gain=%d", layout.density_min_gain)
   fmt.sbprintfln(&b, "density_max_detour=%v", layout.density_max_detour)
+  fmt.sbprintfln(&b, "density_hue_on=%d", layout.density_hue_on ? 1 : 0)
   fmt.sbprintfln(&b, "preselect_on=%d", layout.preselect_on ? 1 : 0)
   fmt.sbprintfln(&b, "lookalive_on=%d", layout.lookalive_on ? 1 : 0)
+  fmt.sbprintfln(&b, "la_hold_min=%v", layout.la_hold_min)
+  fmt.sbprintfln(&b, "la_hold_max=%v", layout.la_hold_max)
+  fmt.sbprintfln(&b, "la_jump_min=%v", layout.la_jump_min)
+  fmt.sbprintfln(&b, "la_jump_max=%v", layout.la_jump_max)
+  fmt.sbprintfln(&b, "la_jump_chance=%d", layout.la_jump_chance)
+  fmt.sbprintfln(&b, "la_hesitate_on=%d", layout.la_hesitate_on ? 1 : 0)
+  fmt.sbprintfln(&b, "la_jump_on=%d", layout.la_jump_on ? 1 : 0)
+  fmt.sbprintfln(&b, "la_step_on=%d", layout.la_step_on ? 1 : 0)
+  fmt.sbprintfln(&b, "la_maxrange_on=%d", layout.la_maxrange_on ? 1 : 0)
+  fmt.sbprintfln(&b, "la_step_chance=%d", layout.la_step_chance)
+  fmt.sbprintfln(&b, "la_step_spread=%v", layout.la_step_spread)
+  fmt.sbprintfln(&b, "la_max_range=%v", layout.la_max_range)
   fmt.sbprintfln(&b, "reach_gate_on=%d", layout.reach_gate_on ? 1 : 0)
+  fmt.sbprintfln(&b, "hunt_on=%d", layout.hunt_on ? 1 : 0)
   fmt.sbprintfln(&b, "sfx_on=%d", layout.sfx_on ? 1 : 0)
   fmt.sbprintfln(&b, "fx_laser_on=%d", layout.fx_laser_on ? 1 : 0)
+  fmt.sbprintfln(&b, "trail_on=%d", layout.trail_on ? 1 : 0)
+  fmt.sbprintfln(&b, "trail_len=%v", layout.trail_len)
+  fmt.sbprintfln(&b, "trail_fade=%v", layout.trail_fade)
   fmt.sbprintfln(&b, "aobjcull_rva=0x%X", layout.aobjcull_rva)
   fmt.sbprintfln(&b, "camera_rva=0x%X", layout.camera_rva)
   fmt.sbprintfln(&b, "coll_obj3d_off=0x%X", layout.coll_obj3d_off)
@@ -201,6 +243,24 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
       }
       continue
     }
+    if key == "radar_range" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.radar_range = f32(fv) // world-unit gather radius - parse as float
+      }
+      continue
+    }
+    if key == "trail_len" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.trail_len = f32(fv) // world-unit trail length - parse as float
+      }
+      continue
+    }
+    if key == "trail_fade" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.trail_fade = f32(fv) // fade exponent - parse as float
+      }
+      continue
+    }
     if key == "density_weight" {
       if fv, ok := strconv.parse_f64(val); ok {
         layout.density_weight = f32(fv) // fractional field - parse as float
@@ -213,6 +273,27 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
       }
       continue
     }
+    // Look-alive fractional tunables (seconds / world units). la_jump_chance + la_step_chance are plain
+    // ints -> generic path below.
+    if key == "la_hold_min" || key == "la_hold_max" || key == "la_jump_min" || key == "la_jump_max" || key == "la_step_spread" || key == "la_max_range" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        switch key {
+        case "la_hold_min":
+          layout.la_hold_min = f32(fv)
+        case "la_hold_max":
+          layout.la_hold_max = f32(fv)
+        case "la_jump_min":
+          layout.la_jump_min = f32(fv)
+        case "la_jump_max":
+          layout.la_jump_max = f32(fv)
+        case "la_step_spread":
+          layout.la_step_spread = f32(fv)
+        case "la_max_range":
+          layout.la_max_range = f32(fv)
+        }
+      }
+      continue
+    }
     if key == "density_on" {
       saw_density_on = true
       layout.density_on = val == "1" || strings.equal_fold(val, "true") || strings.equal_fold(val, "on")
@@ -221,7 +302,7 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     // Persisted runtime toggles - bool-parsed like density_on. Deliberately NOT in layout_set_field:
     // the first three are session-mirrored (their CLI toggles keep both sides in sync; a raw `set`
     // would silently desync), and sfx/fxlaser have their own commands.
-    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "sfx_on" || key == "fx_laser_on" {
+    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "hunt_on" || key == "sfx_on" || key == "fx_laser_on" || key == "trail_on" || key == "density_hue_on" || key == "la_hesitate_on" || key == "la_jump_on" || key == "la_step_on" || key == "la_maxrange_on" {
       bv := val == "1" || strings.equal_fold(val, "true") || strings.equal_fold(val, "on")
       switch key {
       case "preselect_on":
@@ -230,10 +311,24 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
         layout.lookalive_on = bv
       case "reach_gate_on":
         layout.reach_gate_on = bv
+      case "hunt_on":
+        layout.hunt_on = bv
       case "sfx_on":
         layout.sfx_on = bv
       case "fx_laser_on":
         layout.fx_laser_on = bv
+      case "trail_on":
+        layout.trail_on = bv
+      case "density_hue_on":
+        layout.density_hue_on = bv
+      case "la_hesitate_on":
+        layout.la_hesitate_on = bv
+      case "la_jump_on":
+        layout.la_jump_on = bv
+      case "la_step_on":
+        layout.la_step_on = bv
+      case "la_maxrange_on":
+        layout.la_maxrange_on = bv
       }
       continue
     }
@@ -346,6 +441,16 @@ cli_status_full :: proc(session: ^Session) {
   } else {
     fmt.println("  penya_off=0x0    [--] radar '+penya' pop off. fix: 'findpenya <current-penya>'")
   }
+  // inventory-full detector - optional; live-read the current fill if pinned (doubles as verification).
+  if L.inv_off != 0 && L.item_stride != 0 {
+    if used, free, cap, ok := read_inventory_counts(session); ok {
+      fmt.printfln("  inv_off=0x%X item_stride=0x%X  [OK] inventory reads %d/%d used, %d free%s", L.inv_off, L.item_stride, used, cap, free, free == 0 ? " (FULL)" : "")
+    } else {
+      fmt.printfln("  inv_off=0x%X item_stride=0x%X  [--] pinned but couldn't read now - be in-game, or re-run 'findinv'", L.inv_off, L.item_stride)
+    }
+  } else {
+    fmt.println("  inv_off=0x0      [--] inventory-full detector off ('inv' / status). fix: 'findinv' (or re-run 'setup')")
+  }
 
   // --- srvsync / anti-DC ---
   srv_cfg := L.objid_off != 0 && L.sendsettarget_rva != 0 && session.ptr_size == 4
@@ -396,6 +501,32 @@ cli_status_full :: proc(session: ^Session) {
     fmt.println("       [OFF] = LOCAL-ONLY (others see a teleport / miss the jump). fix: 'findmove' in-game.")
   }
 
+  // --- Look-alive tuning (mode toggle mirrored in Session; sub-feature enables + delays persisted here) ---
+  fmt.println("")
+  fmt.printfln("LOOK-ALIVE (human-like farming; mode is %s) - tune in radar Options or 'lookalive ...':", session.lookalive_on ? "ON" : "off")
+  fmt.printfln(
+    "  enables: hesitate %s  jump %s  step %s  max-range %s",
+    L.la_hesitate_on ? "on" : "off", L.la_jump_on ? "on" : "off", L.la_step_on ? "on" : "off", L.la_maxrange_on ? "on" : "off",
+  )
+  fmt.printfln(
+    "  hesitation %.2f-%.2fs   jump interval %.2f-%.2fs   jump chance %d%%",
+    L.la_hold_min, L.la_hold_max, L.la_jump_min, L.la_jump_max, L.la_jump_chance,
+  )
+  fmt.printfln(
+    "  step chance %d%%   step spread %.1fu   max-range %.1fu (beyond -> shrinking-hop approach)",
+    L.la_step_chance, L.la_step_spread, L.la_max_range,
+  )
+  if !move_ok {
+    fmt.println("  note: step + max-range approach (and jumps) are inert until 'findmove' is set up; hesitation still applies.")
+  }
+
+  // --- Hunt mode (commit-to-one-target; standalone, mirrored in Session) ---
+  fmt.println("")
+  fmt.printfln("HUNT mode: %s  <- commit to one target (giant/quest), never drop it for being far/unreachable. 'hunt on|off'.", session.hunt_on ? "ON" : "off")
+  if session.hunt_on && !move_ok {
+    fmt.println("  note: side-stepping around blocks needs 'findmove'; without it, hunt still never drops the target but can't step around a wall.")
+  }
+
   // --- Species prop-table gate for no-name auto ---
   fmt.println("")
   fmt.println("ATTACKABLE-MONSTER gate for no-name 'auto' (any-monster mode) - species GetProp()->dwAI == AII_MONSTER:")
@@ -418,6 +549,7 @@ cli_status_full :: proc(session: ^Session) {
   fmt.println("TERRAIN reachability oracle (from 'worldscan') - reach-gated target selection - OPTIONAL:")
   fmt.printfln("  land_off=0x%X landwidth_off=0x%X hmap_off=0x%X mpu_off=0x%X", L.land_off, L.landwidth_off, L.hmap_off, L.mpu_off)
   fmt.printfln("  attack_range=%v  <- your reach; drives target selection (the picker's engage range) AND 'reach'. 'set attack_range <n>' (floats ok, e.g. 1.75).", L.attack_range)
+  fmt.printfln("  radar_range=%v  <- radar display only: how far it gathers/draws mob dots (world units). Options slider or 'set radar_range <n>' (40-400).", L.radar_range)
   fmt.printfln(
     "  density: %s  <- auto's cluster steering. OFF = plain nearest (v0.4.0 behaviour). ON commits to a mob pack until it's wiped and only detours to a denser pack past the gate. 'density on|off', 'density mingain <n>' (default %d), 'density detour <n>' (default %v).",
     L.density_on ? fmt.tprintf("ON (mingain=%d detour=%v)", L.density_min_gain, L.density_max_detour) : "OFF",
@@ -569,8 +701,9 @@ cli_set :: proc(session: ^Session, args: []string) {
     fmt.eprintln("usage: set <field> <value>   (field names: see 'offsets')")
     return
   }
-  // attack_range / density_weight / density_max_detour are the fractional fields - parse as floats.
-  if args[0] == "attack_range" || args[0] == "density_weight" || args[0] == "density_max_detour" {
+  // attack_range / radar_range / density_weight / density_max_detour / la_* delays are the fractional
+  // fields - parse as floats (la_jump_chance is an int and takes the generic parse_addr path below).
+  if args[0] == "attack_range" || args[0] == "radar_range" || args[0] == "trail_len" || args[0] == "trail_fade" || args[0] == "density_weight" || args[0] == "density_max_detour" || args[0] == "la_hold_min" || args[0] == "la_hold_max" || args[0] == "la_jump_min" || args[0] == "la_jump_max" || args[0] == "la_step_spread" || args[0] == "la_max_range" {
     fv, ok := strconv.parse_f64(args[1])
     if !ok || fv < 0 {
       fmt.eprintfln("invalid value: %s (want a number >= 0, e.g. 1.75)", args[1])
@@ -579,10 +712,28 @@ cli_set :: proc(session: ^Session, args: []string) {
     switch args[0] {
     case "attack_range":
       session.layout.attack_range = f32(fv)
+    case "radar_range":
+      session.layout.radar_range = f32(fv)
+    case "trail_len":
+      session.layout.trail_len = f32(fv)
+    case "trail_fade":
+      session.layout.trail_fade = f32(fv)
     case "density_weight":
       session.layout.density_weight = f32(fv)
     case "density_max_detour":
       session.layout.density_max_detour = f32(fv)
+    case "la_hold_min":
+      session.layout.la_hold_min = f32(fv)
+    case "la_hold_max":
+      session.layout.la_hold_max = f32(fv)
+    case "la_jump_min":
+      session.layout.la_jump_min = f32(fv)
+    case "la_jump_max":
+      session.layout.la_jump_max = f32(fv)
+    case "la_step_spread":
+      session.layout.la_step_spread = f32(fv)
+    case "la_max_range":
+      session.layout.la_max_range = f32(fv)
     }
     fmt.printfln("set %s = %v", args[0], f32(fv))
     if flyff_save_cfg(session.layout, flyff_cfg_path()) {

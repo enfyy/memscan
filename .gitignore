@@ -9,3 +9,6 @@ BACKLOG.md
 # tdbg debug maps (target-selection snapshots) - local analysis output, regenerated on demand.
 tc_map*.html
 CLAUDE.md
+# Tracy profiler: tracy-profiler.exe under tool/tracy/ is already covered by *.exe above; keep
+# local captures out of version control too (the client lib lib/odin-tracy/tracy.lib IS tracked).
+*.tracy

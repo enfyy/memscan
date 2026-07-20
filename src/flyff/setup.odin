@@ -26,7 +26,7 @@ import "../engine"
 // while a setup runs (see the async progress notes on cli_setup). A global (not a constant) so it can
 // be indexed with the runtime step value.
 @(rodata)
-SETUP_STEP_LABELS := [8]string {
+SETUP_STEP_LABELS := [9]string {
   "core + srvsync + focus",
   "attackable-monster prop gate",
   "walk-through-prop filter",
@@ -35,6 +35,7 @@ SETUP_STEP_LABELS := [8]string {
   "render camera",
   "mesh-reach function",
   "attack range",
+  "inventory-full detector",
 }
 
 // Briefly release exec_mutex so other threads (the radar frame pump, the watcher) can run between two
@@ -92,7 +93,7 @@ cli_setup :: proc(session: ^Session, args: []string) {
 
   // [1] Core + srvsync + focus - anchor by name (position-free), then derive everything downstream.
   setup_step_mark(session, 1)
-  fmt.printfln("[1/8] core + srvsync + focus  (anchoring on '%s')", name)
+  fmt.printfln("[1/9] core + srvsync + focus  (anchoring on '%s')", name)
   player, noff, ok := find_player_by_name(session, name)
   if !ok {
     fmt.eprintfln("  could not find a mover named '%s' - are you FULLY in-game (not at a loading screen) and is the name exact (case-sensitive)?", name)
@@ -102,37 +103,37 @@ cli_setup :: proc(session: ^Session, args: []string) {
 
   // [2] Attackable-monster prop gate - just needs a few distinct monster species on screen (no target).
   setup_step_mark(session, 2)
-  fmt.println("\n[2/8] attackable-monster prop gate (findprop - a few distinct monsters on screen)")
+  fmt.println("\n[2/9] attackable-monster prop gate (findprop - a few distinct monsters on screen)")
   cli_findprop(session, {})
 
   // [3] Decorative (walk-through) prop filter - full-scan, so all nearby props feed the consensus.
   setup_step_mark(session, 3)
-  fmt.println("\n[3/8] walk-through-prop collision filter (collscan)")
+  fmt.println("\n[3/9] walk-through-prop collision filter (collscan)")
   cli_collscan(session, {})
 
   // [4] Terrain reachability - best effort; wants flat solid ground.
   setup_step_mark(session, 4)
-  fmt.println("\n[4/8] terrain reachability (worldscan - stand on flat ground; may need a 2nd sample)")
+  fmt.println("\n[4/9] terrain reachability (worldscan - stand on flat ground; may need a 2nd sample)")
   cli_worldscan(session, {})
 
   // [5] Character control (moveto / jump) - derives the dest-field offsets + SendActMsg RVA + jump_msg.
   setup_step_mark(session, 5)
-  fmt.println("\n[5/8] character control (findmove - moveto + jump)")
+  fmt.println("\n[5/9] character control (findmove - moveto + jump)")
   cli_findmove(session, {})
 
   // [6] Render camera - enables the tdbg cull-cone overlay + the radar's camera frustum (F). Read-only scan.
   setup_step_mark(session, 6)
-  fmt.println("\n[6/8] render camera (findcam)")
+  fmt.println("\n[6/9] render camera (findcam)")
   cli_findcam(session, {})
 
   // [7] Mesh-reach RVA - pins IntersectObjLine so `meshreach`/`objline`/`reachcmp` work. Read-only scan.
   setup_step_mark(session, 7)
-  fmt.println("\n[7/8] mesh-reach function (findobjline)")
+  fmt.println("\n[7/9] mesh-reach function (findobjline)")
   cli_findobjline(session, {})
 
   // [8] Attack range - drives the picker's engage/melee ranges.
   setup_step_mark(session, 8)
-  fmt.println("\n[8/8] attack range")
+  fmt.println("\n[8/9] attack range")
   if session.layout.attack_range <= 0 {
     session.layout.attack_range = 1.75 // melee default; the user should set their real reach
     flyff_save_cfg(session.layout, flyff_cfg_path())
@@ -140,6 +141,11 @@ cli_setup :: proc(session: ^Session, args: []string) {
   } else {
     fmt.printfln("  attack_range = %v. Change with: set attack_range <n>", session.layout.attack_range)
   }
+
+  // [9] Inventory-full detector - auto-locate m_Inventory header + element stride. Read-only scan.
+  setup_step_mark(session, 9)
+  fmt.println("\n[9/9] inventory-full detector (findinv)")
+  cli_findinv(session, {})
 
   setup_report(session)
 }
@@ -155,7 +161,7 @@ Setup_Group :: struct {
 
 // The live setup checklist - shared by the `setup` summary and the `status` babysitter top-line, so they
 // never drift. Reads the live layout (each finder auto-pins its fields) + resolves the anchors.
-setup_groups :: proc(session: ^Session) -> [9]Setup_Group {
+setup_groups :: proc(session: ^Session) -> [10]Setup_Group {
   L := session.layout
   handle := session.proc_info.handle
   base := session.proc_info.base
@@ -164,7 +170,7 @@ setup_groups :: proc(session: ^Session) -> [9]Setup_Group {
   char_ctrl_ok :=
     L.destpos_off != 0 && L.iddest_off != 0 && L.forward_off != 0 && // moveto (field-write)
     sendactmsg_rva_sane(session) && L.actmover_off != 0 && L.jump_msg != 0 // jump (SendActMsg call)
-  return [9]Setup_Group {
+  return [10]Setup_Group {
     {core_ok, true, "core (see/select targets)", "be fully in-game, then `setup <name>`"},
     {L.objid_off != 0 && L.sendsettarget_rva != 0, true, "srvsync (anti-disconnect)", "select a mob and re-run `setup` (or `findsettarget`)"},
     {prop_gate_live_ok(session), true, "attackable-monster gate", "get a few distinct monsters on screen, re-run `setup` (or `findprop`)"},
@@ -174,6 +180,7 @@ setup_groups :: proc(session: ^Session) -> [9]Setup_Group {
     {L.attack_range > 0, false, "attack range", "`set attack_range <n>` to your reach"},
     {L.camera_rva != 0, false, "camera / tdbg cull-cone", "be in-game, re-run `setup` (or `findcam`)"},
     {intersectobjline_rva_sane(session), false, "mesh-reach function (objline)", "re-run `setup` (or `findobjline`)"},
+    {L.inv_off != 0 && L.item_stride != 0, false, "inventory-full detector", "be in-game, re-run `setup` (or `findinv`)"},
   }
 }
 

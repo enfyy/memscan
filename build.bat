@@ -32,7 +32,7 @@ REM ==============================================
 REM Validate Input & Environment
 REM ==============================================
 if "%1"=="" (
-    echo Usage: build.bat [debug^|release]
+    echo Usage: build.bat [debug^|release] [tracy]
     exit /b 1
 )
 
@@ -46,6 +46,14 @@ if /i "%1"=="debug" (
     echo Invalid build mode. Use 'debug' or 'release'
     exit /b 1
 )
+
+REM Optional 2nd arg 'tracy' (alias 'profile') enables the Tracy profiler, independent of
+REM debug/release. Off by default: without the define, every tracy.* call compiles to nothing
+REM (see lib/odin-tracy/wrapper.odin), so normal builds are unaffected. tracy.lib is always
+REM linked but stays dormant until instrumentation runs. View captures with tool\tracy\tracy-profiler.exe.
+set "PROFILE_FLAGS="
+if /i "%2"=="tracy"   set "PROFILE_FLAGS=-define:TRACY_ENABLE=true"
+if /i "%2"=="profile" set "PROFILE_FLAGS=-define:TRACY_ENABLE=true"
 
 REM ==============================================
 REM Build
@@ -61,11 +69,11 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo %BLUE%^> %COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS%%RESET%
+echo %BLUE%^> %COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS% %PROFILE_FLAGS%%RESET%
 REM Stream odin's output straight to the console (preserves newlines/indentation and any '!' in
 REM messages - the old redirect-into-a-delayed-expansion-variable approach mangled all three) and
 REM capture only its exit code.
-%COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS%
+%COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS% %PROFILE_FLAGS%
 set "BUILD_ERROR=%ERRORLEVEL%"
 
 if not "%BUILD_ERROR%"=="0" (

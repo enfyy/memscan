@@ -68,12 +68,16 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_density(s, args)
   case "reachgate":
     cli_reachgate(s, args)
+  case "hunt":
+    cli_hunt(s, args)
   case "meshreach":
     cli_meshreach(s, args)
   case "sfx":
     cli_sfx(s, args)
   case "fxlaser":
     cli_fxlaser(s, args)
+  case "trail":
+    cli_trail(s, args)
   case "collwatch":
     cli_collwatch(s, args)
   case "pause":
@@ -118,6 +122,10 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_objscan(s, args)
   case "findpenya":
     cli_findpenya(s, args)
+  case "findinv":
+    cli_findinv(s, args)
+  case "inv":
+    cli_inv(s, args)
   case "mobs":
     cli_mobs(s, args)
   case "mark":
@@ -225,10 +233,11 @@ on_attach :: proc(es: ^engine.Session) {
 
   // Runtime-toggle mirrors: the session bools stay authoritative at runtime; the layout copies exist
   // only so they persist through flyff.cfg. Load them into the live session here; their CLI toggles
-  // (preselect / lookalive / reachgate) write both sides + save. sfx/fxlaser live on the layout only.
+  // (preselect / lookalive / reachgate / hunt) write both sides + save. sfx/fxlaser live on the layout only.
   s.preselect_on = s.layout.preselect_on
   s.lookalive_on = s.layout.lookalive_on
   s.reach_gate_on = s.layout.reach_gate_on
+  s.hunt_on = s.layout.hunt_on
 
   // srvsync defaults ON now that the anti-DC path is proven - it's always needed. It stays inert
   // (notify_server_target no-ops) until sendsettarget_rva/objid_off are set on a 32-bit client, so
@@ -318,9 +327,15 @@ farming (day to day)
                              ON commits to a mob pack until it's wiped; a farther pack steals the pick only past the gates below
   density mingain <n>        gate 1: extra pack members a farther pack needs to steal the pick (default 3)
   density detour <n>         gate 2: max extra walk distance (world units) for that detour (default 20)
+  density hue [on|off]       radar display only: tint monster dots by local pack size (lone red -> dense green)
   preselect [on|off]         precompute the next target while fighting so auto advances instantly on kill (on by default)
-  lookalive [on|off]         human-like farming: random hesitation before each target + occasional jumps (opt-in; needs findmove for jumps)
+  lookalive [on|off]         human-like farming (opt-in): hesitation + jumps + intermediate steps + max-range approach (walk behaviors need findmove)
+  lookalive hesitate|jump|step|maxrange on|off   enable/disable one sub-behavior independently
+  lookalive hold <min> <max> hesitation window (s, delayed lock-on); lookalive jump <min> <max> jump interval (s); lookalive chance <0-100> jump-fire odds
+  lookalive step chance <0-100> odds an advance detours via one offset step; step spread <units> waypoint sideways range; maxrange <units> shrinking-hop distance
+  lookalive show             print the current enables + tuning
   reachgate [on|off]         proactively skip mobs behind walls/trees/buildings when auto-picks a target
+  hunt [on|off]              hunt mode: commit to one target (giant/quest), never drop it for being far/unreachable; side-step around blocks (needs findmove)
   sfx [on|off]               radar sound effects (penya chime + kill zap); persisted to flyff.cfg
   fxlaser [on|off]           radar kill laser-beam effect; persisted to flyff.cfg
   meshreach [on|off]         confirm OBB-blocked mobs with the client's IntersectObjLine (opt-in; injects, crash-prone)
@@ -405,4 +420,6 @@ deep recon (rarely needed)
   deathscan <name>           find a corpse despawn-countdown field
   objscan <value> <name>     find offsets holding <value> across <name> movers
   findpenya <penya> [span]   pin penya_off (your gold field) by its value -> radar '+penya' pop.
-                             read your penya off the UI; if ambiguous, kill a mob + re-run w/ the new value`
+                             read your penya off the UI; if ambiguous, kill a mob + re-run w/ the new value
+  findinv [slots]            auto-pin inv_off + item_stride (no value needed) -> enables 'inv'
+  inv                        report inventory fill (used/free/capacity, FULL); needs 'findinv'`

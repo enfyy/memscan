@@ -6,6 +6,8 @@ import "core:strings"
 import "core:sync"
 import win "core:sys/windows"
 
+import tracy "../../lib/odin-tracy"
+
 // ===========================================================================
 // Global hotkeys + background watcher (generic; process-agnostic).
 //
@@ -33,6 +35,7 @@ hotkey_thread_start :: proc "system" (param: rawptr) -> win.DWORD {
 }
 
 hotkey_watch_loop :: proc(session: ^Session) {
+  tracy.SetThreadName("watcher")
   for {
     sync.mutex_lock(&session.exec_mutex)
     if session.hk_stop {

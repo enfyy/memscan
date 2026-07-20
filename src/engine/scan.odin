@@ -6,6 +6,8 @@ import "core:slice"
 import "core:thread"
 import win "core:sys/windows"
 
+import tracy "../../lib/odin-tracy"
+
 
 // ===========================================================================
 // Scanning
@@ -110,6 +112,7 @@ Scan_Worker :: struct {
 }
 
 scan_worker_proc :: proc(data: rawptr) {
+  tracy.SetThreadName("scan_worker")
   w := cast(^Scan_Worker)data
   w.matches = make([dynamic]Match)
   buf: []byte
@@ -164,6 +167,7 @@ scan_exact_parallel :: proc(
 ) -> (
   set: Match_Set,
 ) {
+  tracy.ZoneN("Scan_Parallel") // 8-thread full-process value scan; the heavy half of a collider rebuild
   set.vtype = t
   set.matches = make([dynamic]Match, allocator)
   size := value_size(t)

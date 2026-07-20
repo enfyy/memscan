@@ -9,6 +9,8 @@ import "core:sync"
 import "core:time"
 import win "core:sys/windows"
 
+import tracy "../../lib/odin-tracy"
+
 // ===========================================================================
 // Terrain reachability oracle (obstacle avoidance spike).
 //
@@ -1272,6 +1274,7 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
 // (path in, get stuck; not drawn). The picker already full-scans every tick, so this is the same cost
 // class. Rebuilt only when the player leaves the cached area, so segment tests hit the cache (pure math).
 collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32) -> []Obb {
+  tracy.ZoneN("Collect_Colliders") // tiny on cache hit, balloons on the ~16-unit rebuild (stutter suspect)
   L := session.layout
   if world == 0 || session.ptr_size != 4 {
     return nil
@@ -1338,6 +1341,7 @@ Reach_Res :: struct {
 // Matches the game: it runs you straight at the mob and shoots straight at it, so the whole line to the
 // mob must be clear.
 compute_reach :: proc(session: ^Session, world: uintptr, px, py, pz, tx, tz: f32) -> Reach_Res {
+  tracy.ZoneN("Compute_Reach")
   L := session.layout
   d := engine.dist_horizontal({px, 0, pz}, {tx, 0, tz})
   in_range := L.attack_range > 0 && d <= f32(L.attack_range)

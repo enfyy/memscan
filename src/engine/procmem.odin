@@ -2,6 +2,8 @@ package engine
 
 import win "core:sys/windows"
 
+import tracy "../../lib/odin-tracy"
+
 // ===========================================================================
 // Process memory read / write
 // ===========================================================================
@@ -141,6 +143,7 @@ collect_regions :: proc(
   private_only := false,
   allocator := context.allocator,
 ) -> [dynamic]Region {
+  tracy.ZoneN("Collect_Regions") // VirtualQueryEx walk of the whole target address space
   regions := make([dynamic]Region, allocator)
   mbi: win.MEMORY_BASIC_INFORMATION
   mbi_size := uint(size_of(mbi))

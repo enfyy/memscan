@@ -96,7 +96,7 @@ Session :: struct {
   auto_reach_fail_count: int, // consecutive blocked probes so far
 
   // Async setup progress (see cli_setup / setup_step_mark). setup_running guards re-entry (one run at
-  // a time, REPL or panel); setup_step (1..8, 0 = idle) feeds the radar panel's live step counter.
+  // a time, REPL or panel); setup_step (1..9, 0 = idle) feeds the radar panel's live step counter.
   setup_running: bool,
   setup_step:    int,
 
@@ -148,6 +148,29 @@ Session :: struct {
   lookalive_on:         bool,
   lookalive_hold_until: i64, // nsec deadline for the post-kill hesitation (0 = no active hold)
   lookalive_jump_at:    i64, // nsec of the next scheduled travel-jump attempt (0 = (re)seed on next tick)
+
+  // Look-alive "approach" (walk-first) state machine (see lookalive_begin_approach / lookalive_approach_tick
+  // in autofarm.odin). While active, auto has picked the next mob but NOT locked it: instead it walks the
+  // character to waypoints via moveto and only locks (auto_commit_pick) once it arrives / is close enough.
+  // Both the single intermediate-step (la_step_on) and the multi-hop max-range approach (la_maxrange_on) use
+  // this one state. All reset in auto_stop; needs 'findmove' (moveto_configured), else it's never entered.
+  la_approach_on:          bool,    // an approach is in progress (short-circuits the rest of auto_tick)
+  la_approach_obj:         uintptr, // the pending (not-yet-locked) target we're walking toward
+  la_approach_wp:          [3]f32,  // the current waypoint we're walking to
+  la_approach_multi:       bool,    // max-range multi-hop (true) vs single intermediate step (false)
+  la_approach_stage:       TC_Stage, // cascade stage of the pending pick (feeds cluster_advance on lock)
+  la_approach_pack:        int,     // its local pack size (feeds cluster_advance on lock)
+  la_approach_best:        f32,     // closest player->waypoint distance seen (progress watchdog)
+  la_approach_progress_at: i64,     // nsec of the last real progress toward the waypoint (stuck timeout)
+
+  // Hunt mode (cli_hunt, cfg mirror layout.hunt_on): commit to ONE target and never drop it for being
+  // far/unreachable. Suppresses the reach-watch/stuck-plateau drops and relaxes the selection reach-gate;
+  // when the path stalls it side-steps (unlock -> moveto a perpendicular waypoint via the la_approach
+  // machinery -> re-lock on arrival) instead of blacklisting. hunt_side_flip alternates the step side so
+  // repeated stalls sweep both ways around an obstacle; hunt_sidestep_count paces the flip. Reset in auto_stop.
+  hunt_on:             bool,
+  hunt_side_flip:      bool, // which side the next side-step offsets to (flips every HUNT_SIDESTEP_FLIP stalls)
+  hunt_sidestep_count: int,  // consecutive side-steps on the current target (paces hunt_side_flip)
 
   // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.

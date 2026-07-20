@@ -18,6 +18,18 @@ FLYFF_HP_OFF :: 0x814 // CMover current HP (LONG); 0 => dead/despawning (don't t
 // next field (+0x818) and equals currentHP at full health - calibrate_derive steps DOWN to this (lower)
 // offset so it never pins maxHP by mistake (maxHP never hits 0, so pets/corpses would misread as alive).
 FLYFF_PENYA_OFF :: 0 // player penya/gold (u32, inline in CMover); 0 => unpinned (run 'findpenya')
+// Inventory-full detection. m_Inventory is an embedded CItemContainer<CItemElem> inside CMover; inv_off
+// is the offset of its 16-byte header {DWORD* m_apIndex, DWORD m_dwIndexNum, DWORD m_dwItemMax,
+// CItemElem* m_apItem}. item_stride is sizeof(CItemElem) (the m_apItem array stride). Both are
+// build-dependent and auto-pinned by 'findinv' (0 => unpinned). The header/element sub-offsets below are
+// fixed by the 32-bit layout (each is DWORDs after a leading 4-byte ptr, no padding).
+FLYFF_INV_OFF :: 0 // offset of m_Inventory (its m_apIndex field) in CMover; 0 => unpinned (run 'findinv')
+FLYFF_ITEM_STRIDE :: 0 // sizeof(CItemElem), the m_apItem array stride; 0 => unpinned (run 'findinv')
+INV_INDEXNUM_REL :: 0x4 // m_dwIndexNum (bag capacity, e.g. 168) relative to inv_off
+INV_ITEMMAX_REL :: 0x8 // m_dwItemMax (indexNum + equip slots) relative to inv_off
+INV_APITEM_REL :: 0xC // CItemElem* m_apItem (element array base) relative to inv_off
+ITEM_OBJIDX_REL :: 0x8 // m_dwObjIndex (logical slot; < indexNum for a bag item) relative to element start
+ITEM_ITEMID_REL :: 0xC // m_dwItemId (0 => empty slot) relative to element start
 FLYFF_MODEL_OFF :: 0x178 // CObj.m_pModel; NULL => not rendered/selectable (crashes on select)
 FLYFF_ANGLE_OFF :: 0x18 // CObj.m_fAngle (Y-yaw, DEGREES). Obj.cpp: RotationY(-m_fAngle) => forward=(-sin,0,cos)
 
@@ -52,6 +64,12 @@ FLYFF_HMAP_OFF :: 0x0 // CLandscape.m_pHeightMap (float*, 129x129 corner grid)
 // attack_range <n>`. 0 => test the full path to the mob's cell.
 FLYFF_ATTACK_RANGE :: 1.7
 
+// Radar display: how far (world units) the radar gathers + draws mob dots around the player. Only the
+// mover blips - obstacle/collider gathering is a separate collision-driven radius (COLLIDER_RADIUS) and
+// is deliberately NOT tied to this. Clamped to [RADAR_RANGE_MIN, RADAR_RANGE_MAX] at use; a range past
+// one landscape tile (~512u) would need the mover tile-window widened, hence the cap. Slider in Options.
+FLYFF_RADAR_RANGE :: f32(80)
+
 // Density / cluster steering (NOT memory offsets). density_on gates the whole feature: OFF = the plain
 // nearest-mob cascade (v0.4.0-identical); ON = auto commits to a mob pack until it's wiped
 // (cluster_advance) and only detours to a denser pack past a double gate - at least density_min_gain
@@ -63,6 +81,9 @@ FLYFF_DENSITY_WEIGHT :: 0
 FLYFF_DENSITY_ON :: false
 FLYFF_DENSITY_MIN_GAIN :: 3
 FLYFF_DENSITY_MAX_DETOUR :: f32(20)
+// Radar display only (no picker effect): tint each monster dot by its local pack size (# mobs within
+// density_radius) instead of flat red - lone = red, denser = hue-shifted toward green. Persisted.
+FLYFF_DENSITY_HUE_ON :: false
 
 // Persisted runtime toggles (NOT memory offsets). preselect/lookalive/reachgate mirror the Session
 // bools so they survive restarts: session.X stays authoritative at runtime, layout.X exists only for
@@ -72,8 +93,49 @@ FLYFF_DENSITY_MAX_DETOUR :: f32(20)
 FLYFF_PRESELECT_ON :: true
 FLYFF_LOOKALIVE_ON :: false
 FLYFF_REACH_GATE_ON :: true
+// Hunt mode: commit to ONE target and never drop it for being far/unreachable (farming's opposite).
+// Suppresses the reach-watch/stuck-plateau target-drops and relaxes the selection reach-gate; when a
+// path is blocked it side-steps around the obstacle instead of abandoning. Standalone - works with or
+// without lookalive. Side-stepping walks the character, so it needs 'findmove' (else it just keeps
+// re-issuing the game's walk-in AI without stepping). See Session.hunt_on / cli_hunt.
+FLYFF_HUNT_ON :: false
 FLYFF_SFX_ON :: true
 FLYFF_FX_LASER_ON :: true
+
+// Radar player-path trail (display-only juice; layout is the single source of truth, like sfx/fxlaser).
+// Off by default - a subtle fading breadcrumb behind the player dot. Two knobs: trail_len is how far
+// back (world units) crumbs are kept, trail_fade is the opacity falloff exponent (1 = linear, >1 fades
+// faster near the player, <1 stays visible further out). Peak opacity is a fixed const (TRAIL_MAX_A).
+FLYFF_TRAIL_ON :: false      // radar player-path trail (off by default; subtle, fades over distance)
+FLYFF_TRAIL_LEN :: f32(60.0) // trail length: crumbs kept up to this many world units back
+FLYFF_TRAIL_FADE :: f32(1.0) // fade exponent: >1 fades faster near the player, <1 stays visible further
+
+// Look-alive tuning (see autofarm.odin lookalive_* + the "look-alive" section in the radar Options
+// panel). All persisted to flyff.cfg and editable live via 'lookalive hold|jump|chance' or 'set'.
+// Durations are in SECONDS (converted to ns per event by la_secs_ns); jump_chance is a 0-100 percent.
+//   la_hold_min/max  - the post-kill hesitation window before locking the next target (delayed lock-on).
+//   la_jump_min/max  - the interval between travel-jump attempts while walking to a target.
+//   la_jump_chance   - per-window odds a scheduled travel-jump actually fires (<100 => sporadic, human).
+// Each of the four sub-behaviors also has its own on/off enable (la_*_on) so they toggle independently
+// under the master lookalive_on. step/max-range are the walk-first "approach" behaviors (they drive the
+// character via moveto, so they're inert until 'findmove' is set - see moveto_configured):
+//   la_step_on       - single perpendicular-offset detour waypoint before locking (chance-gated).
+//   la_step_chance   - percent odds any given advance takes that single detour (<100 => sporadic).
+//   la_step_spread   - max perpendicular offset (world units) applied to a step/approach waypoint.
+//   la_maxrange_on   - shrinking-hops approach for far spawns instead of a straight beeline.
+//   la_max_range     - "too far to beeline" distance: hop toward the target until inside this, then lock.
+FLYFF_LA_HOLD_MIN :: f32(0.8)  // s
+FLYFF_LA_HOLD_MAX :: f32(3.0)  // s
+FLYFF_LA_JUMP_MIN :: f32(4.0)  // s
+FLYFF_LA_JUMP_MAX :: f32(12.0) // s
+FLYFF_LA_JUMP_CHANCE :: 65     // percent (0-100)
+FLYFF_LA_HESITATE_ON :: true   // hesitation sub-feature enabled
+FLYFF_LA_JUMP_ON :: true       // travel-jump sub-feature enabled
+FLYFF_LA_STEP_ON :: true       // intermediate-step sub-feature enabled (needs findmove)
+FLYFF_LA_MAXRANGE_ON :: true   // max-range approach sub-feature enabled (needs findmove)
+FLYFF_LA_STEP_CHANCE :: 40     // percent (0-100): odds an advance takes a single detour step
+FLYFF_LA_STEP_SPREAD :: f32(8.0)   // world units: max perpendicular waypoint offset
+FLYFF_LA_MAX_RANGE :: f32(40.0)    // world units: beyond this, approach in shrinking hops
 
 // Static CObj* CWorld::m_aobjCull[] - the render on-screen display array (World.cpp:69). The object
 // reach test reads this (fast, ~on-screen count) instead of scanning all of memory for CObj. Found by
@@ -212,6 +274,8 @@ Flyff_Layout :: struct {
   name_off:          i64,
   hp_off:            i64,
   penya_off:         i64,
+  inv_off:           i64,
+  item_stride:       i64,
   model_off:         i64,
   angle_off:         i64,
   mover_type:        u32,
@@ -228,15 +292,33 @@ Flyff_Layout :: struct {
   mpu_off:           i64,
   hmap_off:          i64,
   attack_range:      f32,
+  radar_range:       f32, // radar display: mob-dot gather/draw radius (world units); slider in Options
   density_weight:    f32, // retired (pre-rework continuous weight); kept so old cfgs parse + migrate
   density_on:        bool,
   density_min_gain:  int,
   density_max_detour: f32,
+  density_hue_on:    bool, // radar display: colour monster dots by local pack size (no picker effect)
   preselect_on:      bool, // cfg mirror of Session.preselect_on (see FLYFF_PRESELECT_ON note)
   lookalive_on:      bool, // cfg mirror of Session.lookalive_on
+  la_hold_min:       f32,  // look-alive: min post-kill hesitation before locking the next target (seconds)
+  la_hold_max:       f32,  // look-alive: max post-kill hesitation (seconds)
+  la_jump_min:       f32,  // look-alive: min interval between travel-jump attempts (seconds)
+  la_jump_max:       f32,  // look-alive: max travel-jump interval (seconds)
+  la_jump_chance:    int,  // look-alive: percent chance (0-100) a scheduled travel-jump fires
+  la_hesitate_on:    bool, // look-alive: hesitation sub-feature enable
+  la_jump_on:        bool, // look-alive: travel-jump sub-feature enable
+  la_step_on:        bool, // look-alive: intermediate-step sub-feature enable (needs findmove)
+  la_maxrange_on:    bool, // look-alive: max-range shrinking-hops approach enable (needs findmove)
+  la_step_chance:    int,  // look-alive: percent chance (0-100) an advance takes a single detour step
+  la_step_spread:    f32,  // look-alive: max perpendicular waypoint offset (world units)
+  la_max_range:      f32,  // look-alive: beyond this distance, approach in shrinking hops (world units)
   reach_gate_on:     bool, // cfg mirror of Session.reach_gate_on
+  hunt_on:           bool, // cfg mirror of Session.hunt_on (commit-to-one-target hunt mode)
   sfx_on:            bool, // radar sound effects (penya chime + kill zap)
   fx_laser_on:       bool, // radar kill laser-beam effect
+  trail_on:          bool, // radar display: fading player-path trail
+  trail_len:         f32,  // player-path trail length (world units)
+  trail_fade:        f32,  // player-path trail fade exponent (how fast opacity falls off)
   aobjcull_rva:      uintptr,
   camera_rva:        uintptr,
   coll_obj3d_off:    i64,
@@ -264,6 +346,8 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     name_off          = FLYFF_NAME_OFF,
     hp_off            = FLYFF_HP_OFF,
     penya_off         = FLYFF_PENYA_OFF,
+    inv_off           = FLYFF_INV_OFF,
+    item_stride       = FLYFF_ITEM_STRIDE,
     model_off         = FLYFF_MODEL_OFF,
     angle_off         = FLYFF_ANGLE_OFF,
     mover_type        = FLYFF_MOVER_TYPE,
@@ -280,15 +364,33 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     mpu_off           = FLYFF_MPU_OFF,
     hmap_off          = FLYFF_HMAP_OFF,
     attack_range      = FLYFF_ATTACK_RANGE,
+    radar_range       = FLYFF_RADAR_RANGE,
     density_weight    = FLYFF_DENSITY_WEIGHT,
     density_on        = FLYFF_DENSITY_ON,
     density_min_gain  = FLYFF_DENSITY_MIN_GAIN,
     density_max_detour = FLYFF_DENSITY_MAX_DETOUR,
+    density_hue_on    = FLYFF_DENSITY_HUE_ON,
     preselect_on      = FLYFF_PRESELECT_ON,
     lookalive_on      = FLYFF_LOOKALIVE_ON,
+    la_hold_min       = FLYFF_LA_HOLD_MIN,
+    la_hold_max       = FLYFF_LA_HOLD_MAX,
+    la_jump_min       = FLYFF_LA_JUMP_MIN,
+    la_jump_max       = FLYFF_LA_JUMP_MAX,
+    la_jump_chance    = FLYFF_LA_JUMP_CHANCE,
+    la_hesitate_on    = FLYFF_LA_HESITATE_ON,
+    la_jump_on        = FLYFF_LA_JUMP_ON,
+    la_step_on        = FLYFF_LA_STEP_ON,
+    la_maxrange_on    = FLYFF_LA_MAXRANGE_ON,
+    la_step_chance    = FLYFF_LA_STEP_CHANCE,
+    la_step_spread    = FLYFF_LA_STEP_SPREAD,
+    la_max_range      = FLYFF_LA_MAX_RANGE,
     reach_gate_on     = FLYFF_REACH_GATE_ON,
+    hunt_on           = FLYFF_HUNT_ON,
     sfx_on            = FLYFF_SFX_ON,
     fx_laser_on       = FLYFF_FX_LASER_ON,
+    trail_on          = FLYFF_TRAIL_ON,
+    trail_len         = FLYFF_TRAIL_LEN,
+    trail_fade        = FLYFF_TRAIL_FADE,
     aobjcull_rva      = FLYFF_AOBJCULL_RVA,
     camera_rva        = FLYFF_CAMERA_RVA,
     coll_obj3d_off    = FLYFF_COLL_OBJ3D_OFF,

@@ -1354,6 +1354,275 @@ cli_findpenya :: proc(session: ^Session, args: []string) {
 }
 
 // ---------------------------------------------------------------------------
+// Inventory-full detection
+//
+// The player's carried items live in an embedded CItemContainer<CItemElem> m_Inventory inside CMover.
+// Header (16 bytes on the 32-bit client): {DWORD* m_apIndex, DWORD m_dwIndexNum, DWORD m_dwItemMax,
+// CItemElem* m_apItem}. m_dwIndexNum is the bag capacity (168 on this build), m_dwItemMax = capacity +
+// equip slots, and m_apItem points at a dense CItemElem[m_dwItemMax] array. A bag slot is USED iff its
+// element's m_dwItemId != 0; equipped items share the array but carry m_dwObjIndex >= m_dwIndexNum, so we
+// skip them - matching the client's own CItemContainer::GetCount. findinv auto-derives inv_off (the
+// header offset in CMover) and item_stride (sizeof CItemElem); `inv` and `status full` report the count.
+// ---------------------------------------------------------------------------
+
+// Resolve the local player CMover* off the player_rva anchor. ok=false at a loading screen (null anchor).
+read_player_ptr :: proc(session: ^Session) -> (player: uintptr, ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  pt := engine.Value_Type.U32
+  pv, pok := engine.read_value(handle, base + session.layout.player_rva, pt)
+  if !pok {
+    return 0, false
+  }
+  player = uintptr(engine.value_as_u64(pt, pv))
+  return player, player != 0
+}
+
+// Count used/free bag slots, replicating CItemContainer::GetCount. Requires inv_off + item_stride pinned.
+// Reads the whole element array once (page-partial-tolerant) and counts locally.
+read_inventory_counts :: proc(session: ^Session) -> (used: int, free: int, cap: int, ok: bool) {
+  L := session.layout
+  if L.inv_off == 0 || L.item_stride == 0 {
+    return 0, 0, 0, false
+  }
+  handle := session.proc_info.handle
+  pt := engine.Value_Type.U32
+  player, pok := read_player_ptr(session)
+  if !pok {
+    return 0, 0, 0, false
+  }
+  inv := player + uintptr(L.inv_off)
+  in_v, in_ok := engine.read_value(handle, inv + INV_INDEXNUM_REL, pt)
+  im_v, im_ok := engine.read_value(handle, inv + INV_ITEMMAX_REL, pt)
+  apitem := read_ptr_at(handle, inv + INV_APITEM_REL, pt)
+  if !in_ok || !im_ok {
+    return 0, 0, 0, false
+  }
+  index_num := u32(engine.value_as_u64(pt, in_v))
+  item_max := u32(engine.value_as_u64(pt, im_v))
+  // Sanity-gate against a stale/corrupt pin so we never allocate a wild buffer.
+  if apitem == 0 || index_num == 0 || item_max < index_num || item_max > 4096 {
+    return 0, 0, 0, false
+  }
+  stride := uint(L.item_stride)
+  n := uint(item_max)
+  buf := make([]byte, n * stride, context.temp_allocator)
+  got := engine.read_into_partial(handle, apitem, buf)
+  cnt := 0
+  for i: uint = 0; i < n; i += 1 {
+    eb := i * stride
+    if eb + ITEM_ITEMID_REL + 4 > got {
+      break // ran past the mapped tail of the array
+    }
+    obj_idx := rd_u32le(buf, int(eb) + ITEM_OBJIDX_REL)
+    item_id := rd_u32le(buf, int(eb) + ITEM_ITEMID_REL)
+    if item_id != 0 && obj_idx < index_num {
+      cnt += 1
+    }
+  }
+  cap = int(index_num)
+  used = cnt
+  free = cap - used
+  if free < 0 {
+    free = 0
+  }
+  return used, free, cap, true
+}
+
+// inv - report the player's bag fill (used/free/capacity, and whether it's FULL). Needs 'findinv' pinned.
+cli_inv :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if session.layout.inv_off == 0 || session.layout.item_stride == 0 {
+    fmt.eprintln("inventory offsets not pinned. run 'findinv' (in-game) or 'setup <name>'.")
+    return
+  }
+  used, free, cap, ok := read_inventory_counts(session)
+  if !ok {
+    fmt.eprintln("inv: could not read the inventory - be fully in-game, or re-run 'findinv' after a patch.")
+    return
+  }
+  if free == 0 {
+    fmt.printfln("inventory: %d/%d - FULL", used, cap)
+  } else {
+    fmt.printfln("inventory: %d/%d used, %d free", used, cap, free)
+  }
+}
+
+// derive_item_stride - each CItemElem starts with the same in-module vtable pointer (CItemBase is
+// polymorphic), so the byte delta to the vtable's first repeat is sizeof(CItemElem). Validates the vtable
+// repeats at every k*delta within the read window and that m_dwObjIndex at each element base is a sane
+// slot index (< item_max). Returns ok=false rather than guess if the pattern doesn't hold cleanly.
+derive_item_stride :: proc(session: ^Session, apitem: uintptr, item_max: u32) -> (stride: uint, ok: bool) {
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  vt0 := read_ptr_at(handle, apitem, engine.Value_Type.U32)
+  if !in_module_range(vt0, base, mod_end) {
+    return 0, false
+  }
+  SCAN :: 2048 // spans ~15 elements at ~130 B each - plenty of repeats to confirm the stride
+  buf := make([]byte, SCAN, context.temp_allocator)
+  got := engine.read_into_partial(handle, apitem, buf)
+  if got < 0x40 {
+    return 0, false
+  }
+  vt0_u := u32(vt0)
+  // First 4-aligned repeat of the vtable after offset 0 = candidate stride.
+  cand: uint = 0
+  for p := 4; p + 4 <= int(got); p += 4 {
+    if rd_u32le(buf, p) == vt0_u {
+      cand = uint(p)
+      break
+    }
+  }
+  if cand < 0x20 || cand > 0x400 {
+    return 0, false
+  }
+  // element 0's own objIdx should be a sane slot index.
+  if ITEM_OBJIDX_REL + 4 <= int(got) && rd_u32le(buf, ITEM_OBJIDX_REL) >= item_max {
+    return 0, false
+  }
+  // Every k*cand boundary within the window must hold the vtable and a sane objIdx.
+  reps := 0
+  for k: uint = 1; int(k * cand) + 4 <= int(got); k += 1 {
+    p := int(k * cand)
+    if rd_u32le(buf, p) != vt0_u {
+      return 0, false // a boundary that should hold the vtable doesn't - stride is wrong
+    }
+    if p + ITEM_OBJIDX_REL + 4 <= int(got) && rd_u32le(buf, p + ITEM_OBJIDX_REL) >= item_max {
+      return 0, false
+    }
+    reps += 1
+  }
+  if reps < 2 {
+    return 0, false // need at least two confirmed repeats
+  }
+  return cand, true
+}
+
+// findinv [slots] - auto-pin inv_off + item_stride so 'inv'/'status' report bag fullness. Scans the
+// player CMover for the CItemContainer header {heap ptr, indexNum, itemMax, heap ptr}; the second ptr
+// leads to the CItemElem array whose first DWORD is the shared in-module vtable (strong confirmation).
+// The three embedded bank tabs also match (at indexNum 42), so the inventory is the candidate with the
+// LARGEST indexNum (168); pass [slots] to demand an exact indexNum. item_stride (sizeof CItemElem) is
+// derived from the array via derive_item_stride. Read-only; no user-supplied value needed.
+cli_findinv :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  if session.ptr_size != 4 {
+    fmt.eprintln("findinv: targets the 32-bit Neuz.exe.")
+    return
+  }
+  want_slots := 0
+  if len(args) >= 1 {
+    if s, sok := strconv.parse_i64(args[0]); sok && s > 0 {
+      want_slots = int(s)
+    }
+  }
+  handle := session.proc_info.handle
+  base := session.proc_info.base
+  mod_end := base + uintptr(session.proc_info.module_size)
+  pt := engine.Value_Type.U32
+  player, pok := read_player_ptr(session)
+  if !pok {
+    fmt.eprintln("could not read the player anchor - are you in-game? (else run 'setup <name>' first).")
+    return
+  }
+
+  // Read a generous window off the player object; the inventory header sits deep in CMover.
+  SPAN :: 0x8000
+  buf := make([]byte, SPAN, context.temp_allocator)
+  got := engine.read_into_partial(handle, player, buf)
+  if got < 0x20 {
+    fmt.eprintln("findinv: could not read the player object.")
+    return
+  }
+
+  // Scan for the CItemContainer header signature.
+  Cand :: struct {
+    off:       int,
+    index_num: u32,
+    item_max:  u32,
+    apitem:    uintptr,
+  }
+  cands := make([dynamic]Cand, context.temp_allocator)
+  o := 0
+  for o + 0x10 <= int(got) {
+    apindex := uintptr(rd_u32le(buf, o)) // m_apIndex
+    index_num := rd_u32le(buf, o + INV_INDEXNUM_REL) // m_dwIndexNum
+    item_max := rd_u32le(buf, o + INV_ITEMMAX_REL) // m_dwItemMax
+    apitem := uintptr(rd_u32le(buf, o + INV_APITEM_REL)) // m_apItem
+    plausible :=
+      index_num >= 8 && index_num <= 512 &&
+      item_max >= index_num && (item_max - index_num) >= 1 && (item_max - index_num) <= 64 &&
+      apindex != 0 && !in_module_range(apindex, base, mod_end) &&
+      apitem != 0 && !in_module_range(apitem, base, mod_end)
+    if plausible {
+      // Confirm apitem leads to a CItemElem array: its first DWORD must be an in-module vtable.
+      vt := read_ptr_at(handle, apitem, pt)
+      if in_module_range(vt, base, mod_end) {
+        append(&cands, Cand{o, index_num, item_max, apitem})
+      }
+    }
+    o += 4
+  }
+
+  if len(cands) == 0 {
+    fmt.println("findinv: no CItemContainer header found in the player object.")
+    fmt.println("  be FULLY in-game (not at a loading screen); if it persists, re-check player_rva ('setup <name>').")
+    return
+  }
+
+  // Pick the inventory: exact indexNum if [slots] was given, else the largest indexNum (168 > bank 42).
+  pick := -1
+  for c, i in cands {
+    if want_slots > 0 {
+      if int(c.index_num) == want_slots {
+        pick = i
+        break
+      }
+    } else if pick < 0 || c.index_num > cands[pick].index_num {
+      pick = i
+    }
+  }
+  if pick < 0 {
+    fmt.printfln("findinv: no container with exactly %d slots (found %d candidate(s)):", want_slots, len(cands))
+    for c in cands {
+      fmt.printfln("  +0x%X  indexNum=%d itemMax=%d", c.off, c.index_num, c.item_max)
+    }
+    return
+  }
+  chosen := cands[pick]
+
+  stride, sok := derive_item_stride(session, chosen.apitem, chosen.item_max)
+  if !sok {
+    fmt.printfln("findinv: found the inventory header at +0x%X (capacity %d) but could NOT derive the element stride.", chosen.off, chosen.index_num)
+    fmt.println("  be in-game with the character fully loaded, then re-run 'findinv'.")
+    return
+  }
+
+  session.layout.inv_off = i64(chosen.off)
+  session.layout.item_stride = i64(stride)
+  fmt.printfln("findinv: inv_off=0x%X item_stride=0x%X (capacity %d, %d header candidate(s))", chosen.off, stride, chosen.index_num, len(cands))
+  if flyff_save_cfg(session.layout, flyff_cfg_path()) {
+    fmt.printfln("saved -> %s", flyff_cfg_path())
+  }
+  // Live sanity readout so the user can eyeball it against the game (full vs partial).
+  if used, free, cap, ok := read_inventory_counts(session); ok {
+    if free == 0 {
+      fmt.printfln("  live: %d/%d - FULL", used, cap)
+    } else {
+      fmt.printfln("  live: %d/%d used, %d free", used, cap, free)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
 

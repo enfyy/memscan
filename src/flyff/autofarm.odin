@@ -1,6 +1,7 @@
 package flyff
 
 import "core:fmt"
+import "core:math"
 import "core:math/rand"
 import "core:strconv"
 import "core:strings"
@@ -203,14 +204,20 @@ auto_monitor :: proc(session: ^Session, focus: uintptr, now: i64) {
     return
   }
   if d < session.auto_best_dist - PROGRESS_EPS {
-    // Closing in - real progress. Reset the stuck window.
+    // Closing in - real progress. Reset the stuck window (and the hunt side-step flip cadence).
     session.auto_best_dist = d
     session.auto_progress_at = now
+    session.hunt_sidestep_count = 0
     return
   }
-  // Plateaued while still far. Once that's persisted for STUCK_NS, treat the mob as unreachable.
+  // Plateaued while still far. Once that's persisted for STUCK_NS, treat the mob as blocked.
   if now - session.auto_progress_at >= STUCK_NS {
-    auto_skip_blocked(session, focus, ppos, tpos, fmt.tprintf("blocked (d=%.1f)", d), true, now)
+    if session.hunt_on {
+      // Hunt commits to this target: never drop it - side-step around the obstacle and re-lock (below).
+      hunt_on_stuck(session, focus, ppos, tpos, now)
+    } else {
+      auto_skip_blocked(session, focus, ppos, tpos, fmt.tprintf("blocked (d=%.1f)", d), true, now)
+    }
   }
 }
 
@@ -228,6 +235,18 @@ auto_skip_blocked :: proc(session: ^Session, focus: uintptr, ppos, tpos: [3]f32,
     session.auto_avoid_on = true
   }
   // Clear m_pObjFocus so the next tick advances; reset tracking + throttle so it fires promptly.
+  clear_focus(session)
+  session.auto_last = 0
+  session.auto_next_set = false // the precompute for this abandoned target is stale
+  session.auto_next_for = 0
+  fmt.printf("\n[auto] '%s' %s - skipping\n", name, reason)
+  fmt.print("memscan> ")
+}
+
+// Write 0 into m_pObjFocus (deselect the current target) and clear the progress-monitor anchor. Shared by
+// auto_skip_blocked (blacklist + drop) and hunt_on_stuck (unlock so a moveto side-step isn't overridden by
+// the held-attack walk-in). Does NOT touch the advance/precompute bookkeeping - the caller owns that.
+clear_focus :: proc(session: ^Session) {
   handle := session.proc_info.handle
   base := session.proc_info.base
   pt := engine.Value_Type.U64
@@ -241,11 +260,6 @@ auto_skip_blocked :: proc(session: ^Session, focus: uintptr, ppos, tpos: [3]f32,
     }
   }
   session.auto_focus_obj = 0
-  session.auto_last = 0
-  session.auto_next_set = false // the precompute for this abandoned target is stale
-  session.auto_next_for = 0
-  fmt.printf("\n[auto] '%s' %s - skipping\n", name, reason)
-  fmt.print("memscan> ")
 }
 
 // Reach re-watch for the LOCKED target (reach used to be checked only at pick time): a mob can be
@@ -372,6 +386,7 @@ auto_tick :: proc(session: ^Session) {
     session.auto_timer_at = 0
     session.auto_paused = false
     session.pause_obj = 0
+    session.la_approach_on = false // cancel any in-progress look-alive walk
     if was_on {
       fmt.printf("\n[auto] timer elapsed - auto-farm OFF.  %s\n", auto_stats(session, now))
       fmt.print("memscan> ")
@@ -386,14 +401,27 @@ auto_tick :: proc(session: ^Session) {
     pause_tick(session, now)
     return
   }
+  // Look-alive approach in progress: we've picked the next mob but are still WALKING to it (waypoints)
+  // before locking. Runs every tick (unthrottled) for responsive arrival detection, ahead of the normal
+  // focus-live / advance logic - nothing is locked yet, so the focus-live branch below would never fire.
+  if session.la_approach_on {
+    lookalive_approach_tick(session, now)
+    return
+  }
   // A live target is still selected: watch it for obstacle-stuck (every tick, unthrottled) and, while
   // we fight it, precompute the NEXT target so the advance is instant when it dies (pre-select).
   if focus, fok := read_focus_ptr(session); fok && focus != 0 && focus_obj_live(session, focus) {
     if session.auto_stuck_on {
       auto_monitor(session, focus, now)
     }
-    if session.reach_gate_on {
+    if session.reach_gate_on && !session.hunt_on {
       auto_reach_watch(session, focus, now) // reach can be lost AFTER selection - watch it, don't jam
+      // (hunt commits to the target and never drops it for reachability - it side-steps instead, below)
+    }
+    // hunt_on_stuck (above) may have unlocked the target and entered the side-step approach - if so, the
+    // pre-select work below would run against a now-cleared focus. Hand off to the approach next tick.
+    if session.la_approach_on {
+      return
     }
     if session.preselect_on && focus != session.auto_next_for {
       // One precompute per distinct locked target, stutter-safe: the expensive enumeration runs on a
@@ -479,15 +507,44 @@ auto_tick :: proc(session: ^Session) {
   // Look-alive: a randomized "human reaction" hesitation before engaging the next target (delayed
   // lock-on). Holds the whole advance - including the pre-select fast-commit - so we don't insta-lock
   // onto the next mob the instant the current one dies. The kill above is still counted immediately.
-  if session.lookalive_on {
+  // Gated on the per-feature enable: with hesitation off, we advance without any hold.
+  if session.lookalive_on && session.layout.la_hesitate_on {
     if session.lookalive_hold_until == 0 {
-      session.lookalive_hold_until = now + lookalive_rand_ns(LA_HOLD_MIN_NS, LA_HOLD_MAX_NS)
+      session.lookalive_hold_until = now + lookalive_rand_ns(la_secs_ns(session.layout.la_hold_min), la_secs_ns(session.layout.la_hold_max))
       return
     }
     if now < session.lookalive_hold_until {
       return // still hesitating
     }
     session.lookalive_hold_until = 0 // hold elapsed - engage now; re-armed on the next kill
+  }
+  // Look-alive walk-first approach (intermediate step / max-range): before locking, pick the next mob
+  // WITHOUT locking and, if it's far enough / rolls the chance, walk there via waypoints and lock only on
+  // arrival (see lookalive_approach_tick). Needs moveto (findmove). This mode bypasses the pre-select fast
+  // path - fine, since look-alive targets low-spawn grinds where a per-kill synchronous pick isn't a
+  // stutter concern (the background-scan fix exists for high kill rates).
+  if session.lookalive_on && (session.layout.la_step_on || session.layout.la_maxrange_on) && moveto_configured(session) {
+    session.auto_next_set = false // the pre-select cache is unused in approach mode; don't let it commit stale
+    session.auto_next_for = 0
+    if obj, tpos, stage, pack, _, ok := tc_precompute_next(session, session.auto_names[:], 0); ok {
+      if ppos, pok := read_player_pos(session); pok {
+        dist := engine.dist_horizontal(ppos, tpos)
+        multi := session.layout.la_maxrange_on && dist > session.layout.la_max_range
+        single := !multi && session.layout.la_step_on && dist > LA_STEP_MIN_DIST && lookalive_step_roll(session.layout.la_step_chance)
+        if multi || single {
+          lookalive_begin_approach(session, obj, tpos, stage, pack, multi, now)
+          session.auto_last = now
+          return
+        }
+        // Close, or the step roll failed - lock it straight away like the normal advance.
+        if auto_commit_pick(session, obj, tpos, stage, pack) {
+          session.auto_last = now
+          return
+        }
+      }
+    }
+    // Nothing eligible / pick failed: fall through to the reactive advance (auto_next_set is cleared, so
+    // the pre-select branch is skipped and the background scan handles it).
   }
   // Advance to the next mob. Pre-select fast path: if we precomputed a next target during combat (and
   // this isn't a stuck-skip, which needs the reactive avoid steer), commit it instantly with no scan.
@@ -502,20 +559,7 @@ auto_tick :: proc(session: ^Session) {
     npack := session.auto_next_pack
     session.auto_next_set = false
     if lpos, lok := tc_precompute_still_valid(session, nobj, session.auto_next_pos); lok {
-      if focus_set_obj(session, nobj, session.auto_names[:]) == .Picked {
-        session.auto_sel_pos = lpos // LIVE position (not the snapshot) - keeps the kill anchor honest
-        session.auto_sel_obj = nobj
-        session.auto_sel_set = true
-        // Carry the cluster commitment forward, exactly like tc_select's post-pick bookkeeping.
-        if session.layout.density_on {
-          _, engage := pick_ranges(session)
-          session.cluster_committed, session.cluster_origin_pos = cluster_advance(
-            session.cluster_committed, session.cluster_origin_pos, nstage, lpos, npack, density_radius(engage),
-          )
-        } else {
-          session.cluster_committed = false
-          session.cluster_origin_pos = {}
-        }
+      if auto_commit_pick(session, nobj, lpos, nstage, npack) {
         advanced = true
       }
     }
@@ -681,6 +725,10 @@ auto_stop :: proc(session: ^Session) {
   session.cluster_origin_pos = {}
   session.lookalive_hold_until = 0 // run-state only; lookalive_on persists (a mode toggle)
   session.lookalive_jump_at = 0
+  session.la_approach_on = false // abandon any in-progress look-alive walk
+  session.la_approach_obj = 0
+  session.hunt_side_flip = false // hunt side-step state is per-run (hunt_on the mode persists)
+  session.hunt_sidestep_count = 0
   session.auto_reach_obj = 0 // reach re-watch state is per-run
   session.auto_reach_next_check = 0
   session.auto_reach_fail_count = 0
@@ -841,28 +889,76 @@ cli_preselect :: proc(session: ^Session, args: []string) {
 // Look-alive mode: opt-in human-like farming for low-spawn quest grinds.
 // ===========================================================================
 
-// Look-alive tuning. The post-kill hesitation before engaging the next target (delayed lock-on) and the
-// interval between travel-jumps are each randomized per event, so the cadence never reads as robotic.
-LA_HOLD_MIN_NS :: i64(800_000_000) // 0.8s min hesitation before locking the next target
-LA_HOLD_MAX_NS :: i64(3_000_000_000) // 3.0s max
-LA_JUMP_MIN_NS :: i64(4_000_000_000) // 4s min between travel-jump attempts
-LA_JUMP_MAX_NS :: i64(12_000_000_000) // 12s max
+// Look-alive tuning. The post-kill hesitation before engaging the next target (delayed lock-on), the
+// interval between travel-jumps, and whether any given jump window fires are each randomized per event so
+// the cadence never reads as robotic. The delay ranges + jump chance are USER-TUNABLE and persisted in
+// flyff.cfg (Flyff_Layout.la_*; defaults FLYFF_LA_* in flyff.odin) - edit them via the radar Options
+// "look-alive" section or 'lookalive hold|jump|chance'. Only the fixed cutoffs below stay constants.
 LA_JUMP_MIN_DIST :: f32(8.0) // only jump while still this far from the target (travelling, not in melee)
+LA_STEP_MIN_DIST :: f32(12.0) // don't bother with a single intermediate detour for mobs nearer than this
+LA_WP_ARRIVE :: f32(3.5) // horizontal distance at/under which an approach waypoint counts as reached
 
-lookalive_seeded: bool // one-time seed guard for the look-alive RNG (see lookalive_rand_ns)
+// Hunt mode side-step (hunt_on_stuck): how far to the side to step around an obstacle, and how many
+// consecutive stalls before flipping to the other side (so a repeatedly-jammed hunt sweeps both ways).
+HUNT_SIDESTEP_DIST :: f32(10.0)
+HUNT_SIDESTEP_FLIP :: 3
 
-// Uniform random duration in [lo, hi) nanoseconds for look-alive's jitter. Seeds the context random
-// generator once from the wall clock (on the watcher thread, which owns a valid default context) so runs
-// don't repeat the same delay pattern. Returns lo when the range is empty/inverted.
-lookalive_rand_ns :: proc(lo, hi: i64) -> i64 {
+lookalive_seeded: bool // one-time seed guard for the look-alive RNG (see lookalive_seed)
+
+// Seed the context random generator once from the wall clock (on the watcher thread, which owns a valid
+// default context) so look-alive runs don't repeat the same delay/jump pattern across restarts.
+lookalive_seed :: proc() {
   if !lookalive_seeded {
     rand.reset_u64(u64(time.now()._nsec))
     lookalive_seeded = true
   }
+}
+
+// Seconds (a tunable la_* field) -> nanoseconds for the look-alive scheduler. Negatives clamp to 0.
+la_secs_ns :: proc(secs: f32) -> i64 {
+  if secs <= 0 {
+    return 0
+  }
+  return i64(f64(secs) * 1e9)
+}
+
+// Uniform random duration in [lo, hi) nanoseconds for look-alive's jitter. Returns lo when the range is
+// empty/inverted (also the natural result of a min==max range, e.g. a fixed delay).
+lookalive_rand_ns :: proc(lo, hi: i64) -> i64 {
+  lookalive_seed()
   if hi <= lo {
     return lo
   }
   return rand.int64_range(lo, hi)
+}
+
+// Uniform random f32 in [lo, hi] for the approach waypoint jitter (perpendicular offset, along-vector
+// fraction). Returns lo when the range is empty/inverted.
+lookalive_rand_f32 :: proc(lo, hi: f32) -> f32 {
+  lookalive_seed()
+  if hi <= lo {
+    return lo
+  }
+  return lo + rand.float32() * (hi - lo)
+}
+
+// Per-advance roll for the single intermediate detour step. Same 0-100 semantics as the jump-window roll.
+lookalive_step_roll :: proc(pct: int) -> bool {
+  return lookalive_jump_roll(pct)
+}
+
+// True if a scheduled travel-jump should actually fire this window. pct is the 0-100 la_jump_chance:
+// <=0 never jumps, >=100 always jumps, in between rolls the seeded RNG. Skipping windows makes the jump
+// cadence sporadic (human) rather than a metronome.
+lookalive_jump_roll :: proc(pct: int) -> bool {
+  if pct >= 100 {
+    return true
+  }
+  if pct <= 0 {
+    return false
+  }
+  lookalive_seed()
+  return rand.int_max(100) < pct
 }
 
 // Silent check that the jump primitive is fully configured (mirrors jump_ready without its eprintln
@@ -883,34 +979,434 @@ lookalive_do_jump :: proc(session: ^Session) {
   }
 }
 
-// Per-tick travel-jump scheduler (look-alive). Jumps at randomized intervals, but only while still
-// travelling to the target (>= LA_JUMP_MIN_DIST away) so we don't hop in place during melee. Seeds the
-// first interval instead of jumping on the very first tick.
-lookalive_jump_tick :: proc(session: ^Session, focus: uintptr, now: i64) {
-  if !jump_configured(session) {
+// Shared travel-jump scheduler core (look-alive). Jumps at randomized intervals while travelling toward
+// <tpos> - a locked focus OR the target of an in-progress approach - but only while still >=
+// LA_JUMP_MIN_DIST away so we don't hop in place during melee. Seeds the first interval instead of jumping
+// on the very first tick. Gated on the la_jump_on enable + jump_configured; disabled/unconfigured no-ops.
+lookalive_jump_core :: proc(session: ^Session, tpos: [3]f32, now: i64) {
+  if !session.layout.la_jump_on || !jump_configured(session) {
     return
   }
   if session.lookalive_jump_at == 0 {
-    session.lookalive_jump_at = now + lookalive_rand_ns(LA_JUMP_MIN_NS, LA_JUMP_MAX_NS)
+    session.lookalive_jump_at = now + lookalive_rand_ns(la_secs_ns(session.layout.la_jump_min), la_secs_ns(session.layout.la_jump_max))
     return
   }
   if now < session.lookalive_jump_at {
     return
   }
-  session.lookalive_jump_at = now + lookalive_rand_ns(LA_JUMP_MIN_NS, LA_JUMP_MAX_NS)
-  ppos, pok := read_player_pos(session)
-  tpos, tok := engine.read_vec3(session.proc_info.handle, focus + uintptr(session.layout.pos_off))
-  if pok && tok && engine.dist_horizontal(ppos, tpos) >= LA_JUMP_MIN_DIST {
+  // Re-arm the next window regardless of whether we jump this time (so a rolled-skip still advances).
+  session.lookalive_jump_at = now + lookalive_rand_ns(la_secs_ns(session.layout.la_jump_min), la_secs_ns(session.layout.la_jump_max))
+  if !lookalive_jump_roll(session.layout.la_jump_chance) {
+    return // rolled to skip this window - keeps jumping sporadic, not metronomic
+  }
+  if ppos, pok := read_player_pos(session); pok && engine.dist_horizontal(ppos, tpos) >= LA_JUMP_MIN_DIST {
     lookalive_do_jump(session)
   }
 }
 
-// lookalive | lookalive on|off -> toggle look-alive mode (opt-in). When on, auto farms more like a human:
-// a random hesitation before engaging each new target (delayed lock-on) plus occasional jumps while
-// travelling to one. Deliberately less efficient than the snappy loop - for low-spawn quest grinds where
-// AFK-looking farming is the concern - so it's OFF by default. Jumps need 'findmove'; without it the
-// hesitation still applies and jumps are skipped.
+// Per-tick travel-jump scheduler while a focus is locked (the game walks us to it): read the focus
+// position and defer to the shared core.
+lookalive_jump_tick :: proc(session: ^Session, focus: uintptr, now: i64) {
+  if !session.layout.la_jump_on || !jump_configured(session) {
+    return
+  }
+  if tpos, tok := engine.read_vec3(session.proc_info.handle, focus + uintptr(session.layout.pos_off)); tok {
+    lookalive_jump_core(session, tpos, now)
+  }
+}
+
+// Silent check that moveto (the CMover dest-field walk) is fully configured - mirrors moveto_ready without
+// its eprintln output, so the look-alive approach can skip walking quietly when 'findmove' isn't set up.
+moveto_configured :: proc(session: ^Session) -> bool {
+  if !session.attached || session.ptr_size != 4 {
+    return false
+  }
+  L := session.layout
+  return L.destpos_off != 0 && L.iddest_off != 0 && L.forward_off != 0
+}
+
+// Lock <obj> as the active target (m_pObjFocus) and set auto's kill-anchor + density cluster bookkeeping,
+// exactly like tc_finish_select's post-pick tail. <live_pos> is the mob's live position (keeps the kill
+// anchor honest); <stage>/<pack> feed the cluster commitment. Returns false when the focus write is refused
+// (freed / model-less / HP<=0) so the caller can fall back. Shared by the pre-select fast-commit and the
+// look-alive approach's arrival-lock.
+auto_commit_pick :: proc(session: ^Session, obj: uintptr, live_pos: [3]f32, stage: TC_Stage, pack: int) -> bool {
+  if focus_set_obj(session, obj, session.auto_names[:]) != .Picked {
+    return false
+  }
+  session.auto_sel_pos = live_pos
+  session.auto_sel_obj = obj
+  session.auto_sel_set = true
+  if session.layout.density_on {
+    _, engage := pick_ranges(session)
+    session.cluster_committed, session.cluster_origin_pos = cluster_advance(
+      session.cluster_committed, session.cluster_origin_pos, stage, live_pos, pack, density_radius(engage),
+    )
+  } else {
+    session.cluster_committed = false
+    session.cluster_origin_pos = {}
+  }
+  return true
+}
+
+// Compute a walk-first waypoint from player <p> toward target <t>: a point ~halfway along the p->t vector
+// (fraction jittered 0.4-0.6 so it never reads as exactly halfway), pushed sideways by a random amount
+// within la_step_spread perpendicular to that vector. Ground-plane (x/z); Y is taken from p (the client
+// ground-clamps the walk). Degenerate (p == t) returns p.
+lookalive_step_point :: proc(session: ^Session, p, t: [3]f32) -> [3]f32 {
+  dx := t[0] - p[0]
+  dz := t[2] - p[2]
+  length := math.sqrt(dx * dx + dz * dz)
+  if length < 0.001 {
+    return p
+  }
+  frac := lookalive_rand_f32(0.4, 0.6)
+  ax := p[0] + dx * frac
+  az := p[2] + dz * frac
+  // Perpendicular unit vector in the ground plane is (-dz, dx)/length; offset a random signed amount.
+  off := lookalive_rand_f32(-session.layout.la_step_spread, session.layout.la_step_spread)
+  return {ax + (-dz / length) * off, p[1], az + (dx / length) * off}
+}
+
+// Enter the look-alive walk-first approach for <obj> (position <tpos>, cascade <stage>/<pack> carried to
+// the eventual lock). <multi> = the max-range shrinking-hop approach; else a single intermediate detour.
+// Computes the first waypoint, walks there (moveto = dest field-write + snapshot broadcast), and arms the
+// progress watchdog. From here lookalive_approach_tick drives it each tick until it locks or abandons.
+lookalive_begin_approach :: proc(session: ^Session, obj: uintptr, tpos: [3]f32, stage: TC_Stage, pack: int, multi: bool, now: i64) {
+  ppos, pok := read_player_pos(session)
+  if !pok {
+    session.la_approach_on = false // can't read our own position - let the normal advance retry
+    session.auto_last = 0
+    return
+  }
+  wp := lookalive_step_point(session, ppos, tpos)
+  if !write_dest_pos(session, ppos, wp) {
+    session.la_approach_on = false
+    session.auto_last = 0
+    return
+  }
+  remote_send_snapshot(session) // broadcast so other clients see the walk, not a teleport
+  session.la_approach_obj = obj
+  session.la_approach_multi = multi
+  session.la_approach_stage = stage
+  session.la_approach_pack = pack
+  session.la_approach_wp = wp
+  session.la_approach_best = engine.dist_horizontal(ppos, wp)
+  session.la_approach_progress_at = now
+  session.la_approach_on = true
+}
+
+// Per-tick driver for an in-progress look-alive approach. Re-validates the pending target, watches for a
+// stuck plateau against the current waypoint, fires travel-jumps, and - on reaching a waypoint - either
+// locks the target (single step, or a multi-hop now inside la_max_range) or walks the next shrinking hop.
+lookalive_approach_tick :: proc(session: ^Session, now: i64) {
+  world, _, ppos, aok := tc_resolve_anchors(session)
+  if !aok {
+    return // transient read failure; retry next tick (the walk continues client-side meanwhile)
+  }
+  obj := session.la_approach_obj
+  // Target still a live, selectable mob? (Someone else may have killed it, or it despawned mid-walk.)
+  if !obj_is_selectable(session, obj, session.auto_names[:]) {
+    session.la_approach_on = false
+    session.auto_last = 0 // re-pick promptly next tick
+    return
+  }
+  tpos, tok := engine.read_vec3(session.proc_info.handle, obj + uintptr(session.layout.pos_off))
+  if !tok || (session.fence.active && !fence_contains(session.fence, tpos[0], tpos[2])) {
+    session.la_approach_on = false // unreadable, or it drifted outside the geo-fence
+    session.auto_last = 0
+    return
+  }
+  if session.lookalive_on {
+    lookalive_jump_core(session, tpos, now) // travel-jumps use the live target (a hunt-only walk stays plain)
+  }
+  // Stuck watchdog against the current waypoint: if we stop closing on it for STUCK_NS while still far, the
+  // path is blocked. Farming abandons (auto_skip_blocked clears focus + prints "skipping"); hunt never drops
+  // the target - it just tries another side-step (hunt_on_stuck flips the side after a few tries).
+  d_wp := engine.dist_horizontal(ppos, session.la_approach_wp)
+  if d_wp > LA_WP_ARRIVE {
+    if d_wp < session.la_approach_best - PROGRESS_EPS {
+      session.la_approach_best = d_wp
+      session.la_approach_progress_at = now
+    } else if now - session.la_approach_progress_at >= STUCK_NS {
+      session.la_approach_on = false
+      if session.hunt_on {
+        hunt_on_stuck(session, obj, ppos, tpos, now) // sets up a fresh (flipped) side-step; never drops
+      } else {
+        auto_skip_blocked(session, obj, ppos, tpos, "blocked on approach", true, now)
+      }
+    }
+    return // still walking to this waypoint
+  }
+  // Reached the waypoint. Multi-hop: keep hopping until inside la_max_range, then fall through to lock.
+  if session.la_approach_multi && engine.dist_horizontal(ppos, tpos) > session.layout.la_max_range {
+    if session.reach_gate_on && !session.hunt_on && !cand_reachable(session, world, ppos, tpos) {
+      session.la_approach_on = false // next leg is blocked now - let the reactive pick re-steer
+      session.auto_last = 0
+      return
+    }
+    wp := lookalive_step_point(session, ppos, tpos)
+    if !write_dest_pos(session, ppos, wp) {
+      session.la_approach_on = false
+      session.auto_last = 0
+      return
+    }
+    remote_send_snapshot(session)
+    session.la_approach_wp = wp
+    session.la_approach_best = engine.dist_horizontal(ppos, wp)
+    session.la_approach_progress_at = now
+    return
+  }
+  // Arrived (single step done, or the multi-hop is now within max-range): lock it and let the game finish.
+  session.la_approach_on = false
+  if auto_commit_pick(session, obj, tpos, session.la_approach_stage, session.la_approach_pack) {
+    session.auto_last = now
+  } else {
+    session.auto_last = 0 // lock refused (freed/model) - re-pick next tick
+  }
+}
+
+// A hunt side-step waypoint: HUNT_SIDESTEP_DIST to one side of the player (perpendicular to player->target),
+// plus a little forward toward the target, so a jammed hunt walks AROUND the obstacle rather than purely
+// sideways. <left> picks the side (flipped across repeated stalls). Ground plane (x/z); Y from the player.
+hunt_sidestep_point :: proc(session: ^Session, p, t: [3]f32, left: bool) -> [3]f32 {
+  dx := t[0] - p[0]
+  dz := t[2] - p[2]
+  length := math.sqrt(dx * dx + dz * dz)
+  if length < 0.001 {
+    return p
+  }
+  ux := dx / length // unit toward the target
+  uz := dz / length
+  side: f32 = left ? 1 : -1
+  // Perpendicular (-uz, ux); step to the side and ~half that distance forward.
+  fwd := HUNT_SIDESTEP_DIST * 0.5
+  return {p[0] + (-uz) * HUNT_SIDESTEP_DIST * side + ux * fwd, p[1], p[2] + ux * HUNT_SIDESTEP_DIST * side + uz * fwd}
+}
+
+// Hunt mode's response to a blocked/plateaued target (from auto_monitor or an approach-waypoint stall):
+// NEVER drop the target. Unlock it (so the held-attack walk-in stops overriding our moveto), walk a
+// perpendicular side-step around the obstacle via the approach machinery, and re-lock on arrival. The side
+// alternates every HUNT_SIDESTEP_FLIP stalls so a stubborn jam is probed from both directions. Without
+// 'findmove' we can't walk - so we just refresh the progress window and keep letting the game push in.
+hunt_on_stuck :: proc(session: ^Session, focus: uintptr, ppos, tpos: [3]f32, now: i64) {
+  name, _ := read_mover_name(session, focus)
+  if !moveto_configured(session) {
+    // Can't side-step without char-control. Hunt still never drops: reset the window and keep pushing.
+    session.auto_best_dist = 1e30
+    session.auto_progress_at = now
+    fmt.printf("\n[hunt] '%s' blocked - holding (need 'findmove' to step around)\n", name)
+    fmt.print("memscan> ")
+    return
+  }
+  session.hunt_sidestep_count += 1
+  if session.hunt_sidestep_count % HUNT_SIDESTEP_FLIP == 0 {
+    session.hunt_side_flip = !session.hunt_side_flip // sweep the other way after a few tries
+  }
+  wp := hunt_sidestep_point(session, ppos, tpos, session.hunt_side_flip)
+  clear_focus(session) // unlock: a locked focus + held attack re-paths straight at the mob every frame
+  if !write_dest_pos(session, ppos, wp) {
+    // Couldn't issue the walk. Focus is cleared, so the reactive advance re-locks the same target (hunt
+    // commits) next tick - don't enter the approach.
+    session.auto_last = 0
+    return
+  }
+  remote_send_snapshot(session) // broadcast so other clients see the side-step, not a teleport
+  // Re-use the look-alive approach machinery to walk to the side-step waypoint and re-lock on arrival.
+  session.la_approach_obj = focus
+  session.la_approach_multi = false
+  session.la_approach_stage = .None // plain re-lock; no cascade/cluster steering for a committed hunt
+  session.la_approach_pack = 0
+  session.la_approach_wp = wp
+  session.la_approach_best = engine.dist_horizontal(ppos, wp)
+  session.la_approach_progress_at = now
+  session.la_approach_on = true
+  // Fresh monitor window so the re-locked target gets a full STUCK_NS before the next side-step.
+  session.auto_best_dist = 1e30
+  session.auto_progress_at = now
+  fmt.printf("\n[hunt] '%s' blocked - stepping around\n", name)
+  fmt.print("memscan> ")
+}
+
+// Persist the layout after a look-alive tuning edit (attach-gated, like cli_preselect - the live layout
+// is defaults until attach loads flyff.cfg, so saving before attach would clobber the file with defaults).
+lookalive_save :: proc(session: ^Session) {
+  if session.attached {
+    flyff_save_cfg(session.layout, flyff_cfg_path())
+  }
+}
+
+// Dump of the current look-alive enables + tuning (shared by 'lookalive show', toggling on, and status).
+lookalive_print_tuning :: proc(session: ^Session) {
+  L := session.layout
+  fmt.printfln(
+    "  enables: hesitate %s  jump %s  step %s  max-range %s",
+    L.la_hesitate_on ? "on" : "off", L.la_jump_on ? "on" : "off", L.la_step_on ? "on" : "off", L.la_maxrange_on ? "on" : "off",
+  )
+  fmt.printfln(
+    "  hesitation %.2f-%.2fs  jump %.2f-%.2fs @ %d%%  step %d%% spread %.1fu  max-range %.1fu%s",
+    L.la_hold_min, L.la_hold_max, L.la_jump_min, L.la_jump_max, L.la_jump_chance,
+    L.la_step_chance, L.la_step_spread, L.la_max_range,
+    moveto_configured(session) ? "" : "  (step/max-range + jumps inert until 'findmove')",
+  )
+}
+
+// Parse an on/off token. ok=false for anything else (so callers can distinguish a toggle from a value).
+la_parse_onoff :: proc(s: string) -> (val: bool, ok: bool) {
+  switch s {
+  case "on":
+    return true, true
+  case "off":
+    return false, true
+  }
+  return false, false
+}
+
+// lookalive | lookalive on|off        -> toggle look-alive mode (opt-in). When on, auto farms more like a
+//                                        human, via four independently-toggleable sub-behaviors below.
+// lookalive hesitate|jump|step|maxrange on|off  -> enable/disable one sub-behavior.
+// lookalive hold <min> <max>          -> set the hesitation window (seconds; delayed lock-on).
+// lookalive jump <min> <max>          -> set the travel-jump interval (seconds).
+// lookalive chance <0-100>            -> set the odds a scheduled jump actually fires (percent).
+// lookalive step chance <0-100>       -> set the odds an advance takes a single detour step (percent).
+// lookalive step spread <units>       -> set the max perpendicular waypoint offset (world units).
+// lookalive maxrange <units>          -> set the "too far to beeline" distance (shrinking-hop approach).
+// lookalive show                      -> print the current enables + tuning.
+// The mode is deliberately less efficient than the snappy loop - for low-spawn quest grinds where
+// AFK-looking farming is the concern - so it's OFF by default. Jumps + step + max-range need 'findmove';
+// without it hesitation still applies and the walk-based behaviors are skipped. Sub-commands never toggle
+// the mode itself.
 cli_lookalive :: proc(session: ^Session, args: []string) {
+  if len(args) >= 1 {
+    switch args[0] {
+    case "hesitate", "hesitation":
+      if len(args) == 2 {
+        if b, ok := la_parse_onoff(args[1]); ok {
+          session.layout.la_hesitate_on = b
+          fmt.printfln("look-alive hesitation %s.", b ? "ON" : "off")
+          lookalive_save(session)
+          return
+        }
+      }
+      fmt.eprintln("usage: lookalive hesitate on|off")
+      return
+    case "hold":
+      if len(args) != 3 {
+        fmt.eprintln("usage: lookalive hold <min-seconds> <max-seconds>")
+        return
+      }
+      lo, lok := strconv.parse_f64(args[1])
+      hi, hik := strconv.parse_f64(args[2])
+      if !lok || !hik || lo < 0 || hi < 0 {
+        fmt.eprintln("min/max must be numbers >= 0 (seconds).")
+        return
+      }
+      if hi < lo {
+        lo, hi = hi, lo // tolerate swapped order
+      }
+      session.layout.la_hold_min = f32(lo)
+      session.layout.la_hold_max = f32(hi)
+      fmt.printfln("look-alive hesitation = %.2f - %.2f s.", lo, hi)
+      lookalive_save(session)
+      return
+    case "jump":
+      if len(args) == 2 {
+        if b, ok := la_parse_onoff(args[1]); ok {
+          session.layout.la_jump_on = b
+          session.lookalive_jump_at = 0 // re-seed the schedule from the new state
+          fmt.printfln("look-alive jumps %s.", b ? "ON" : "off")
+          lookalive_save(session)
+          return
+        }
+      }
+      if len(args) != 3 {
+        fmt.eprintln("usage: lookalive jump on|off | lookalive jump <min-seconds> <max-seconds>")
+        return
+      }
+      lo, lok := strconv.parse_f64(args[1])
+      hi, hik := strconv.parse_f64(args[2])
+      if !lok || !hik || lo < 0 || hi < 0 {
+        fmt.eprintln("min/max must be numbers >= 0 (seconds).")
+        return
+      }
+      if hi < lo {
+        lo, hi = hi, lo // tolerate swapped order
+      }
+      session.layout.la_jump_min = f32(lo)
+      session.layout.la_jump_max = f32(hi)
+      session.lookalive_jump_at = 0 // re-seed the next interval from the new range
+      fmt.printfln("look-alive jump interval = %.2f - %.2f s.", lo, hi)
+      lookalive_save(session)
+      return
+    case "chance":
+      if len(args) != 2 {
+        fmt.eprintln("usage: lookalive chance <0-100>   (percent a scheduled jump fires)")
+        return
+      }
+      n, nok := strconv.parse_int(args[1])
+      if !nok || n < 0 || n > 100 {
+        fmt.eprintln("chance must be an integer 0-100 (percent).")
+        return
+      }
+      session.layout.la_jump_chance = n
+      fmt.printfln("look-alive jump chance = %d%%.", n)
+      lookalive_save(session)
+      return
+    case "step":
+      if len(args) == 2 {
+        if b, ok := la_parse_onoff(args[1]); ok {
+          session.layout.la_step_on = b
+          fmt.printfln("look-alive intermediate step %s.", b ? "ON" : "off")
+          lookalive_save(session)
+          return
+        }
+      }
+      if len(args) == 3 && args[1] == "chance" {
+        n, nok := strconv.parse_int(args[2])
+        if !nok || n < 0 || n > 100 {
+          fmt.eprintln("step chance must be an integer 0-100 (percent).")
+          return
+        }
+        session.layout.la_step_chance = n
+        fmt.printfln("look-alive step chance = %d%%.", n)
+        lookalive_save(session)
+        return
+      }
+      if len(args) == 3 && args[1] == "spread" {
+        v, vok := strconv.parse_f64(args[2])
+        if !vok || v < 0 {
+          fmt.eprintln("step spread must be a number >= 0 (world units).")
+          return
+        }
+        session.layout.la_step_spread = f32(v)
+        fmt.printfln("look-alive step spread = %.1f units.", v)
+        lookalive_save(session)
+        return
+      }
+      fmt.eprintln("usage: lookalive step on|off | lookalive step chance <0-100> | lookalive step spread <units>")
+      return
+    case "maxrange", "max":
+      if len(args) == 2 {
+        if b, ok := la_parse_onoff(args[1]); ok {
+          session.layout.la_maxrange_on = b
+          fmt.printfln("look-alive max-range approach %s.", b ? "ON" : "off")
+          lookalive_save(session)
+          return
+        }
+        if v, vok := strconv.parse_f64(args[1]); vok && v >= 0 {
+          session.layout.la_max_range = f32(v)
+          fmt.printfln("look-alive max-range = %.1f units.", v)
+          lookalive_save(session)
+          return
+        }
+      }
+      fmt.eprintln("usage: lookalive maxrange on|off | lookalive maxrange <units>")
+      return
+    case "show", "tuning", "cfg":
+      lookalive_print_tuning(session)
+      return
+    }
+  }
   switch {
   case len(args) == 0:
     session.lookalive_on = !session.lookalive_on
@@ -919,20 +1415,24 @@ cli_lookalive :: proc(session: ^Session, args: []string) {
   case len(args) == 1 && args[0] == "off":
     session.lookalive_on = false
   case:
-    fmt.eprintln("usage: lookalive [on|off]")
+    fmt.eprintln("usage: lookalive [on|off] | hesitate|jump|step|maxrange on|off | hold <min> <max> | jump <min> <max> | chance <0-100> | step chance|spread <v> | maxrange <units> | show")
     return
   }
   session.lookalive_hold_until = 0
   session.lookalive_jump_at = 0
+  session.la_approach_on = false // toggling the mode cancels any in-progress walk
   session.layout.lookalive_on = session.lookalive_on // cfg mirror (see on_attach)
   if session.attached {
     flyff_save_cfg(session.layout, flyff_cfg_path()) // attach-gated (see cli_preselect note)
   }
   note := ""
-  if session.lookalive_on && !jump_configured(session) {
-    note = "  (jumps need 'findmove'; delayed lock-on still active)"
+  if session.lookalive_on && !moveto_configured(session) {
+    note = "  (step/max-range + jumps need 'findmove'; delayed lock-on still active)"
   }
   fmt.printfln("look-alive %s.%s", session.lookalive_on ? "ON" : "OFF", note)
+  if session.lookalive_on {
+    lookalive_print_tuning(session)
+  }
 }
 
 // reachgate | reachgate on|off -> toggle the PROACTIVE reach filter for auto: skip candidate mobs whose
@@ -956,6 +1456,32 @@ cli_reachgate :: proc(session: ^Session, args: []string) {
     flyff_save_cfg(session.layout, flyff_cfg_path()) // attach-gated (see cli_preselect note)
   }
   fmt.printfln("reach-gate %s.", session.reach_gate_on ? "ON" : "OFF")
+}
+
+// hunt | hunt on|off -> toggle hunt mode. Farming's opposite: instead of mowing down whatever herd is
+// nearest and dropping any mob that turns out to be far/unreachable, hunt COMMITS to the current target
+// (a giant, a quest mob) and never drops it for distance/reachability - it keeps walking in, and when the
+// path stalls it side-steps around the obstacle (unlock -> moveto a perpendicular waypoint -> re-lock)
+// rather than blacklisting and re-picking. Standalone (works with or without lookalive). Side-stepping
+// walks the character, so it needs 'findmove'; without it hunt still never drops, it just can't step around.
+cli_hunt :: proc(session: ^Session, args: []string) {
+  switch {
+  case len(args) == 0:
+    session.hunt_on = !session.hunt_on
+  case len(args) == 1 && args[0] == "on":
+    session.hunt_on = true
+  case len(args) == 1 && args[0] == "off":
+    session.hunt_on = false
+  case:
+    fmt.eprintln("usage: hunt [on|off]")
+    return
+  }
+  session.layout.hunt_on = session.hunt_on // cfg mirror (see on_attach)
+  if session.attached {
+    flyff_save_cfg(session.layout, flyff_cfg_path()) // attach-gated (see cli_preselect note)
+  }
+  hint := (session.hunt_on && !moveto_configured(session)) ? "  (side-step around blocks needs 'findmove')" : ""
+  fmt.printfln("hunt mode %s.%s", session.hunt_on ? "ON" : "OFF", hint)
 }
 
 // meshreach | meshreach on|off -> toggle the mesh-accurate reach confirm. When on, a candidate our loose

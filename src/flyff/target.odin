@@ -11,6 +11,8 @@ import "core:time"
 import win "core:sys/windows"
 import "../engine"
 
+import tracy "../../lib/odin-tracy"
+
 TC_Cand :: struct {
   obj: uintptr,
   d:   f32, // horizontal (ground-plane) distance to the player - the picker's sort + range gates use it
@@ -761,7 +763,7 @@ tc_finish_select :: proc(
     now           = now,
     name_filtered = len(names) > 0,
     require_fresh = require_fresh,
-    gate          = require_fresh && session.reach_gate_on, // reach filter (auto only; inert w/o aobjcull_rva)
+    gate          = require_fresh && session.reach_gate_on && !session.hunt_on, // reach filter (auto only; hunt commits even to a blocked target - it side-steps in)
     fence_on      = session.fence.active, // geo-fence gate (auto + manual when active; 'fence off' to override)
     avoid_on      = session.auto_avoid_on,
     avoid_dir     = session.auto_avoid_dir,
@@ -912,7 +914,7 @@ tc_finish_precompute :: proc(
     now           = now,
     name_filtered = len(names) > 0,
     require_fresh = true,
-    gate          = session.reach_gate_on,
+    gate          = session.reach_gate_on && !session.hunt_on, // hunt commits even to a blocked target (see tc_finish_select)
     fence_on      = session.fence.active,
     avoid_on      = false, // pre-select never runs the one-shot stuck-avoid steer
     last_kill_set = anchor_set,
@@ -969,8 +971,8 @@ tc_precompute_still_valid :: proc(session: ^Session, obj: uintptr, cached_pos: [
   if engine.dist_horizontal(lp, cached_pos) > PRESELECT_DRIFT_MAX {
     return {}, false // wandered too far - the precomputed choice may no longer make sense
   }
-  if session.reach_gate_on && !cand_reachable(session, world, player_pos, lp) {
-    return {}, false // approach is blocked NOW (terrain/object), whatever it looked like at precompute
+  if session.reach_gate_on && !session.hunt_on && !cand_reachable(session, world, player_pos, lp) {
+    return {}, false // approach is blocked NOW (terrain/object), whatever it looked like at precompute (hunt commits anyway)
   }
   if session.fence.active && !fence_contains(session.fence, lp[0], lp[2]) {
     return {}, false // drifted outside the geo-fence
@@ -1049,6 +1051,7 @@ tc_scan_request :: proc(session: ^Session, names: []string, world, player: uintp
 // Worker body: the expensive enumeration with NO lock held, then a microsecond publish under
 // exec_mutex. A stale generation (auto stopped / target switched / detached mid-scan) is discarded.
 tc_scan_worker :: proc(data: rawptr) {
+  tracy.SetThreadName("scan_job")
   req := cast(^Scan_Job_Req)data
   defer {
     for n in req.names {
@@ -1218,7 +1221,7 @@ cli_density :: proc(session: ^Session, args: []string) {
     fmt.eprintln("not attached.")
     return
   }
-  usage :: "usage: density [on|off]  |  density mingain <n>  |  density detour <n>"
+  usage :: "usage: density [on|off]  |  density mingain <n>  |  density detour <n>  |  density hue [on|off]"
   if len(args) >= 1 {
     switch strings.to_lower(args[0]) {
     case "on":
@@ -1251,6 +1254,25 @@ cli_density :: proc(session: ^Session, args: []string) {
         return
       }
       session.layout.density_max_detour = f32(v)
+    case "hue":
+      // Radar display toggle (no picker effect): colour monster dots by local pack size. Handled
+      // inline (own save + message + return) so it doesn't also print the cluster-steering status.
+      on := !session.layout.density_hue_on
+      if len(args) >= 2 {
+        switch strings.to_lower(args[1]) {
+        case "on":
+          on = true
+        case "off":
+          on = false
+        case:
+          fmt.eprintln("usage: density hue [on|off]")
+          return
+        }
+      }
+      session.layout.density_hue_on = on
+      flyff_save_cfg(session.layout, flyff_cfg_path())
+      fmt.printfln("radar density-hue: %s - monster dots %s.", on ? "ON" : "OFF", on ? "tinted by local pack size (lone red -> dense green)" : "flat red")
+      return
     case:
       if _, isnum := strconv.parse_f64(args[0]); isnum {
         fmt.eprintln("the numeric density weight is retired - use 'density on' plus 'density mingain <n>' / 'density detour <n>'.")
