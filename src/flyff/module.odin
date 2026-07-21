@@ -78,6 +78,8 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_fxlaser(s, args)
   case "trail":
     cli_trail(s, args)
+  case "hillshade":
+    cli_hillshade(s, args)
   case "collwatch":
     cli_collwatch(s, args)
   case "pause":
@@ -220,6 +222,7 @@ on_attach :: proc(es: ^engine.Session) {
   delete(s.tc_recent)
   s.tc_recent = nil
   s.collider_cache_valid = false
+  s.collider_job.gen += 1 // orphan any in-flight collider rebuild from the previous process
 
   // Load the persisted Flyff layout (flyff.cfg next to memscan.exe) fresh over defaults, so a
   // patched build just needs 'calibrate' once. Absent file -> built-in defaults.
@@ -275,6 +278,7 @@ on_detach :: proc(es: ^engine.Session) {
   remote_free_actmsg_page(s)
   remote_free_dplay_page(s)
   s.collider_cache_valid = false // stale across processes
+  s.collider_job.gen += 1 // discard a collider rebuild still running against the detached process
 }
 
 // Session-end teardown: free the remote pages (if still attached) + all flyff lifetime-owned data.

@@ -6,6 +6,7 @@ import "core:math"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 import win "core:sys/windows"
 
@@ -1001,7 +1002,7 @@ obj_obb_blocks :: proc(session: ^Session, obj: uintptr, ax, az, bx, bz, knee: f3
 // OT_CTRL, the two sets ProcessCollision uses). FAST path: walk the game's on-screen display array
 // m_aobjCull (aobjcull_rva) - a handful of reads, no memory scan. Fallback (aobjcull_rva==0): the full
 // world-ptr scan. ok_scan=false => world anchor didn't resolve.
-obj_segment_blocked :: proc(session: ^Session, ax, ay, az, bx, bz: f32) -> (blocked: bool, hit: Obb, ok_scan: bool) {
+obj_segment_blocked :: proc(session: ^Session, ax, ay, az, bx, bz: f32, allow_async := false) -> (blocked: bool, hit: Obb, ok_scan: bool) {
   if session.ptr_size != 4 {
     return
   }
@@ -1016,7 +1017,7 @@ obj_segment_blocked :: proc(session: ^Session, ax, ay, az, bx, bz: f32) -> (bloc
   if L.landobj_off != 0 && L.land_off != 0 && L.landwidth_off != 0 {
     world := read_ptr_at(handle, base + L.world_rva, pt)
     if world != 0 {
-      obbs := collect_area_colliders(session, world, ax, az)
+      obbs := collect_area_colliders(session, world, ax, az, allow_async)
       ok_scan = true
       for o in obbs {
         if o.decorative {
@@ -1273,9 +1274,8 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
 // from the flat per-tile m_apObject array the old walk read - so reach/radar saw straight through them
 // (path in, get stuck; not drawn). The picker already full-scans every tick, so this is the same cost
 // class. Rebuilt only when the player leaves the cached area, so segment tests hit the cache (pure math).
-collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32) -> []Obb {
+collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32, allow_async := false) -> []Obb {
   tracy.ZoneN("Collect_Colliders") // tiny on cache hit, balloons on the ~16-unit rebuild (stutter suspect)
-  L := session.layout
   if world == 0 || session.ptr_size != 4 {
     return nil
   }
@@ -1283,12 +1283,34 @@ collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32) -
     dx := px - session.collider_cache_center[0]
     dz := pz - session.collider_cache_center[2]
     if dx * dx + dz * dz <= COLLIDER_CACHE_MOVE * COLLIDER_CACHE_MOVE {
-      return session.collider_cache[:]
+      return session.collider_cache[:] // fresh - pure math from here
     }
   }
+  // Cache is stale (or cold). The radar's soft reach visualization passes allow_async: it must NEVER
+  // stall the 30fps frame on the ~200ms full-scan rebuild, so kick the off-thread worker and keep
+  // serving the current (slightly stale) cache until it publishes. Accurate callers (the picker's reach
+  // gate, tdbg/reachdbg, the pre-window probe, the background snapshot scan) leave allow_async at its
+  // default and rebuild synchronously here - correctness over latency.
+  if allow_async {
+    collider_refresh_async(session, world, px, pz)
+    return session.collider_cache[:]
+  }
+  clear(&session.collider_cache)
+  collider_collect_into(session, world, px, pz, &session.collider_cache)
+  session.collider_cache_center = {px, 0, pz}
+  session.collider_cache_valid = true
+  return session.collider_cache[:]
+}
+
+// The rebuild body shared by the synchronous path above and the background worker below: a full writable-
+// memory scan for the world pointer (each CObj holds m_pWorld at field_off), keeping OT_OBJ/OT_CTRL props
+// that carry a live OBB within COLLIDER_RADIUS. Appends to `out` (caller clears + owns it). Reads only
+// proc_info / ptr_size / layout (through obj_to_obb), so it runs identically against the live session or a
+// Session snapshot. Scratch comes from context.temp_allocator - the caller reclaims it.
+collider_collect_into :: proc(session: ^Session, world: uintptr, px, pz: f32, out: ^[dynamic]Obb) {
+  L := session.layout
   handle := session.proc_info.handle
   pt := engine.Value_Type.U32
-  clear(&session.collider_cache)
   wval := engine.ptr_to_value(world, session.ptr_size)
   regions := engine.collect_regions(handle, true)
   defer delete(regions)
@@ -1313,11 +1335,73 @@ collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32) -
     if dx * dx + dz * dz > r2 {
       continue
     }
+    append(out, o)
+  }
+}
+
+// One-at-a-time background collider rebuild. `active` gates re-entry; `gen` discards a publish whose
+// request was superseded (a newer refresh, or a process detach/switch - see on_attach / on_detach which
+// bump gen). All fields are touched only under exec_mutex: the frame kicks the job inside its locked
+// section, the worker flips active + publishes under the lock.
+Collider_Job :: struct {
+  active: bool,
+  gen:    int,
+}
+
+// Heap-owned request handed to collider_scan_worker. snap carries ONLY proc_info / ptr_size / layout -
+// the same snapshot discipline as Scan_Job_Req, and exactly what collider_collect_into / obj_to_obb read.
+Collider_Job_Req :: struct {
+  session: ^Session,
+  snap:    Session,
+  world:   uintptr,
+  px, pz:  f32,
+  gen:     int,
+}
+
+// Kick a background collider-cache rebuild if none is already in flight. Caller holds exec_mutex (the
+// radar frame / reach pass). No-op while a worker runs - the stale cache is served until it publishes.
+collider_refresh_async :: proc(session: ^Session, world: uintptr, px, pz: f32) {
+  if session.collider_job.active {
+    return
+  }
+  session.collider_job.active = true
+  session.collider_job.gen += 1
+  req := new(Collider_Job_Req)
+  req.session = session
+  req.snap.proc_info = session.proc_info
+  req.snap.ptr_size = session.ptr_size
+  req.snap.layout = session.layout
+  req.world = world
+  req.px = px
+  req.pz = pz
+  req.gen = session.collider_job.gen
+  thread.create_and_start_with_data(req, collider_scan_worker, nil, .Normal, true) // self_cleanup: fire-and-forget
+}
+
+// Worker body: the expensive full-scan collect with NO lock held, then a tiny value-copy publish under
+// exec_mutex. A stale generation (detached / superseded by a newer request) discards the batch.
+collider_scan_worker :: proc(data: rawptr) {
+  tracy.SetThreadName("collider_job")
+  req := cast(^Collider_Job_Req)data
+  defer free(req)
+  defer free_all(context.temp_allocator) // reclaim the worker's scan scratch (Obbs below are value copies)
+  tmp := make([dynamic]Obb) // context.allocator: survives the temp free, copied into the cache under the lock
+  collider_collect_into(&req.snap, req.world, req.px, req.pz, &tmp)
+  session := req.session
+  sync.mutex_lock(&session.exec_mutex)
+  defer sync.mutex_unlock(&session.exec_mutex)
+  session.collider_job.active = false
+  if !session.attached || req.gen != session.collider_job.gen {
+    delete(tmp) // superseded - throw the batch away
+    return
+  }
+  clear(&session.collider_cache)
+  for o in tmp {
     append(&session.collider_cache, o)
   }
-  session.collider_cache_center = {px, 0, pz}
+  delete(tmp)
+  session.collider_cache_center = {req.px, 0, req.pz}
   session.collider_cache_valid = true
-  return session.collider_cache[:]
 }
 
 Reach_Status :: enum {
@@ -1340,7 +1424,7 @@ Reach_Res :: struct {
 // attack_range does NOT skip the test (a mob can be close yet walled off) - it's returned as a flag.
 // Matches the game: it runs you straight at the mob and shoots straight at it, so the whole line to the
 // mob must be clear.
-compute_reach :: proc(session: ^Session, world: uintptr, px, py, pz, tx, tz: f32) -> Reach_Res {
+compute_reach :: proc(session: ^Session, world: uintptr, px, py, pz, tx, tz: f32, allow_async := false) -> Reach_Res {
   tracy.ZoneN("Compute_Reach")
   L := session.layout
   d := engine.dist_horizontal({px, 0, pz}, {tx, 0, tz})
@@ -1348,7 +1432,7 @@ compute_reach :: proc(session: ^Session, world: uintptr, px, py, pz, tx, tz: f32
   if tblocked, thit := reach_raycast(session, world, px, pz, tx, tz); tblocked {
     return {status = .Blocked_Terrain, d = d, in_range = in_range, thit = thit, oscan = true}
   }
-  oblocked, ohit, oscan := obj_segment_blocked(session, px, py, pz, tx, tz)
+  oblocked, ohit, oscan := obj_segment_blocked(session, px, py, pz, tx, tz, allow_async)
   if oblocked {
     // Two-stage mesh confirm: our OBB is the loose whole-silhouette box, so a "blocked" is often a false
     // positive on a GMT_NORMAL prop (thin trunk under a wide canopy). Re-test with the client's own

@@ -110,6 +110,13 @@ FLYFF_TRAIL_ON :: false      // radar player-path trail (off by default; subtle,
 FLYFF_TRAIL_LEN :: f32(60.0) // trail length: crumbs kept up to this many world units back
 FLYFF_TRAIL_FADE :: f32(1.0) // fade exponent: >1 fades faster near the player, <1 stays visible further
 
+// Radar terrain hillshade (display-only relief; colourless, off by default). hillshade_z is the vertical
+// exaggeration (higher = more dramatic slopes); hillshade_light is the light azimuth in degrees CW from
+// north (315 = NW, the cartographic convention). See radar.odin HILL_* + radar_hillshade_color.
+FLYFF_HILLSHADE_ON :: false
+FLYFF_HILLSHADE_Z :: f32(4.0)
+FLYFF_HILLSHADE_LIGHT :: f32(315.0)
+
 // Look-alive tuning (see autofarm.odin lookalive_* + the "look-alive" section in the radar Options
 // panel). All persisted to flyff.cfg and editable live via 'lookalive hold|jump|chance' or 'set'.
 // Durations are in SECONDS (converted to ns per event by la_secs_ns); jump_chance is a 0-100 percent.
@@ -319,6 +326,9 @@ Flyff_Layout :: struct {
   trail_on:          bool, // radar display: fading player-path trail
   trail_len:         f32,  // player-path trail length (world units)
   trail_fade:        f32,  // player-path trail fade exponent (how fast opacity falls off)
+  hillshade_on:      bool, // radar display: colourless terrain shaded-relief backdrop
+  hillshade_z:       f32,  // hillshade vertical exaggeration (relief depth)
+  hillshade_light:   f32,  // hillshade light azimuth (degrees CW from north; 315 = NW)
   aobjcull_rva:      uintptr,
   camera_rva:        uintptr,
   coll_obj3d_off:    i64,
@@ -391,6 +401,9 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     trail_on          = FLYFF_TRAIL_ON,
     trail_len         = FLYFF_TRAIL_LEN,
     trail_fade        = FLYFF_TRAIL_FADE,
+    hillshade_on      = FLYFF_HILLSHADE_ON,
+    hillshade_z       = FLYFF_HILLSHADE_Z,
+    hillshade_light   = FLYFF_HILLSHADE_LIGHT,
     aobjcull_rva      = FLYFF_AOBJCULL_RVA,
     camera_rva        = FLYFF_CAMERA_RVA,
     coll_obj3d_off    = FLYFF_COLL_OBJ3D_OFF,

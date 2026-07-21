@@ -199,6 +199,9 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "trail_on=%d", layout.trail_on ? 1 : 0)
   fmt.sbprintfln(&b, "trail_len=%v", layout.trail_len)
   fmt.sbprintfln(&b, "trail_fade=%v", layout.trail_fade)
+  fmt.sbprintfln(&b, "hillshade_on=%d", layout.hillshade_on ? 1 : 0)
+  fmt.sbprintfln(&b, "hillshade_z=%v", layout.hillshade_z)
+  fmt.sbprintfln(&b, "hillshade_light=%v", layout.hillshade_light)
   fmt.sbprintfln(&b, "aobjcull_rva=0x%X", layout.aobjcull_rva)
   fmt.sbprintfln(&b, "camera_rva=0x%X", layout.camera_rva)
   fmt.sbprintfln(&b, "coll_obj3d_off=0x%X", layout.coll_obj3d_off)
@@ -261,6 +264,18 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
       }
       continue
     }
+    if key == "hillshade_z" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.hillshade_z = f32(fv) // vertical exaggeration (relief depth) - parse as float
+      }
+      continue
+    }
+    if key == "hillshade_light" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.hillshade_light = f32(fv) // light azimuth degrees - parse as float
+      }
+      continue
+    }
     if key == "density_weight" {
       if fv, ok := strconv.parse_f64(val); ok {
         layout.density_weight = f32(fv) // fractional field - parse as float
@@ -302,7 +317,7 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     // Persisted runtime toggles - bool-parsed like density_on. Deliberately NOT in layout_set_field:
     // the first three are session-mirrored (their CLI toggles keep both sides in sync; a raw `set`
     // would silently desync), and sfx/fxlaser have their own commands.
-    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "hunt_on" || key == "sfx_on" || key == "fx_laser_on" || key == "trail_on" || key == "density_hue_on" || key == "la_hesitate_on" || key == "la_jump_on" || key == "la_step_on" || key == "la_maxrange_on" {
+    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "hunt_on" || key == "sfx_on" || key == "fx_laser_on" || key == "trail_on" || key == "hillshade_on" || key == "density_hue_on" || key == "la_hesitate_on" || key == "la_jump_on" || key == "la_step_on" || key == "la_maxrange_on" {
       bv := val == "1" || strings.equal_fold(val, "true") || strings.equal_fold(val, "on")
       switch key {
       case "preselect_on":
@@ -319,6 +334,8 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
         layout.fx_laser_on = bv
       case "trail_on":
         layout.trail_on = bv
+      case "hillshade_on":
+        layout.hillshade_on = bv
       case "density_hue_on":
         layout.density_hue_on = bv
       case "la_hesitate_on":
@@ -703,7 +720,7 @@ cli_set :: proc(session: ^Session, args: []string) {
   }
   // attack_range / radar_range / density_weight / density_max_detour / la_* delays are the fractional
   // fields - parse as floats (la_jump_chance is an int and takes the generic parse_addr path below).
-  if args[0] == "attack_range" || args[0] == "radar_range" || args[0] == "trail_len" || args[0] == "trail_fade" || args[0] == "density_weight" || args[0] == "density_max_detour" || args[0] == "la_hold_min" || args[0] == "la_hold_max" || args[0] == "la_jump_min" || args[0] == "la_jump_max" || args[0] == "la_step_spread" || args[0] == "la_max_range" {
+  if args[0] == "attack_range" || args[0] == "radar_range" || args[0] == "trail_len" || args[0] == "trail_fade" || args[0] == "hillshade_z" || args[0] == "hillshade_light" || args[0] == "density_weight" || args[0] == "density_max_detour" || args[0] == "la_hold_min" || args[0] == "la_hold_max" || args[0] == "la_jump_min" || args[0] == "la_jump_max" || args[0] == "la_step_spread" || args[0] == "la_max_range" {
     fv, ok := strconv.parse_f64(args[1])
     if !ok || fv < 0 {
       fmt.eprintfln("invalid value: %s (want a number >= 0, e.g. 1.75)", args[1])
@@ -734,6 +751,10 @@ cli_set :: proc(session: ^Session, args: []string) {
       session.layout.la_step_spread = f32(fv)
     case "la_max_range":
       session.layout.la_max_range = f32(fv)
+    case "hillshade_z":
+      session.layout.hillshade_z = f32(fv)
+    case "hillshade_light":
+      session.layout.hillshade_light = f32(fv)
     }
     fmt.printfln("set %s = %v", args[0], f32(fv))
     if flyff_save_cfg(session.layout, flyff_cfg_path()) {

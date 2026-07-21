@@ -79,6 +79,18 @@ TRAIL_MIN_STEP :: f32(0.6)                 // min world-move before a new crumb 
 TRAIL_BREAK_STEP :: f32(60.0)              // a single hop farther than this = teleport/map change -> clear
 TRAIL_MAX_PTS :: 2000                      // hard cap on crumb count (safety net; > max_len/min_step so it never truncates before trail_len)
 
+// Radar terrain hillshade (display-only; toggle: `hillshade`). A COLOURLESS shaded-relief backdrop of
+// the terrain, lit from a fixed compass direction (hillshade_light, degrees CW from north; default NW).
+// It reads the same heightmap the reach oracle uses (world_attr_at / decode_hgt) and shades each screen
+// cell by the slope's alignment with the light, so hills/cliffs/ramps emboss in grey WITHOUT spending
+// any of the map's semantic colour budget. Flat ground -> HILL_BASE (a hair above the background, which
+// also demarcates "terrain here" from void/water); slopes swing +/- HILL_SPAN. Drawn UNDER everything
+// (bottom layer, under crosshair/obstacles/fences/dots). Needs `worldscan` pinned; else draws nothing.
+HILL_BASE :: 24     // flat-ground luminance (just above the {12,16,22} background)
+HILL_SPAN :: 34     // luminance swing from base by slope-vs-light (lit ridge brighter, shadow recedes)
+HILL_CELL_PX :: 8   // on-screen cell size (px), constant at every zoom; bilinear sampling fills detail
+HILL_MAX_DIM :: 260 // hard cap on grid columns/rows (huge windows) so one rebuild stays bounded
+
 // Fence floating toolbar (edit mode only; drawn over the map's top-left). The rect is also excluded
 // from map input (mouse_in_panel) while edit is on, so a toolbar click never doubles as a fence
 // draw/erase at the same screen point.
@@ -264,6 +276,194 @@ radar_density_color :: proc(pack, maxpack: int) -> rl.Color {
   return rl.ColorFromHSV(t * 120, 0.9, 0.95) // hue 0 (red) -> 120 (green)
 }
 
+// ===========================================================================
+// Terrain hillshade relief (display-only radar backdrop). See the HILL_* constants for the design note.
+// ===========================================================================
+
+Hill_Cell :: struct {
+  rect: rl.Rectangle,
+  col:  rl.Color,
+}
+
+// Grey for one hillshade cell from its terrain slope (gx,gz = dHeight/dWorld). Directional-derivative
+// shading: flat -> HILL_BASE; a slope rising toward the light brightens, away darkens. Colourless (a
+// faint cool tint matching the background). zexag exaggerates the vertical relief; light_deg is the
+// compass bearing (deg CW from north/+z) the light comes FROM. North-up projection (see radar_w2s), so
+// +z is screen-up: at 0deg the light is from the top, keeping the default NW light in the upper-left.
+radar_hillshade_color :: proc(gx, gz, zexag, light_deg: f32) -> rl.Color {
+  th := math.to_radians(light_deg)
+  lx := math.sin(th) // horizontal light dir (north-up screen): +z (north) at 0deg -> up, +x (east) at 90deg -> right
+  lz := math.cos(th)
+  s := -(gx * lx + gz * lz) * zexag // > 0 = the surface faces the light
+  s = clamp(s, -1, 1)
+  lum := clamp(f32(HILL_BASE) + f32(HILL_SPAN) * s, 0, 255)
+  return rl.Color{u8(lum * 0.86), u8(lum * 0.93), u8(lum), 255}
+}
+
+// Load (and cache for this rebuild) a landscape tile's 129x129 heightmap floats in one bulk read.
+// Returns nil for an unloaded/unreadable tile (cached as nil so we don't re-probe it every sample).
+hill_tile_hmap :: proc(session: ^Session, arr: uintptr, tile: int, cache: ^map[int][]f32) -> []f32 {
+  if h, ok := cache[tile]; ok {
+    return h
+  }
+  handle := session.proc_info.handle
+  ps := session.ptr_size
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  L := session.layout
+  pland := read_ptr_at(handle, arr + uintptr(tile * ps), pt)
+  if !is_heap_ptr(session, pland) {
+    cache[tile] = nil
+    return nil
+  }
+  hmap := read_ptr_at(handle, pland + uintptr(L.hmap_off), pt) // m_pHeightMap (float*)
+  if !is_heap_ptr(session, hmap) {
+    cache[tile] = nil
+    return nil
+  }
+  buf := make([]f32, HMAP_STRIDE * HMAP_STRIDE, context.temp_allocator)
+  n, ok := engine.read_into(handle, hmap, slice.to_bytes(buf))
+  if !ok || n < uint(len(buf) * 4) {
+    cache[tile] = nil
+    return nil
+  }
+  cache[tile] = buf
+  return buf
+}
+
+// Decoded terrain height at an integer heightmap corner (global grid coords gx,gz), resolving which
+// tile owns it. ok=false = off-world / unloaded. The bulk-read building block for the bilinear sampler.
+hill_corner :: proc(session: ^Session, arr: uintptr, land_width, land_height, gx, gz: int, cache: ^map[int][]f32) -> (h: f32, ok: bool) {
+  if gx < 0 || gz < 0 || gx >= land_width * MAP_SIZE || gz >= land_height * MAP_SIZE {
+    return 0, false
+  }
+  m_x := gx / MAP_SIZE
+  m_z := gz / MAP_SIZE
+  tile := m_x + m_z * land_width
+  if tile < 0 || tile >= land_width * land_height {
+    return 0, false
+  }
+  hm := hill_tile_hmap(session, arr, tile, cache)
+  if hm == nil {
+    return 0, false
+  }
+  cell := (gx - m_x * MAP_SIZE) + (gz - m_z * MAP_SIZE) * HMAP_STRIDE
+  if cell < 0 || cell >= len(hm) {
+    return 0, false
+  }
+  _, height := decode_hgt(hm[cell])
+  return height, true
+}
+
+// BILINEAR decoded terrain height at world (wx,wz) via the cached tile heightmaps - blends the 4
+// surrounding mpu-spaced corners so the relief is smooth between samples instead of stair-stepped.
+// ok=false when the primary (containing) corner is off-world / unloaded; far corners clamp to it at
+// the loaded-terrain edge.
+hill_sample :: proc(session: ^Session, arr: uintptr, land_width, land_height: int, mpu, wx, wz: f32, cache: ^map[int][]f32) -> (h: f32, ok: bool) {
+  ux := wx / mpu
+  uz := wz / mpu
+  if ux < 0 || uz < 0 || ux >= f32(land_width * MAP_SIZE) || uz >= f32(land_height * MAP_SIZE) {
+    return 0, false
+  }
+  ix := int(ux)
+  iz := int(uz)
+  fx := ux - f32(ix)
+  fz := uz - f32(iz)
+  h00, ok00 := hill_corner(session, arr, land_width, land_height, ix, iz, cache)
+  if !ok00 {
+    return 0, false
+  }
+  h10, ok10 := hill_corner(session, arr, land_width, land_height, ix + 1, iz, cache)
+  h01, ok01 := hill_corner(session, arr, land_width, land_height, ix, iz + 1, cache)
+  h11, ok11 := hill_corner(session, arr, land_width, land_height, ix + 1, iz + 1, cache)
+  if !ok10 {h10 = h00}
+  if !ok01 {h01 = h00}
+  if !ok11 {h11 = h00}
+  a := h00 + (h10 - h00) * fx
+  b := h01 + (h11 - h01) * fx
+  return a + (b - a) * fz, true
+}
+
+// Build the hillshade cell list for the current view. Called in the radar's LOCKED phase (it reads game
+// memory). Samples the visible world rect on a grid (>= one heightmap cell, coarsened when zoomed out),
+// computes each cell's slope by central differences, and emits a precomputed screen rect + grey. Each
+// visible tile's heightmap is bulk-read once into a temp cache, so a rebuild costs a handful of reads.
+radar_gather_hillshade :: proc(session: ^Session, world: uintptr, cam: [2]f32, scale: f32, center: rl.Vector2, fw, fh, zexag, light_deg: f32, out: ^[dynamic]Hill_Cell) {
+  clear(out)
+  handle := session.proc_info.handle
+  ps := session.ptr_size
+  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  L := session.layout
+  if world == 0 || L.land_off == 0 || L.landwidth_off == 0 || L.hmap_off == 0 {
+    return
+  }
+  lw := int(read_i32_at(handle, world + uintptr(L.landwidth_off)))
+  lh := int(read_i32_at(handle, world + uintptr(L.landwidth_off + 4)))
+  if lw <= 0 || lh <= 0 || lw > 256 || lh > 256 {
+    return
+  }
+  arr := read_ptr_at(handle, world + uintptr(L.land_off), pt) // m_apLand (CLandscape**)
+  if !is_heap_ptr(session, arr) {
+    return
+  }
+  mpu := f32(world_mpu(session, world))
+
+  // draw-cell world-size: keep cells ~HILL_CELL_PX on screen at EVERY zoom (the bilinear sampler below
+  // fills in detail between the coarser mpu-spaced heightmap samples, so sub-mpu cells are meaningful -
+  // this is what makes the relief smooth instead of stair-stepping to the 4-unit grid when zoomed in).
+  d := f32(HILL_CELL_PX) / scale
+  // visible world rect (scissor region is [0,0]..[fw-PANEL_W, fh]); pad one cell for edge gradients and
+  // snap the origin to a multiple of d so cells don't shimmer as the view pans.
+  vw := fw - PANEL_W
+  c0 := radar_s2w(cam, scale, center, 0, 0)
+  c1 := radar_s2w(cam, scale, center, vw, fh)
+  minx := math.floor(min(c0[0], c1[0]) / d) * d - d
+  minz := math.floor(min(c0[1], c1[1]) / d) * d - d
+  maxx := max(c0[0], c1[0]) + d
+  maxz := max(c0[1], c1[1]) + d
+  cols := int((maxx - minx) / d) + 2
+  rows := int((maxz - minz) / d) + 2
+  // extreme zoom-out guard: coarsen d so the grid never exceeds HILL_MAX_DIM per side.
+  if cols > HILL_MAX_DIM || rows > HILL_MAX_DIM {
+    k := f32(max(cols, rows)) / f32(HILL_MAX_DIM)
+    d *= k
+    cols = int((maxx - minx) / d) + 2
+    rows = int((maxz - minz) / d) + 2
+  }
+  // gradient stencil: at least one heightmap cell (mpu) wide so central differences straddle real
+  // samples and the shading stays smooth - a sub-cell stencil would trace the bilinear grid's creases.
+  gstep := max(d, mpu)
+
+  tiles := make(map[int][]f32, 32, context.temp_allocator) // per-rebuild tile-heightmap cache
+  half := d * 0.5
+  for iz in 0 ..< rows {
+    wz := minz + f32(iz) * d
+    for ix in 0 ..< cols {
+      wx := minx + f32(ix) * d
+      hc, cok := hill_sample(session, arr, lw, lh, mpu, wx, wz, &tiles)
+      if !cok {
+        continue // no terrain here -> leave the background showing (reads as void/water)
+      }
+      hxp, ok1 := hill_sample(session, arr, lw, lh, mpu, wx + gstep, wz, &tiles)
+      hxm, ok2 := hill_sample(session, arr, lw, lh, mpu, wx - gstep, wz, &tiles)
+      hzp, ok3 := hill_sample(session, arr, lw, lh, mpu, wx, wz + gstep, &tiles)
+      hzm, ok4 := hill_sample(session, arr, lw, lh, mpu, wx, wz - gstep, &tiles)
+      if !ok1 {hxp = hc} // fall back to the centre height at the world edge (partial gradient)
+      if !ok2 {hxm = hc}
+      if !ok3 {hzp = hc}
+      if !ok4 {hzm = hc}
+      gx := (hxp - hxm) / (2 * gstep)
+      gz := (hzp - hzm) / (2 * gstep)
+      col := radar_hillshade_color(gx, gz, zexag, light_deg)
+      p0 := radar_w2s(cam, scale, center, wx - half, wz - half)
+      p1 := radar_w2s(cam, scale, center, wx + half, wz + half)
+      // +1px on the far edges so adjacent cells overlap (no single-pixel seams between them). Build from
+      // the min corner + abs size so the north-up projection's flipped z can't yield a negative-height
+      // rect (raylib draws nothing for those - which is what blanked the whole relief).
+      append(out, Hill_Cell{rl.Rectangle{min(p0.x, p1.x), min(p0.y, p1.y), abs(p1.x - p0.x) + 1, abs(p1.y - p0.y) + 1}, col})
+    }
+  }
+}
+
 // Resolve the MoverProp array base + the local player's own species AI, for radar classification.
 // propbase = [base+propmover_rva] (0 when the AI gate isn't configured -> everything Unclassified).
 // player_ai is the local player's GetProp()->dwAI, read live so other players (same AI) are flagged
@@ -322,7 +522,7 @@ radar_reach_pass :: proc(session: ^Session, world: uintptr, ppos: [3]f32, mobs: 
   n := min(len(cand), REACH_VIS_MAX)
   for k in 0 ..< n {
     m := &mobs[cand[k].i]
-    res := compute_reach(session, world, ppos[0], ppos[1], ppos[2], m.pos[0], m.pos[2])
+    res := compute_reach(session, world, ppos[0], ppos[1], ppos[2], m.pos[0], m.pos[2], allow_async = true)
     m.reach_tested = true
     m.reachable = res.status == .Clear
   }
@@ -334,6 +534,29 @@ Radar_Tool :: enum {
   Rect,
   Polygon,
   Eraser,
+}
+
+// The handful of giants the game ships WITHOUT the "Giant" prefix. There's no cheap per-mover "is giant"
+// flag to read, so - since it's only these few - we special-case them by name alongside the prefix test.
+GIANT_NAME_EXCEPTIONS :: []string {
+  "General Chimeradon",
+  "General Bearnerky",
+  "Great Chef Muffrin",
+  "Queen Popcrank",
+}
+
+// True if a mover name marks a giant: either the "Giant" prefix, or one of the prefix-less exceptions
+// above. Case-insensitive (the client's names are ASCII), matching name_has_prefix_fold.
+is_giant_name :: proc(nm: string) -> bool {
+  if name_has_prefix_fold(nm, "Giant") {
+    return true
+  }
+  for ex in GIANT_NAME_EXCEPTIONS {
+    if strings.equal_fold(nm, ex) {
+      return true
+    }
+  }
+  return false
 }
 
 // Case-insensitive prefix test (for the map-wide "Giant *" giant scan; the client's names are ASCII).
@@ -519,7 +742,7 @@ radar_scan_giants :: proc(session: ^Session, world, player: uintptr, out: ^[dyna
           continue // not a live CObj
         }
         nm, nok := read_mover_name(session, obj)
-        if !nok || !name_has_prefix_fold(nm, "Giant") {
+        if !nok || !is_giant_name(nm) {
           continue
         }
         if L.hp_off != 0 { // drop corpses (HP<=0), like the gather
@@ -544,13 +767,18 @@ radar_scan_giants :: proc(session: ^Session, world, player: uintptr, out: ^[dyna
 // scale = pixels per world unit; center = screen midpoint.
 // ===========================================================================
 
+// NORTH-UP projection: world +z (north) maps to screen-UP (negative y). The game's yaw is left-handed
+// (Obj.cpp: RotationY(-m_fAngle)), so a plain +z-down mapping would mirror the world and reverse the
+// on-screen turn direction (clockwise in-game -> counter-clockwise on the radar). Negating z here makes
+// the radar a true top-down map: turning clockwise in-game turns the facing arrow clockwise on-screen.
 radar_w2s :: proc(cam: [2]f32, scale: f32, center: rl.Vector2, wx, wz: f32) -> rl.Vector2 {
-  return {center.x + (wx - cam[0]) * scale, center.y + (wz - cam[1]) * scale}
+  return {center.x + (wx - cam[0]) * scale, center.y - (wz - cam[1]) * scale}
 }
 radar_s2w :: proc(cam: [2]f32, scale: f32, center: rl.Vector2, sx, sy: f32) -> [2]f32 {
-  return {cam[0] + (sx - center.x) / scale, cam[1] + (sy - center.y) / scale}
+  return {cam[0] + (sx - center.x) / scale, cam[1] - (sy - center.y) / scale}
 }
-// Rotate a 2D (x,z) vector by a_rad (matches the world->screen axes: +z is screen-down).
+// Rotate a 2D world (x,z) vector by a_rad. Result is fed back through radar_w2s (which handles the z-flip),
+// so this stays a plain world-space rotation.
 radar_rot2 :: proc(v: [2]f32, a_rad: f32) -> [2]f32 {
   c := math.cos(a_rad)
   s := math.sin(a_rad)
@@ -563,7 +791,7 @@ radar_rot2 :: proc(v: [2]f32, a_rad: f32) -> [2]f32 {
 radar_draw_arrow :: proc(sp: rl.Vector2, a_deg, length, half: f32, col: rl.Color) {
   theta := math.to_radians(a_deg + 180)
   fx := -math.sin(theta) // screen-x component
-  fz := math.cos(theta) // screen-y component (+ = down = +world z)
+  fz := -math.cos(theta) // screen-y component (north-up projection: +world z -> screen-up)
   tip := rl.Vector2{sp.x + fx * length, sp.y + fz * length}
   bl := rl.Vector2{sp.x + fz * half, sp.y - fx * half} // base corners (perp to the heading)
   br := rl.Vector2{sp.x - fz * half, sp.y + fx * half}
@@ -637,6 +865,8 @@ radar_line_loop :: proc(a, b, c, d: rl.Vector2, th: f32, col: rl.Color) {
 radar_draw_obb :: proc(o: Obb, cam: [2]f32, scale: f32, center: rl.Vector2) {
   u := radar_axis_half({o.axis[0][0], o.axis[0][2]}, o.ext[0] * scale, 2.5)
   v := radar_axis_half({o.axis[2][0], o.axis[2][2]}, o.ext[2] * scale, 2.5)
+  u[1] = -u[1] // north-up projection: world +z maps to screen-up, so flip the extent vectors' z too
+  v[1] = -v[1]
   p := radar_w2s(cam, scale, center, o.center[0], o.center[2])
   c0 := rl.Vector2{p.x - u[0] - v[0], p.y - u[1] - v[1]}
   c1 := rl.Vector2{p.x + u[0] - v[0], p.y + u[1] - v[1]}
@@ -664,8 +894,9 @@ radar_draw_shape :: proc(s: Fence_Shape, cam: [2]f32, scale: f32, center: rl.Vec
   case .Rect:
     p0 := radar_w2s(cam, scale, center, s.minx, s.minz)
     p1 := radar_w2s(cam, scale, center, s.maxx, s.maxz)
-    rl.DrawRectangleV(p0, {p1.x - p0.x, p1.y - p0.y}, fill)
-    rl.DrawRectangleLinesEx({p0.x, p0.y, p1.x - p0.x, p1.y - p0.y}, 1.5, line)
+    rc := rl.Rectangle{min(p0.x, p1.x), min(p0.y, p1.y), abs(p1.x - p0.x), abs(p1.y - p0.y)} // min corner + abs size (z is flipped, see radar_w2s)
+    rl.DrawRectangleRec(rc, fill)
+    rl.DrawRectangleLinesEx(rc, 1.5, line)
   case .Polygon:
     n := len(s.verts)
     for i in 0 ..< n {
@@ -688,8 +919,9 @@ radar_draw_erase_hover :: proc(s: Fence_Shape, cam: [2]f32, scale: f32, center: 
   case .Rect:
     p0 := radar_w2s(cam, scale, center, s.minx, s.minz)
     p1 := radar_w2s(cam, scale, center, s.maxx, s.maxz)
-    rl.DrawRectangleV(p0, {p1.x - p0.x, p1.y - p0.y}, fill)
-    rl.DrawRectangleLinesEx({p0.x, p0.y, p1.x - p0.x, p1.y - p0.y}, 2, red)
+    rc := rl.Rectangle{min(p0.x, p1.x), min(p0.y, p1.y), abs(p1.x - p0.x), abs(p1.y - p0.y)} // min corner + abs size (z is flipped, see radar_w2s)
+    rl.DrawRectangleRec(rc, fill)
+    rl.DrawRectangleLinesEx(rc, 2, red)
   case .Polygon:
     n := len(s.verts)
     for i in 0 ..< n {
@@ -1067,6 +1299,31 @@ cli_trail :: proc(session: ^Session, args: []string) {
   fmt.printfln("player trail %s.", session.layout.trail_on ? "ON" : "OFF")
 }
 
+// hillshade [on|off] - toggle the radar's colourless terrain relief (a shaded-relief backdrop that
+// embosses hills/cliffs/ramps in grey, lit from hillshade_light). Reads the terrain heightmap, so it
+// needs `worldscan` pinned; the toggle still flips (it activates once terrain resolves). Depth is
+// `set hillshade_z`, light direction `set hillshade_light`. Persisted like trail (attach-gated save).
+cli_hillshade :: proc(session: ^Session, args: []string) {
+  switch {
+  case len(args) == 0:
+    session.layout.hillshade_on = !session.layout.hillshade_on
+  case len(args) == 1 && args[0] == "on":
+    session.layout.hillshade_on = true
+  case len(args) == 1 && args[0] == "off":
+    session.layout.hillshade_on = false
+  case:
+    fmt.eprintln("usage: hillshade [on|off]")
+    return
+  }
+  if session.attached {
+    flyff_save_cfg(session.layout, flyff_cfg_path())
+  }
+  fmt.printfln("terrain hillshade %s.", session.layout.hillshade_on ? "ON" : "OFF")
+  if session.layout.hillshade_on && !terrain_ready(session) {
+    fmt.println("  note: terrain offsets not pinned yet - run 'worldscan' (in-game) so the relief has heights to draw.")
+  }
+}
+
 // Multi-line hover tooltip (the "?" legend badge + anything else needing more than one line). Shares
 // the visual language of the status-light tooltip; clamps to the given right edge.
 panel_tooltip_lines :: proc(x, y: f32, lines: []cstring, right_edge: f32) {
@@ -1253,6 +1510,16 @@ cli_radar :: proc(session: ^Session, args: []string) {
   trail := make([dynamic][3]f32)
   defer delete(trail)
 
+  // Terrain hillshade relief - cached screen-cell list, rebuilt only when the view (cam/scale/size)
+  // changes (terrain is static), so a still view costs only the rect draws. Cells are value-only.
+  hill_cells := make([dynamic]Hill_Cell)
+  defer delete(hill_cells)
+  hill_cam := [2]f32{}
+  hill_scale := f32(-1)
+  hill_fw := f32(-1)
+  hill_fh := f32(-1)
+  hill_valid := false
+
   // Filter-coloring name cache + map-wide giant overlay - radar-local, persist across frames (like poly_wip),
   // freed on close. The giant list is refilled by a throttled scan (GIANT_SCAN_NS); giants_at gates it.
   name_cache := make(map[uintptr]Radar_Name_Entry)
@@ -1363,13 +1630,14 @@ cli_radar :: proc(session: ^Session, args: []string) {
     if !cam_lock && rl.IsMouseButtonDown(.RIGHT) { // right-drag pans (disabled while locked to the player)
       d := rl.GetMouseDelta()
       cam[0] -= d.x / scale
-      cam[1] -= d.y / scale
+      cam[1] += d.y / scale // north-up projection: screen-y is inverted vs world z (see radar_w2s)
     }
     if rl.IsKeyPressed(.E) {edit = !edit}
     if rl.IsKeyPressed(.F) {show_cam = !show_cam}
     if rl.IsKeyPressed(.R) {show_reach = !show_reach}
     if rl.IsKeyPressed(.L) {cam_lock = !cam_lock}
     if rl.IsKeyPressed(.C) || rl.IsKeyPressed(.HOME) {cam = {ppos[0], ppos[2]}}
+    if rl.IsKeyPressed(.H) {panel_enqueue(&ps, "hillshade")} // toggle terrain relief (deferred like jump)
     if rl.IsKeyPressed(.SPACE) && !edit {panel_enqueue(&ps, "jump")} // jump (deferred like every UI action)
 
     // --- input: fence editor (edit mode) ---
@@ -1473,9 +1741,26 @@ cli_radar :: proc(session: ^Session, args: []string) {
         radar_scan_giants(session, w, player, &giants)
         giants_at = now_frame
       }
-      // collect_area_colliders returns session.collider_cache[:], which the watcher's reach gate also
-      // rewrites - clone it into temp so drawing after we unlock can't touch a slice being reallocated.
-      obbs = slice.clone(collect_area_colliders(session, w, ppos[0], ppos[2]), context.temp_allocator)
+      // collect_area_colliders returns session.collider_cache[:]. allow_async keeps the frame off the
+      // ~200ms rebuild: a stale cache kicks the background collider_scan_worker and serves the current
+      // slice. That worker republishes the cache under exec_mutex, so clone into temp - drawing runs after
+      // we unlock and must not touch a slice being reallocated out from under it.
+      obbs = slice.clone(collect_area_colliders(session, w, ppos[0], ppos[2], allow_async = true), context.temp_allocator)
+      // Terrain hillshade: rebuild the relief cells only when the view changed (static terrain). Reads
+      // game memory, so it must run here (locked). Gated on the toggle + terrain offsets being pinned.
+      if L.hillshade_on && terrain_ready(session) {
+        if !hill_valid || hill_cam != cam || hill_scale != scale || hill_fw != fw || hill_fh != fh {
+          radar_gather_hillshade(session, w, cam, scale, center, fw, fh, L.hillshade_z, L.hillshade_light, &hill_cells)
+          hill_cam = cam
+          hill_scale = scale
+          hill_fw = fw
+          hill_fh = fh
+          hill_valid = true
+        }
+      } else if hill_valid {
+        clear(&hill_cells)
+        hill_valid = false
+      }
       // Selected target: read m_pObjFocus + its position so we can ring it (it may sit outside the
       // gathered radius, so we resolve its position directly rather than relying on the mob list).
       focus = read_ptr_at(handle, w + uintptr(L.focus_off), pt)
@@ -1640,6 +1925,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
     sfx_on_s := session.layout.sfx_on
     fx_laser_s := session.layout.fx_laser_on
     trail_s := session.layout.trail_on
+    hillshade_on_s := session.layout.hillshade_on
     opt_ar_cur := session.layout.attack_range
     opt_mg_cur := session.layout.density_min_gain
     opt_dt_cur := session.layout.density_max_detour
@@ -1698,6 +1984,12 @@ cli_radar :: proc(session: ^Session, args: []string) {
     rl.ClearBackground(rl.Color{12, 16, 22, 255})
     // Clip all world/HUD drawing to the left region so nothing bleeds under the right-side panel.
     rl.BeginScissorMode(0, 0, i32(fw - PANEL_W), i32(fh))
+    // terrain hillshade relief (bottom layer; colourless, under crosshair/obstacles/fences/dots)
+    if hillshade_on_s {
+      for c in hill_cells {
+        rl.DrawRectangleRec(c.rect, c.col)
+      }
+    }
     // screen-center crosshair (the current camera focus)
     rl.DrawLineV({center.x, 0}, {center.x, fh}, rl.Color{28, 38, 50, 255})
     rl.DrawLineV({0, center.y}, {fw, center.y}, rl.Color{28, 38, 50, 255})
@@ -1874,9 +2166,9 @@ cli_radar :: proc(session: ^Session, args: []string) {
         if uy > 0.001 {tmax = min(tmax, (fh - mrg - cy) / (uy * len2))} else if uy < -0.001 {tmax = min(tmax, (mrg - cy) / (uy * len2))}
         tmax = clamp(tmax, 0, 1)
         ep := rl.Vector2{cx + dx * tmax, cy + dy * tmax}
-        // radar_draw_arrow takes a game-angle in DEGREES; its tip points along (-sin, cos) of (a_deg+180).
-        // Solve for the tip to point outward along (ux, uy): a_deg = deg(atan2(-ux, uy)) - 180.
-        radar_draw_arrow(ep, math.to_degrees(math.atan2(-ux, uy)) - 180, 12, 6, GIANT_COL)
+        // radar_draw_arrow takes a game-angle in DEGREES; its tip points along screen dir (sin, cos) of a_deg
+        // (north-up projection). Solve for the tip to point outward along (ux, uy): a_deg = deg(atan2(ux, uy)).
+        radar_draw_arrow(ep, math.to_degrees(math.atan2(ux, uy)), 12, 6, GIANT_COL)
         rl.DrawCircleLinesV(ep, 6, GIANT_COL)
         gd := engine.dist_horizontal(g.pos, ppos)
         label := fmt.ctprintf("%s (%.0fu)", g.name, gd)
@@ -2544,6 +2836,15 @@ cli_radar :: proc(session: ^Session, args: []string) {
         "Trail - a subtle fading breadcrumb behind your dot showing where you've",
         "walked. Off by default. Tune length + fade with the sliders below. Display",
         "only, drawn under the mob dots so it never masks a target.",
+      }, &otip)
+      ty0 += 30
+      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, hillshade_on_s ? "Hillshade: ON" : "Hillshade: off") {
+        panel_enqueue(&ps, hillshade_on_s ? "hillshade off" : "hillshade on")
+      }
+      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
+        "Hillshade - colourless shaded relief of the terrain (lit from the NW), drawn",
+        "under the dots. Shows hills/cliffs/ramps via light + shadow, no added colour.",
+        "Needs 'worldscan'. Depth: 'set hillshade_z'; light dir: 'set hillshade_light'. Key: H.",
       }, &otip)
       // vision radius slider (world units): how far the radar gathers/draws mob dots. Same seed/drag/
       // persist-on-release dance as the sidebar attack_range slider (the locked block seeds ps.rr_slider

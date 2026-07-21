@@ -12,6 +12,12 @@
         "command": ".\\build.bat release",
         "cwd": "${workspaceFolder}",
         "singleInstance": true,
+      },
+      {
+        "name": "Build debug tracy",
+        "command": ".\\build.bat debug tracy",
+        "cwd": "${workspaceFolder}",
+        "singleInstance": true,
       }
     ],
     "defaultColor": "white",

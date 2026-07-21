@@ -216,6 +216,13 @@ Session :: struct {
   collider_cache:        [dynamic]Obb,
   collider_cache_center: [3]f32,
   collider_cache_valid:  bool,
+
+  // Off-frame-thread collider-cache rebuild (see collider_refresh_async / collider_scan_worker in
+  // terrain.odin). The radar's reach visualization must not block on the ~200ms full-scan rebuild, so
+  // when it finds the cache stale it kicks this one-shot worker and keeps serving the (slightly stale)
+  // cache; the worker publishes the fresh cache under exec_mutex. The picker's own reach gate is
+  // unaffected - it stays synchronous/accurate (it already runs off-thread via scan_job).
+  collider_job:          Collider_Job,
 }
 
 #assert(offset_of(Session, eng) == 0) // module hooks recover ^Session from ^engine.Session (offset-0 cast)
