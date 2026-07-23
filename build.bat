@@ -15,7 +15,15 @@ REM raylib is STATICALLY linked. raylib.lib and Win32 User32.lib (pulled in for 
 REM define CloseWindow/ShowCursor; without help the linker binds them to user32's (wrong - the raylib
 REM window then never closes). /WHOLEARCHIVE:raylib.lib forces raylib's whole archive in first so its
 REM own CloseWindow wins and user32's is never pulled. No raylib.dll needed at runtime.
-set "LINK_FLAGS=-extra-linker-flags:/WHOLEARCHIVE:raylib.lib"
+REM
+REM msvcrt.lib is re-added explicitly for the leaderboards feature (vendor:curl). The prebuilt libcurl.lib
+REM ships a "/NODEFAULTLIB:msvcrt" directive (it was built against the STATIC CRT, libcmt), which strips the
+REM DYNAMIC CRT. But raylib.lib is built against the DYNAMIC CRT (msvcrt) and needs its __imp_* imports
+REM (fmin/strtok/atof/...). Naming msvcrt.lib explicitly overrides curl's exclusion so BOTH CRTs are present
+REM again - the same benign msvcrt(raylib)+libcmt(raygui/curl) mix the project already linked pre-curl. curl
+REM keeps its memory internal (response bytes are copied into our own Odin-allocated buffer), so nothing
+REM crosses the CRT boundary at runtime.
+set "LINK_FLAGS=-extra-linker-flags:"/WHOLEARCHIVE:raylib.lib msvcrt.lib""
 set "DEBUG_FLAGS=-debug"
 set "RELEASE_FLAGS=-o:speed -disable-assert -no-bounds-check"
 

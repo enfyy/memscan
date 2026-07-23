@@ -12,3 +12,4 @@ CLAUDE.md
 # Tracy profiler: tracy-profiler.exe under tool/tracy/ is already covered by *.exe above; keep
 # local captures out of version control too (the client lib lib/odin-tracy/tracy.lib IS tracked).
 *.tracy
+/src/flyff/leaderboard_secret.odin

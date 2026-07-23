@@ -101,12 +101,14 @@ Session :: struct {
   setup_step:    int,
 
   // Penya gain tracking (Phase 6 C1). penya_tick (watcher tick + radar frame) watches the live penya
-  // field: a rise adds to penya_total, bumps penya_seq, and appends a Penya_Event the radar drains into
-  // a "+penya" pop + chime; a fall (spend) just re-baselines. penya_total accrues even with the radar
-  // closed. Events are seq-tagged so the radar only replays ones newer than when it opened, and pruned
-  // after PENYA_EVENT_TTL. Reset on attach, freed on close.
-  penya_total:   i64,
-  penya_last:    i64, // last-seen live penya (delta baseline)
+  // field. penya_last always tracks the live balance (a rise or fall re-baselines it), so the bottom-left
+  // HUD shows real gold. A rise is only counted as EARNED - added to penya_total, bumps penya_seq, appends
+  // a Penya_Event for the radar "+penya" pop + chime - when it pairs with a recent kill and is under
+  // lb_penya_cap (see penya_tick); a Perin conversion / sale / trade moves the balance but isn't income.
+  // penya_total accrues even with the radar closed. Events are seq-tagged so the radar only replays ones
+  // newer than when it opened, and pruned after PENYA_EVENT_TTL. Reset on attach, freed on close.
+  penya_total:   i64, // session penya EARNED (kill-paired), shown as "penya:" in the panel
+  penya_last:    i64, // last-seen live penya = current gold balance (delta baseline + HUD readout)
   penya_seeded:  bool,
   penya_seq:     i64, // monotonic id of the latest penya-gain event
   penya_events:  [dynamic]Penya_Event,
@@ -115,6 +117,9 @@ Session :: struct {
   // beam + zap. Seq-tagged + pruned like penya_events. Reset on attach, freed on close.
   kill_seq:      i64,
   kill_events:   [dynamic]Kill_Event,
+  last_kill_ns:  i64, // time.now()._nsec of the last confirmed kill (auto OR manual); penya_tick only counts a
+  // penya gain as EARNED (session total + radar pop) if it lands within LB_PENYA_KILL_WINDOW_NS of this, so
+  // wallet manipulation (Perin conversion, sales) bumps your gold but not your farming stats. Set in record_kill_event.
 
   // Manual-kill watch (kill_watch_tick): while auto is OFF, watch the player's own selected target so a
   // hand-killed mob still fires the radar laser/zap (auto_tick only detects kills while auto is running).
@@ -125,6 +130,20 @@ Session :: struct {
   // Timestamp (nsec) of the last CONFIRMED jump - set by cli_jump and lookalive_do_jump on success, so
   // the radar can play a dot-hop animation for every jump (manual + autonomous look-alive). 0 = none.
   jump_fired_at: i64,
+
+  // Leaderboard recording + backend (see leaderboard.odin). lb_run is an explicit Start/Stop span that
+  // accumulates the farm stats to submit; lb_cur_name / lb_cur_pack carry the committed target's identity
+  // + local pack size forward from the pick sites (target.odin / auto_commit_pick) so the kill sites can
+  // attribute a kill's monster name + density even after the object is freed. Network results (submit /
+  // board fetch) land in lb_status_buf + lb_board, written under exec_mutex by the async workers and read
+  // by both the CLI and the radar. Reset on attach, freed on close.
+  lb_run:        Leaderboard_Run,
+  lb_cur_name:   [64]u8, // last committed auto target's name (NUL-terminated); the kill-attribution fallback
+  lb_cur_pack:   int,    // last committed auto target's local pack size (feeds lb_run.max_density on kill)
+  lb_net_busy:   bool,   // a submit/fetch worker is in flight (guards concurrent network calls)
+  lb_status_buf: [128]u8, // last network status line (NUL-terminated), e.g. "submitted #42" / "rejected: ..."
+  lb_board:      [dynamic]Lb_Row, // last fetched leaderboard page (value rows; drawn by the radar dialog)
+  lb_board_sort: int,    // which sort key lb_board currently reflects (index into LB_SORTS)
 
   // Pre-select / precompute-next (see tc_precompute_next / auto_tick). While a target is focused, auto
   // precomputes the mob it will advance to next, so it can be committed the INSTANT focus clears on a

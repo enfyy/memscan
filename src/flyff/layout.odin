@@ -44,6 +44,8 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.hp_off = i64(v)
   case "penya_off":
     layout.penya_off = i64(v)
+  case "lb_penya_cap":
+    layout.lb_penya_cap = i64(v)
   case "inv_off":
     layout.inv_off = i64(v)
   case "item_stride":
@@ -217,6 +219,8 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "dplay_destpos_off=0x%X", layout.dplay_destpos_off)
   fmt.sbprintfln(&b, "sendsnapshot_rva=0x%X", layout.sendsnapshot_rva)
   fmt.sbprintfln(&b, "sendplayermoved_rva=0x%X", layout.sendplayermoved_rva)
+  fmt.sbprintfln(&b, "leaderboard_url=%s", layout.leaderboard_url) // string key (may be empty)
+  fmt.sbprintfln(&b, "lb_penya_cap=%d", layout.lb_penya_cap)
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
   return err == nil
 }
@@ -347,6 +351,13 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
       case "la_maxrange_on":
         layout.la_maxrange_on = bv
       }
+      continue
+    }
+    // leaderboard_url is the one STRING key - it will never parse as an address, so intercept it here
+    // and store a persistent clone (val points into the temp-allocated file buffer). Never freed (see
+    // the field note in flyff.odin); a re-load on re-attach leaks the old clone, which is negligible.
+    if key == "leaderboard_url" {
+      layout.leaderboard_url = strings.clone(val)
       continue
     }
     v, vok := engine.parse_addr(val)
@@ -654,6 +665,19 @@ cli_status_full :: proc(session: ^Session) {
     }
   }
 
+  // --- Leaderboard backend (optional; enables the radar's "Leaderboards..." button + `leaderboard` cmds) ---
+  fmt.println("")
+  fmt.println("LEADERBOARD (optional) - submit timed farm runs to a backend; download others' configs:")
+  if L.leaderboard_url != "" {
+    fmt.printfln("  leaderboard_url=%s  [OK] configured - radar 'Leaderboards...' button shows; `leaderboard` cmds live.", L.leaderboard_url)
+    if s := lb_status_str(session); s != "" {
+      fmt.printfln("  last: %s", s)
+    }
+  } else {
+    fmt.println("  leaderboard_url=(unset)  [--] off. fix: `set leaderboard_url <https://host:port>`")
+  }
+  fmt.printfln("  lb_penya_cap=%d  anti-cheat: span penya counts only kill-paired gains <= this (a 100M Perin is ignored). `set lb_penya_cap <n>`", L.lb_penya_cap)
+
   fmt.println("")
   fmt.println("SETUP - the whole thing is one command (re-run after a game patch):")
   fmt.println("  setup <name> [hp]            stand in a field on the ground with a few distinct monsters on screen, then")
@@ -716,6 +740,20 @@ cli_set :: proc(session: ^Session, args: []string) {
   }
   if len(args) < 2 {
     fmt.eprintln("usage: set <field> <value>   (field names: see 'offsets')")
+    return
+  }
+  // leaderboard_url is the one string-valued key: store it verbatim (a URL won't parse as an address).
+  // "-" / "none" / "off" clears it (disables the feature). Persistent clone, never freed (see flyff.odin).
+  if args[0] == "leaderboard_url" {
+    url := args[1]
+    if url == "-" || strings.equal_fold(url, "none") || strings.equal_fold(url, "off") {
+      url = ""
+    }
+    session.layout.leaderboard_url = strings.clone(url)
+    fmt.printfln("set leaderboard_url = %s", url == "" ? "(cleared)" : url)
+    if flyff_save_cfg(session.layout, flyff_cfg_path()) {
+      fmt.printfln("saved -> %s", flyff_cfg_path())
+    }
     return
   }
   // attack_range / radar_range / density_weight / density_max_detour / la_* delays are the fractional

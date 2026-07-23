@@ -187,11 +187,12 @@ setup_groups :: proc(session: ^Session) -> [10]Setup_Group {
 // Optional layout pins that `setup` does NOT cover - each just enables an extra feature and is pinned by
 // its own finder (re-pin after a game patch). None is required for `auto`; surfaced under `status` so
 // they're discoverable. Reuses Setup_Group: `label` = the feature, `need` = the finder that pins it.
-optional_pins :: proc(session: ^Session) -> [2]Setup_Group {
+optional_pins :: proc(session: ^Session) -> [3]Setup_Group {
   L := session.layout
-  return [2]Setup_Group {
+  return [3]Setup_Group {
     {L.particlemng_rva != 0 && L.createparticle_rva != 0, false, "in-world markers / mark / ring", "findparticle"},
     {L.penya_off != 0, false, "penya pop (radar juice)", "findpenya <current-penya>"},
+    {L.leaderboard_url != "", false, "leaderboard backend", "set leaderboard_url <url>"},
   }
 }
 

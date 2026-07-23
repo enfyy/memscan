@@ -6,10 +6,18 @@ import "core:strconv"
 import "core:strings"
 
 // ===========================================================================
-// Geo-fence: a target-selection boundary. A fence is a FLAT LIST of shapes, each tagged include(+)
-// or exclude(-). A world point is inside when it is inside ANY + shape AND inside NO - shape (a fence
-// with only - shapes carves out of the whole map). The auto/manual picker gates candidate mobs on
-// fence_contains (see tc_cand_skip in target.odin), so the player never targets mobs outside the area.
+// Geo-fence: a target-selection boundary. A fence is a FLAT LIST of shapes, each tagged include(+),
+// exclude(-), or avoid(!). A world point is inside when it is inside ANY + shape AND inside NO -/! shape
+// (a fence with only -/! shapes carves out of the whole map). The auto/manual picker gates candidate mobs
+// on fence_contains (see tc_cand_skip in target.odin), so the player never targets mobs outside the area.
+//
+// The THREE zone types:
+//   +  include : the base farmable area (targets must be inside one).
+//   -  exclude : a carve-out - never TARGET a mob inside it (but the player may still path through it).
+//   !  avoid   : a hard no-go - excludes targeting like '-' AND the player never ENTERS it: a mob whose
+//                straight path from the player crosses an avoid zone is treated as unreachable, so auto
+//                won't target it (and won't walk through), and moveto refuses a dest in/through one. For
+//                things like the tower's central teleport pad that would port you off the map.
 //
 // Authoring: draw shapes on the live radar (mouse editor in radar.odin) OR the walk-and-place text
 // commands here (`fence add ...` at the player's feet, or explicit world coords). Serializable to
@@ -24,10 +32,29 @@ Fence_Kind :: enum {
 
 Fence_Shape :: struct {
   kind:                   Fence_Kind,
-  include:                bool, // + (true, inclusion) / - (false, carve-out)
+  include:                bool, // + (true, inclusion) / - (false, carve-out). Always false when avoid.
+  avoid:                  bool, // ! (hard no-go): carve-out for targeting PLUS a path blocker (fence_blocks_path)
   cx, cz, r:              f32, // Circle: center + radius
   minx, minz, maxx, maxz: f32, // Rect: bounds
   verts:                  [dynamic][2]f32, // Polygon: world (x,z) vertices
+}
+
+// Tag <-> (include, avoid). "!" = avoid, "-" = exclude, "+"/other = include. Shared by (de)serialization,
+// the shape description, and the text-command tag parser so the three stay consistent.
+fence_tag_str :: proc(include, avoid: bool) -> string {
+  if avoid {
+    return "!"
+  }
+  return include ? "+" : "-"
+}
+fence_tag_parse :: proc(s: string) -> (include, avoid: bool) {
+  switch s {
+  case "!":
+    return false, true
+  case "-":
+    return false, false
+  }
+  return true, false
 }
 
 Fence :: struct {
@@ -114,6 +141,73 @@ fence_contains :: proc(f: Fence, x, z: f32) -> bool {
   return fence_geom_contains(f, x, z)
 }
 
+// True if the straight segment (x0,z0)->(x1,z1) passes through ANY active avoid(!) zone. Sampled along the
+// segment (avoid zones are sizable, so a ~2-unit step never tunnels through one; steps are capped so a long
+// ray stays cheap). Used to keep the player out of a no-go zone: auto skips targets whose path crosses one,
+// and moveto refuses such a destination. Inactive fence / no avoid shapes -> false (fast path).
+fence_blocks_path :: proc(f: Fence, x0, z0, x1, z1: f32) -> bool {
+  if !f.active {
+    return false
+  }
+  has_avoid := false
+  for s in f.shapes {
+    if s.avoid {
+      has_avoid = true
+      break
+    }
+  }
+  if !has_avoid {
+    return false
+  }
+  dx := x1 - x0
+  dz := z1 - z0
+  span := abs(dx) + abs(dz) // Manhattan >= Euclidean, so the sample step never under-covers the segment
+  steps := int(span / 2.0) + 1
+  if steps > 128 {
+    steps = 128
+  }
+  for i in 0 ..= steps {
+    t := f32(i) / f32(steps)
+    x := x0 + dx * t
+    z := z0 + dz * t
+    for s in f.shapes {
+      if s.avoid && fence_shape_contains(s, x, z) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// True if (x,z) is inside any active avoid(!) zone.
+fence_point_in_avoid :: proc(f: Fence, x, z: f32) -> bool {
+  if !f.active {
+    return false
+  }
+  for s in f.shapes {
+    if s.avoid && fence_shape_contains(s, x, z) {
+      return true
+    }
+  }
+  return false
+}
+
+// Movement gate: may the player walk from <cur> to <dest>? Refuses a destination inside a no-go zone, and
+// refuses a path that crosses one - UNLESS the player is already inside a zone (then allow it, so they can
+// walk back out rather than getting stuck). Used by write_dest_pos + cli_moveto.
+fence_move_ok :: proc(f: Fence, cur, dest: [3]f32) -> bool {
+  if !f.active {
+    return true
+  }
+  if fence_point_in_avoid(f, dest[0], dest[2]) {
+    return false // never walk INTO a no-go zone
+  }
+  if !fence_point_in_avoid(f, cur[0], cur[2]) && fence_blocks_path(f, cur[0], cur[2], dest[0], dest[2]) {
+    return false // path crosses a no-go zone (and we aren't escaping one)
+  }
+  return true
+}
+
 // ===========================================================================
 // Lifetime
 // ===========================================================================
@@ -189,7 +283,7 @@ fence_serialize :: proc(f: ^Fence, b: ^strings.Builder) {
   fmt.sbprintln(b, "# memscan fence")
   fmt.sbprintfln(b, "active %d", f.active ? 1 : 0)
   for s in f.shapes {
-    tag := s.include ? "+" : "-"
+    tag := fence_tag_str(s.include, s.avoid)
     switch s.kind {
     case .Circle:
       fmt.sbprintfln(b, "circle %s %v %v %v", tag, s.cx, s.cz, s.r)
@@ -230,11 +324,13 @@ fence_deserialize :: proc(f: ^Fence, content: string) {
       }
     case "circle":
       if len(fields) >= 5 {
+        inc, avo := fence_tag_parse(fields[1])
         append(
           &f.shapes,
           Fence_Shape {
             kind = .Circle,
-            include = fields[1] != "-",
+            include = inc,
+            avoid = avo,
             cx = fence_f32(fields[2]),
             cz = fence_f32(fields[3]),
             r = fence_f32(fields[4]),
@@ -243,11 +339,13 @@ fence_deserialize :: proc(f: ^Fence, content: string) {
       }
     case "rect":
       if len(fields) >= 6 {
+        inc, avo := fence_tag_parse(fields[1])
         append(
           &f.shapes,
           Fence_Shape {
             kind = .Rect,
-            include = fields[1] != "-",
+            include = inc,
+            avoid = avo,
             minx = fence_f32(fields[2]),
             minz = fence_f32(fields[3]),
             maxx = fence_f32(fields[4]),
@@ -257,9 +355,11 @@ fence_deserialize :: proc(f: ^Fence, content: string) {
       }
     case "poly":
       if len(fields) >= 2 {
+        inc, avo := fence_tag_parse(fields[1])
         s := Fence_Shape {
           kind    = .Polygon,
-          include = fields[1] != "-",
+          include = inc,
+          avoid   = avo,
         }
         i := 2
         for i + 1 < len(fields) {
@@ -280,14 +380,19 @@ fence_deserialize :: proc(f: ^Fence, content: string) {
 // Text commands  (fence <subcommand>) - dispatched from cli.odin
 // ===========================================================================
 
-// Pops a trailing "+"/"-" tag from args; returns the remaining args + the include flag (default +).
-fence_pop_tag :: proc(args: []string) -> (rest: []string, include: bool) {
+// Pops a trailing "+"/"-"/"!" tag from args; returns the remaining args + the include/avoid flags
+// (default "+"). "!" = avoid (also implies exclude), "-" = exclude, "+" = include.
+fence_pop_tag :: proc(args: []string) -> (rest: []string, include: bool, avoid: bool) {
   include = true
   rest = args
   if len(args) > 0 {
     switch args[len(args) - 1] {
     case "-":
       include = false
+      rest = args[:len(args) - 1]
+    case "!":
+      include = false
+      avoid = true
       rest = args[:len(args) - 1]
     case "+":
       rest = args[:len(args) - 1]
@@ -312,14 +417,16 @@ parse_vec2_literal :: proc(s: string) -> (v: [2]f32, ok: bool) {
 }
 
 fence_shape_desc :: proc(s: Fence_Shape, allocator := context.temp_allocator) -> string {
-  tag := s.include ? "+" : "-"
+  tag := fence_tag_str(s.include, s.avoid)
+  kindword := s.avoid ? " AVOID" : (s.include ? "" : " EXCLUDE")
   switch s.kind {
   case .Circle:
-    return fmt.aprintf("%s circle  center (%.1f, %.1f)  r %.1f", tag, s.cx, s.cz, s.r, allocator = allocator)
+    return fmt.aprintf("%s%s circle  center (%.1f, %.1f)  r %.1f", tag, kindword, s.cx, s.cz, s.r, allocator = allocator)
   case .Rect:
     return fmt.aprintf(
-      "%s rect    x [%.1f..%.1f]  z [%.1f..%.1f]",
+      "%s%s rect    x [%.1f..%.1f]  z [%.1f..%.1f]",
       tag,
+      kindword,
       s.minx,
       s.maxx,
       s.minz,
@@ -327,7 +434,7 @@ fence_shape_desc :: proc(s: Fence_Shape, allocator := context.temp_allocator) ->
       allocator = allocator,
     )
   case .Polygon:
-    return fmt.aprintf("%s polygon %d verts", tag, len(s.verts), allocator = allocator)
+    return fmt.aprintf("%s%s polygon %d verts", tag, kindword, len(s.verts), allocator = allocator)
   }
   return "?"
 }
@@ -451,7 +558,8 @@ fence_cmd_add :: proc(session: ^Session, args: []string) {
     fmt.eprintln("usage: fence add circle|rect ...")
     return
   }
-  rest, include := fence_pop_tag(args[1:])
+  rest, include, avoid := fence_pop_tag(args[1:])
+  kindword := avoid ? "AVOID" : (include ? "" : "EXCLUDE")
   switch args[0] {
   case "circle":
     cx, cz, r: f32
@@ -477,9 +585,9 @@ fence_cmd_add :: proc(session: ^Session, args: []string) {
       fmt.eprintln("usage: fence add circle <r> [-]  |  fence add circle <x,z> <r> [-]")
       return
     }
-    append(&f.shapes, Fence_Shape{kind = .Circle, include = include, cx = cx, cz = cz, r = r})
+    append(&f.shapes, Fence_Shape{kind = .Circle, include = include, avoid = avoid, cx = cx, cz = cz, r = r})
     f.active = true
-    fmt.printfln("fence: + %s circle center (%.1f, %.1f) r %.1f  (%d shapes, ACTIVE)", include ? "" : "EXCLUDE", cx, cz, r, len(f.shapes))
+    fmt.printfln("fence: %s circle center (%.1f, %.1f) r %.1f  (%d shapes, ACTIVE)", kindword, cx, cz, r, len(f.shapes))
 
   case "rect":
     minx, minz, maxx, maxz: f32
@@ -506,9 +614,9 @@ fence_cmd_add :: proc(session: ^Session, args: []string) {
       fmt.eprintln("usage: fence add rect <halfx,halfz> [-]  |  fence add rect <minx,minz> <maxx,maxz> [-]")
       return
     }
-    append(&f.shapes, Fence_Shape{kind = .Rect, include = include, minx = minx, minz = minz, maxx = maxx, maxz = maxz})
+    append(&f.shapes, Fence_Shape{kind = .Rect, include = include, avoid = avoid, minx = minx, minz = minz, maxx = maxx, maxz = maxz})
     f.active = true
-    fmt.printfln("fence: + %s rect x[%.1f..%.1f] z[%.1f..%.1f]  (%d shapes, ACTIVE)", include ? "" : "EXCLUDE", minx, maxx, minz, maxz, len(f.shapes))
+    fmt.printfln("fence: %s rect x[%.1f..%.1f] z[%.1f..%.1f]  (%d shapes, ACTIVE)", kindword, minx, maxx, minz, maxz, len(f.shapes))
 
   case:
     fmt.eprintfln("fence add: unknown shape '%s' (circle|rect; polygon via 'fence poly')", args[0])
@@ -536,16 +644,17 @@ fence_cmd_poly :: proc(session: ^Session, args: []string) {
       fmt.eprintfln("fence poly end: need >=3 vertices (have %d).", len(f.poly_wip))
       return
     }
-    _, include := fence_pop_tag(args[1:])
+    _, include, avoid := fence_pop_tag(args[1:])
     s := Fence_Shape {
       kind    = .Polygon,
       include = include,
+      avoid   = avoid,
     }
     append(&s.verts, ..f.poly_wip[:])
     append(&f.shapes, s)
     clear(&f.poly_wip)
     f.active = true
-    fmt.printfln("fence: + %s polygon %d verts  (%d shapes, ACTIVE)", include ? "" : "EXCLUDE", len(s.verts), len(f.shapes))
+    fmt.printfln("fence: %s polygon %d verts  (%d shapes, ACTIVE)", avoid ? "AVOID" : (include ? "" : "EXCLUDE"), len(s.verts), len(f.shapes))
   case:
     fmt.eprintfln("fence poly: unknown '%s' (start|point|end)", args[0])
   }

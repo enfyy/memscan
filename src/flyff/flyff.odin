@@ -18,6 +18,10 @@ FLYFF_HP_OFF :: 0x814 // CMover current HP (LONG); 0 => dead/despawning (don't t
 // next field (+0x818) and equals currentHP at full health - calibrate_derive steps DOWN to this (lower)
 // offset so it never pins maxHP by mistake (maxHP never hits 0, so pets/corpses would misread as alive).
 FLYFF_PENYA_OFF :: 0 // player penya/gold (u32, inline in CMover); 0 => unpinned (run 'findpenya')
+// Leaderboard anti-cheat: a single penya gain larger than this is NOT credited to a recording span (it's
+// a Perin conversion / big trade / quest reward, not a kill drop). A Perin is 100,000,000 penya, so the
+// default sits well below that and above any realistic single-mob drop. Tune per server: `set lb_penya_cap`.
+FLYFF_LB_PENYA_CAP :: i64(10_000_000)
 // Inventory-full detection. m_Inventory is an embedded CItemContainer<CItemElem> inside CMover; inv_off
 // is the offset of its 16-byte header {DWORD* m_apIndex, DWORD m_dwIndexNum, DWORD m_dwItemMax,
 // CItemElem* m_apItem}. item_stride is sizeof(CItemElem) (the m_apItem array stride). Both are
@@ -344,6 +348,17 @@ Flyff_Layout :: struct {
   dplay_destpos_off: i64,
   sendsnapshot_rva:  uintptr,
   sendplayermoved_rva: uintptr,
+
+  // Leaderboard backend URL (base, e.g. https://host:port). The only STRING config key; everything
+  // else is numeric/hex/float. Empty = the feature is off (the radar's "Leaderboards..." button is
+  // hidden). Set with `set leaderboard_url <url>`; persisted verbatim. Allocated once from the process
+  // heap and never freed - Flyff_Layout is copied by value in several spots, so an owned/freed string
+  // would dangle; the immutable bytes are safe to share across copies. See leaderboard.odin.
+  leaderboard_url:   string,
+  // Anti-cheat cap: the max single penya gain (in one tick) a recording span will credit. Larger jumps
+  // (a Perin = 100M, a trade, a sale) are ignored so the board's penya reflects kill drops. See
+  // FLYFF_LB_PENYA_CAP + lb_note_penya_gain (leaderboard.odin). `set lb_penya_cap <n>`.
+  lb_penya_cap:      i64,
 }
 
 flyff_layout_default :: proc() -> Flyff_Layout {
@@ -419,5 +434,7 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     dplay_destpos_off = FLYFF_DPLAY_DESTPOS_OFF,
     sendsnapshot_rva  = FLYFF_SENDSNAPSHOT_RVA,
     sendplayermoved_rva = FLYFF_SENDPLAYERMOVED_RVA,
+    leaderboard_url   = "", // off by default; `set leaderboard_url <url>` enables the feature
+    lb_penya_cap      = FLYFF_LB_PENYA_CAP,
   }
 }

@@ -50,11 +50,19 @@ penya_tick :: proc(session: ^Session) {
           session.penya_seeded = true
         } else if cur > session.penya_last {
           gain := cur - session.penya_last
-          session.penya_total += gain
-          session.penya_seq += 1
-          pos, _ := read_player_pos(session)
-          append(&session.penya_events, Penya_Event{amount = gain, pos = pos, t = now, seq = session.penya_seq})
-          session.penya_last = cur
+          session.penya_last = cur // current gold always tracks the real balance (bottom-left HUD readout)
+          // Count it as EARNED (session penya total + radar "+penya" pop) only if it pairs with a recent
+          // kill AND isn't a wallet-sized jump: a Perin conversion / sale / trade changes your gold but is
+          // not farming income. Uses the same window + cap as the leaderboard so the two never disagree.
+          pcap := session.layout.lb_penya_cap
+          earned := (now - session.last_kill_ns <= LB_PENYA_KILL_WINDOW_NS) && (pcap <= 0 || gain <= pcap)
+          if earned {
+            session.penya_total += gain
+            session.penya_seq += 1
+            pos, _ := read_player_pos(session)
+            append(&session.penya_events, Penya_Event{amount = gain, pos = pos, t = now, seq = session.penya_seq})
+          }
+          lb_note_penya_gain(session, gain, now) // leaderboard span (its own active + window + cap gates)
         } else if cur < session.penya_last {
           session.penya_last = cur // spent penya (repair / buy) - re-baseline, no pop
         }
@@ -81,6 +89,7 @@ penya_tick :: proc(session: ^Session) {
 // Record a confirmed kill at <pos> for the radar's laser/zap juice. Shared by both kill sites.
 record_kill_event :: proc(session: ^Session, pos: [3]f32, now: i64) {
   session.kill_seq += 1
+  session.last_kill_ns = now // opens the penya "earned" window (see penya_tick) for auto + manual kills
   append(&session.kill_events, Kill_Event{pos = pos, t = now, seq = session.kill_seq})
 }
 
@@ -358,6 +367,7 @@ pause_resume :: proc(session: ^Session, killed_obj: uintptr, now: i64) {
   session.auto_paused = false
   session.pause_obj = 0
   session.auto_count += 1 // the kill that resumes us counts too (this is the first kill when armed)
+  lb_record_kill(session, killed_obj) // attribute to the leaderboard span (no-op unless recording)
   if pos, ok := engine.read_vec3(session.proc_info.handle, killed_obj + uintptr(session.layout.pos_off)); ok {
     session.last_kill_pos = pos
     session.last_kill_set = true
@@ -492,6 +502,7 @@ auto_tick :: proc(session: ^Session) {
     }
     if died {
       session.auto_count += 1
+      lb_record_kill(session, session.auto_sel_obj) // attribute to the leaderboard span (no-op unless recording)
       session.last_kill_pos = session.auto_sel_pos
       session.last_kill_set = true
       record_kill_event(session, session.auto_sel_pos, now) // radar laser + zap
@@ -1037,6 +1048,7 @@ auto_commit_pick :: proc(session: ^Session, obj: uintptr, live_pos: [3]f32, stag
   session.auto_sel_pos = live_pos
   session.auto_sel_obj = obj
   session.auto_sel_set = true
+  lb_note_commit(session, obj, pack) // carry name + pack to the kill site (no-op unless a run is recording)
   if session.layout.density_on {
     _, engage := pick_ranges(session)
     session.cluster_committed, session.cluster_origin_pos = cluster_advance(

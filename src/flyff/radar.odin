@@ -41,6 +41,15 @@ OT_MOVER_IDX :: 5 // m_apObject[] index for OT_MOVER (mobs / players / pets)
 
 FENCE_INC :: rl.Color{46, 204, 113, 255} // + inclusion shape (green)
 FENCE_EXC :: rl.Color{231, 126, 34, 255} // - exclusion / carve-out shape (orange)
+FENCE_AVOID :: rl.Color{224, 40, 96, 255} // ! avoid / hard no-go shape (crimson)
+
+// Fence shape outline color by its role (see Fence_Shape). Shared by the live draw + the editor preview.
+fence_shape_color :: proc(include, avoid: bool) -> rl.Color {
+  if avoid {
+    return FENCE_AVOID
+  }
+  return include ? FENCE_INC : FENCE_EXC
+}
 CAM_COL :: rl.Color{90, 200, 225, 255} // camera eye + frustum cone (cyan; toggled with F)
 
 MOB_COL :: rl.Color{231, 76, 60, 255} // attackable monster (red)
@@ -826,6 +835,32 @@ radar_draw_bag :: proc(cx, cy: f32, col: rl.Color) {
   rl.DrawRectangleRounded({cx - 6, cy - 2, 12, 10}, 0.4, 6, col) // pouch body
 }
 
+// A small coin glyph for the bottom-left penya readout (same anchor/scale as radar_draw_bag).
+radar_draw_coin :: proc(cx, cy: f32, col: rl.Color) {
+  rl.DrawCircle(i32(cx), i32(cy), 6, col)
+  rl.DrawCircleLines(i32(cx), i32(cy), 6, rl.Color{40, 34, 14, 255}) // thin dark rim
+  rl.DrawRectangleRounded({cx - 1, cy - 3, 2, 6}, 0.5, 4, rl.Color{60, 48, 16, 210}) // faint coin mark
+}
+
+// A loud throbbing bar behind a bottom-left readout (full bag / penya near the cap) so the alert is
+// impossible to miss. <cy> is the readout's vertical center, <p> the 0..1 pulse phase, <rgb> the alert hue.
+radar_alert_bg :: proc(x, cy, w: f32, p: f32, rgb: [3]u8) {
+  a := u8(45 + 170 * p) // fill throbs from faint to near-solid
+  rl.DrawRectangleRounded({x, cy - 14, w, 28}, 0.45, 6, rl.Color{rgb.r, rgb.g, rgb.b, a})
+  rl.DrawRectangleRoundedLines({x, cy - 14, w, 28}, 0.45, 6, rl.Color{rgb.r, rgb.g, rgb.b, 255})
+}
+
+// Fence editor draw-tag <-> (include, avoid, label). Tab cycles 0->1->2 (include+ / exclude- / avoid!).
+radar_fence_tag :: proc(i: int) -> (include, avoid: bool, label: cstring) {
+  switch i {
+  case 1:
+    return false, false, "-"
+  case 2:
+    return false, true, "!"
+  }
+  return true, false, "+"
+}
+
 // Screen half-edge vector for a unit box axis' xz projection, clamped to a min pixel length so tiny
 // props stay visible. <dir> = axis (x,z) - unit for the yaw-only props Flyff places; <half> = ext*scale
 // pixels; <min_half> = floor so a small rock never shrinks to a dot.
@@ -883,7 +918,7 @@ radar_draw_obb :: proc(o: Obb, cam: [2]f32, scale: f32, center: rl.Vector2) {
 // Draw one committed fence shape (green for +, orange for -). Polygons are outlined (fill needs
 // triangulation and the mob shading conveys membership anyway).
 radar_draw_shape :: proc(s: Fence_Shape, cam: [2]f32, scale: f32, center: rl.Vector2) {
-  line := s.include ? FENCE_INC : FENCE_EXC
+  line := fence_shape_color(s.include, s.avoid)
   fill := line
   fill.a = 40
   switch s.kind {
@@ -1160,6 +1195,14 @@ Panel_State :: struct {
   opt_seeded:   bool, // one-time seed of the option textboxes on modal open
   opt_scroll:   f32, // Options modal vertical scroll offset (<=0; content scrolls under the fixed title/footer)
   opt_content_h: f32, // measured intrinsic content height (for the scroll clamp) - set each frame while open
+
+  // Leaderboards modal (see leaderboard.odin). The trigger button appears at the bottom-center of the
+  // sidebar only when leaderboard_url is set; the modal drives the same `leaderboard` subcommands as the CLI.
+  leaderboard_open: bool,
+  lb_seeded:        bool,   // one-time seed of the name box on open
+  lb_name_buf:      [64]u8, // submission-name textbox
+  lb_name_edit:     bool,
+  lb_sort:          i32,    // selected board sort (index into LB_SORTS; drives the toggle group + Refresh)
 }
 
 // Write <s> into a raygui textbox byte buffer (NUL-terminated, tail-zeroed). For seeding the Options
@@ -1482,7 +1525,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
   // (it lives across frames while the temp allocator is reclaimed each frame).
   edit := false
   tool := Radar_Tool.Circle
-  include := true
+  tag_i := 0 // fence draw tag: 0 = include(+), 1 = exclude(-), 2 = avoid(!). Tab cycles.
   drag_active := false
   drag_start := [2]f32{}
   poly_wip := make([dynamic][2]f32)
@@ -1563,9 +1606,10 @@ cli_radar :: proc(session: ^Session, args: []string) {
       mouse.x >= fw - PANEL_W ||
       ps.setup_open ||
       ps.options_open ||
+      ps.leaderboard_open ||
       rl.CheckCollisionPointRec(mouse, MUTE_BTN_RECT) ||
       (edit && rl.CheckCollisionPointRec(mouse, FENCE_TB_RECT))
-    typing := ps.search_edit || ps.name_edit || ps.hp_edit || ps.penya_edit
+    typing := ps.search_edit || ps.name_edit || ps.hp_edit || ps.penya_edit || ps.lb_name_edit
 
     // Re-snapshot the layout every frame (under the lock): setup/findpenya from the panel and an
     // external 'set attack_range' all mutate session.layout live, and a frozen copy kept the ring,
@@ -1646,7 +1690,8 @@ cli_radar :: proc(session: ^Session, args: []string) {
       if rl.IsKeyPressed(.TWO) {tool = .Rect}
       if rl.IsKeyPressed(.THREE) {tool = .Polygon}
       if rl.IsKeyPressed(.FOUR) {tool = .Eraser}
-      if rl.IsKeyPressed(.TAB) {include = !include}
+      if rl.IsKeyPressed(.TAB) {tag_i = (tag_i + 1) % 3} // cycle + / - / !
+      e_include, e_avoid, _ := radar_fence_tag(tag_i)
       if rl.IsKeyPressed(.A) {session.fence.active = !session.fence.active}
       if rl.IsKeyPressed(.DELETE) {
         fence_reset(&session.fence)
@@ -1662,7 +1707,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
           append(&poly_wip, mw)
         }
         if rl.IsKeyPressed(.ENTER) && len(poly_wip) >= 3 {
-          s := Fence_Shape{kind = .Polygon, include = include}
+          s := Fence_Shape{kind = .Polygon, include = e_include, avoid = e_avoid}
           append(&s.verts, ..poly_wip[:])
           append(&session.fence.shapes, s)
           clear(&poly_wip)
@@ -1694,7 +1739,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
             dz := mw[1] - drag_start[1]
             r := math.sqrt(dx * dx + dz * dz)
             if r > 0.5 {
-              append(&session.fence.shapes, Fence_Shape{kind = .Circle, include = include, cx = drag_start[0], cz = drag_start[1], r = r})
+              append(&session.fence.shapes, Fence_Shape{kind = .Circle, include = e_include, avoid = e_avoid, cx = drag_start[0], cz = drag_start[1], r = r})
               session.fence.active = true
             }
           } else {
@@ -1703,7 +1748,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
             minz := min(drag_start[1], mw[1])
             maxz := max(drag_start[1], mw[1])
             if (maxx - minx) > 0.5 && (maxz - minz) > 0.5 {
-              append(&session.fence.shapes, Fence_Shape{kind = .Rect, include = include, minx = minx, minz = minz, maxx = maxx, maxz = maxz})
+              append(&session.fence.shapes, Fence_Shape{kind = .Rect, include = e_include, avoid = e_avoid, minx = minx, minz = minz, maxx = maxx, maxz = maxz})
               session.fence.active = true
             }
           }
@@ -1943,7 +1988,30 @@ cli_radar :: proc(session: ^Session, args: []string) {
     opt_lamaxr_cur := session.layout.la_max_range
     prop_ok_s := prop_gate_ready(session)
     penya_total_s := session.penya_total
+    penya_cur_s := session.penya_last // current gold balance (bottom-left HUD readout + cap warning)
+    penya_show_s := session.layout.penya_off != 0 && session.penya_seeded // pinned + read at least once
     jump_at_s := session.jump_fired_at // for the player-dot hop animation (set by cli_jump / look-alive)
+    // Leaderboards snapshot: cheap scalars always (the gated button reads lb_configured_s); the board rows +
+    // status are cloned into temp only while the modal is open (a Session.lb_board mutated by the async worker
+    // must never be drawn lock-free). lb_rows_s is temp-lifetime - consumed by this frame's draw, freed after.
+    lb_configured_s := session.layout.leaderboard_url != ""
+    lb_active_s := session.lb_run.active
+    lb_has_run_s := session.lb_run.active || session.lb_run.start_ns != 0
+    lb_elapsed_s := lb_elapsed_sec(session)
+    lb_kills_s := session.lb_run.kills
+    lb_penya_s := lb_penya(session)
+    lb_kpm_s := lb_kpm(session)
+    lb_density_s := session.lb_run.max_density
+    lb_species_s := len(session.lb_run.names)
+    lb_busy_s := session.lb_net_busy
+    lb_submitted_s := session.lb_run.submitted
+    lb_board_sort_s := session.lb_board_sort
+    lb_status_s := ""
+    lb_rows_s: []Lb_Row
+    if ps.leaderboard_open {
+      lb_status_s = strings.clone(lb_status_str(session), context.temp_allocator)
+      lb_rows_s = slice.clone(session.lb_board[:], context.temp_allocator)
+    }
     // Bag fullness for the bottom-left HUD readout. read_inventory_counts is a ~100KB RPM read, so
     // throttle it (~2.5/s); the last result persists across frames. No-op/hidden when 'findinv' is unset.
     if L.inv_off != 0 && L.item_stride != 0 {
@@ -2022,7 +2090,8 @@ cli_radar :: proc(session: ^Session, args: []string) {
     }
     // in-progress polygon (edit mode)
     if edit && tool == .Polygon && len(poly_wip) > 0 {
-      col := include ? FENCE_INC : FENCE_EXC
+      pinc, pavo, _ := radar_fence_tag(tag_i)
+      col := fence_shape_color(pinc, pavo)
       for i in 0 ..< len(poly_wip) {
         a := radar_w2s(cam, scale, center, poly_wip[i][0], poly_wip[i][1])
         rl.DrawCircleV(a, 3, col)
@@ -2036,7 +2105,8 @@ cli_radar :: proc(session: ^Session, args: []string) {
     }
     // in-progress circle/rect drag (edit mode)
     if edit && drag_active && (tool == .Circle || tool == .Rect) {
-      col := include ? FENCE_INC : FENCE_EXC
+      dinc, davo, _ := radar_fence_tag(tag_i)
+      col := fence_shape_color(dinc, davo)
       sp := radar_w2s(cam, scale, center, drag_start[0], drag_start[1])
       if tool == .Circle {
         dx := mw[0] - drag_start[0]
@@ -2269,13 +2339,15 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // excluded from map input via mouse_in_panel, so these clicks never double as fence edits.
     if edit {
       rl.GuiUnlock()
-      if ps.setup_open || ps.options_open {rl.GuiLock()} // modal up -> toolbar renders disabled like the panel
+      if ps.setup_open || ps.options_open || ps.leaderboard_open {rl.GuiLock()} // modal up -> toolbar renders disabled like the panel
       rl.DrawRectangleRounded(FENCE_TB_RECT, 0.15, 6, rl.Color{16, 22, 30, 235})
       rl.DrawRectangleRoundedLines(FENCE_TB_RECT, 0.15, 6, rl.Color{60, 74, 90, 255})
       tool_i := i32(tool)
       rl.GuiToggleGroup({20, 40, 55, 24}, "Circle;Rect;Poly;Erase", &tool_i)
       tool = Radar_Tool(tool_i)
-      if rl.GuiButton({20, 68, 36, 24}, include ? "+" : "-") {include = !include}
+      _, _, taglabel := radar_fence_tag(tag_i)
+      // the tag button cycles + (include) -> - (exclude) -> ! (avoid / hard no-go)
+      if rl.GuiButton({20, 68, 36, 24}, taglabel) {tag_i = (tag_i + 1) % 3}
       if rl.GuiButton({60, 68, 62, 24}, session.fence.active ? "On" : "Off") {
         panel_enqueue(&ps, session.fence.active ? "fence off" : "fence on")
       }
@@ -2283,8 +2355,32 @@ cli_radar :: proc(session: ^Session, args: []string) {
       if rl.GuiButton({190, 68, 54, 24}, "Undo") {panel_enqueue(&ps, "fence undo")}
       // compact live state + key hints, only while editing (the always-on HUD text is gone - see badge)
       toolname: cstring = tool == .Circle ? "circle" : tool == .Rect ? "rect" : tool == .Polygon ? "polygon" : "eraser"
-      rl.DrawText(fmt.ctprintf("EDIT  tool:%s  tag:%s  fence %s (%d shapes)", toolname, include ? "+" : "-", session.fence.active ? "ON" : "off", len(session.fence.shapes)), 10, i32(fh) - 46, 14, rl.RAYWHITE)
-      rl.DrawText("1/2/3:draw  4:erase  Tab:+/-  Ldrag/click  Enter:close-poly  Bksp:undo  Del:clear  A:on/off  E:done", 10, i32(fh) - 24, 14, rl.Color{150, 160, 172, 255})
+      tagword: cstring = tag_i == 0 ? "include(+)" : tag_i == 1 ? "exclude(-)" : "AVOID(!)"
+      rl.DrawText(fmt.ctprintf("EDIT  tool:%s  tag:%s  fence %s (%d shapes)", toolname, tagword, session.fence.active ? "ON" : "off", len(session.fence.shapes)), 10, i32(fh) - 46, 14, rl.RAYWHITE)
+      rl.DrawText("1/2/3:draw  4:erase  Tab:+/-/!  Ldrag/click  Enter:close-poly  Bksp:undo  Del:clear  A:on/off  E:done", 10, i32(fh) - 24, 14, rl.Color{150, 160, 172, 255})
+    }
+
+    // Bottom-left penya readout (just above the bag): a coin glyph + your current gold, comma-grouped.
+    // Only shown once 'findpenya' has pinned penya_off and a value has been read. It PULSES RED as you
+    // approach the in-game penya ceiling (max i32 = 2,147,483,647) - past that, farmed penya overflows and
+    // is lost, so this warns you to bank/spend. Hidden while the fence editor owns this corner.
+    if penya_show_s && !edit {
+      PENYA_CAP :: i64(2_147_483_647) // max(i32) - the in-game penya cap
+      PENYA_WARN :: PENYA_CAP - 25_000_000 // start warning 25M short of it
+      py := fh - 42
+      txt := fmt.ctprintf("%s", commafy(penya_cur_s))
+      coin_col := PENYA_COL
+      pfs: i32 = 14
+      if penya_cur_s >= PENYA_WARN {
+        // Near the cap: hammer it. A fast sine throbs a solid RED bar behind the readout, swells the number
+        // hard, and flashes the text yellow->white-hot for contrast. Impossible to miss.
+        p := f32(0.5 + 0.5 * math.sin(rl.GetTime() * 9.0))
+        pfs = 14 + i32(11 * p)
+        radar_alert_bg(6, py, f32(rl.MeasureText(txt, pfs)) + 34, p, {235, 40, 40})
+        coin_col = {255, u8(205 + 50 * p), u8(70 + 185 * p), 255} // yellow -> white
+      }
+      radar_draw_coin(19, py, coin_col)
+      rl.DrawText(txt, 31, i32(py) - pfs / 2, pfs, coin_col)
     }
 
     // Bottom-left bag readout: a small pouch glyph + free/total slots. Hidden while the fence editor owns
@@ -2292,25 +2388,25 @@ cli_radar :: proc(session: ^Session, args: []string) {
     if inv_have && !edit {
       by := fh - 15
       full := inv_used == inv_cap
+      txt := fmt.ctprintf("%d/%d", inv_used, inv_cap)
       bag_col := rl.Color{170, 180, 192, 255}
       fs: i32 = 14
       if full {
-        // Full bag: pulse the whole readout so it can't be missed. A sine on wall time throbs the color
-        // between the base orange and a hot yellow-white, and swells the number a couple pixels in sync.
-        p := f32(0.5 + 0.5 * math.sin(rl.GetTime() * 6.0))
-        base := [3]f32{235, 120, 70}
-        hot := [3]f32{255, 226, 120}
-        bag_col = {u8(base.r + (hot.r - base.r) * p), u8(base.g + (hot.g - base.g) * p), u8(base.b + (hot.b - base.b) * p), 255}
-        fs = 14 + i32(4 * p)
+        // Full bag: hammer it too - a throbbing ORANGE bar behind the readout, a hard size swell, and the
+        // number flashing orange->white. Same loud idiom as the penya cap warning above.
+        p := f32(0.5 + 0.5 * math.sin(rl.GetTime() * 8.0))
+        fs = 14 + i32(10 * p)
+        radar_alert_bg(6, by, f32(rl.MeasureText(txt, fs)) + 34, p, {240, 120, 30})
+        bag_col = {255, u8(210 + 45 * p), u8(80 + 175 * p), 255} // orange -> white
       }
       radar_draw_bag(19, by, bag_col)
       // Anchor the number's left edge + vertical center so the size pulse grows in place, not off-corner.
-      rl.DrawText(fmt.ctprintf("%d/%d", inv_used, inv_cap), 31, i32(by) - fs / 2, fs, bag_col)
+      rl.DrawText(txt, 31, i32(by) - fs / 2, fs, bag_col)
     }
 
     // Sound mute button (top-left): one-click toggle of the radar SFX. Same state/command path as the
     // Options "Sound" button, just always reachable. Click is gated out of map input via mouse_in_panel.
-    mute_hov := rl.CheckCollisionPointRec(mouse, MUTE_BTN_RECT) && !ps.setup_open && !ps.options_open
+    mute_hov := rl.CheckCollisionPointRec(mouse, MUTE_BTN_RECT) && !ps.setup_open && !ps.options_open && !ps.leaderboard_open
     rl.DrawRectangleRounded(MUTE_BTN_RECT, 0.5, 6, mute_hov ? rl.Color{54, 72, 94, 235} : rl.Color{26, 34, 44, 210})
     rl.DrawRectangleRoundedLines(MUTE_BTN_RECT, 0.5, 6, rl.Color{70, 84, 100, 255})
     mute_glyph := sfx_on_s ? (mute_hov ? rl.RAYWHITE : rl.Color{170, 180, 192, 255}) : rl.Color{110, 118, 130, 255}
@@ -2325,7 +2421,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // "?" legend badge (replaces the old always-on HUD text): hover for the legend + hotkeys, top-right
     // of the map region. Tooltip-only, so the map stays clean.
     badge := rl.Rectangle{fw - PANEL_W - 40, 8, 28, 26}
-    badge_hov := rl.CheckCollisionPointRec(mouse, badge) && !ps.setup_open && !ps.options_open
+    badge_hov := rl.CheckCollisionPointRec(mouse, badge) && !ps.setup_open && !ps.options_open && !ps.leaderboard_open
     rl.DrawRectangleRounded(badge, 0.5, 6, badge_hov ? rl.Color{54, 72, 94, 235} : rl.Color{26, 34, 44, 210})
     rl.DrawRectangleRoundedLines(badge, 0.5, 6, rl.Color{70, 84, 100, 255})
     rl.DrawText("?", i32(badge.x + 10), i32(badge.y + 4), 18, badge_hov ? rl.RAYWHITE : rl.Color{150, 160, 172, 255})
@@ -2342,7 +2438,8 @@ cli_radar :: proc(session: ^Session, args: []string) {
         "L: lock on player    C/Home: recenter",
         "RMB-drag: pan        wheel: zoom   ESC: close",
         "",
-        "edit mode:  1/2/3: draw   4: erase   Tab: +/-",
+        "edit mode:  1/2/3: draw   4: erase",
+        "  Tab: +include / -exclude / !avoid(no-go)",
         "  A: fence on/off   Enter: close poly",
         "  Bksp: undo   Del: clear   E: done",
       }
@@ -2359,7 +2456,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
     pw := PANEL_W - 24
     y := f32(12)
     rl.GuiUnlock() // clear any stale lock leaked from a prior frame -> panel never gets stuck in DISABLED
-    if ps.setup_open || ps.options_open {rl.GuiLock()} // freeze the background widgets while a modal is up
+    if ps.setup_open || ps.options_open || ps.leaderboard_open {rl.GuiLock()} // freeze the background widgets while a modal is up
 
     // header + setup status lights + optional pins (hover a missing one for the fix)
     rl.DrawText(fmt.ctprintf("%s", status_hdr), i32(x0), i32(y), 11, PANEL_HDR)
@@ -2579,6 +2676,17 @@ cli_radar :: proc(session: ^Session, args: []string) {
     if rl.GuiButton({x0, y, pw, 26}, cam_lock ? "Lock on player: ON" : "Lock on player: off") {cam_lock = !cam_lock}
     y += 30
     if rl.GuiButton({x0, y, pw, 26}, "Jump (Space)") {panel_enqueue(&ps, "jump")}
+
+    // Leaderboards trigger: bottom-center of the sidebar, absolutely positioned (independent of the flow
+    // `y` cursor, like MUTE_BTN_RECT), shown ONLY when leaderboard_url is set (lb_configured_s snapshot).
+    if lb_configured_s {
+      lbw := f32(160)
+      lbh := f32(30)
+      if rl.GuiButton({px + (PANEL_W - lbw) / 2, fh - lbh - 12, lbw, lbh}, "Leaderboards...") {
+        ps.leaderboard_open = true
+        ps.lb_seeded = false
+      }
+    }
 
     // hovered status-light tooltip (on top of the panel)
     if tooltip != nil {
@@ -3112,6 +3220,146 @@ cli_radar :: proc(session: ^Session, args: []string) {
         panel_tooltip_lines(mouse.x + 14, ty, otip, fw)
       }
     }
+
+    // --- Leaderboards modal (submit a timed run + browse the board; trigger gated on leaderboard_url) ---
+    if ps.leaderboard_open {
+      rl.GuiUnlock()
+      rl.DrawRectangle(0, 0, i32(fw), i32(fh), rl.Color{0, 0, 0, 150})
+      lw := f32(474)
+      lh := f32(590)
+      lx := (fw - lw) / 2
+      ly := (fh - lh) / 2
+      rl.GuiPanel({lx, ly, lw, lh}, "leaderboards")
+      ix := lx + 14
+      iw := lw - 28
+      yy := ly + 34
+      if !ps.lb_seeded {
+        ps.lb_seeded = true
+        ps.lb_sort = i32(lb_board_sort_s) // reflect whatever sort the board currently holds
+        ps.lb_name_edit = false
+      }
+
+      // RECORDING group: name box + Start/Stop + Submit + live stats.
+      rl.DrawText("RECORDING", i32(ix), i32(yy), 13, PANEL_HDR)
+      yy += 20
+      if rl.GuiTextBox({ix, yy, iw, 28}, cstring(&ps.lb_name_buf[0]), i32(len(ps.lb_name_buf)), ps.lb_name_edit) {
+        ps.lb_name_edit = !ps.lb_name_edit
+      }
+      rl.DrawText("name shown on the board", i32(ix), i32(yy + 30), 10, PANEL_DIM)
+      yy += 48
+      lbhalf := (iw - 10) / 2
+      start_lbl: cstring = lb_active_s ? "Stop recording" : "Start recording"
+      if rl.GuiButton({ix, yy, lbhalf, 28}, start_lbl) {
+        panel_enqueue(&ps, lb_active_s ? "leaderboard stop" : "leaderboard start")
+      }
+      nm_typed := strings.trim_space(panel_buf_str(ps.lb_name_buf[:]))
+      submit_ready := lb_has_run_s && lb_elapsed_s >= LB_MIN_SEC && !lb_busy_s && !lb_submitted_s && nm_typed != ""
+      submit_rect := rl.Rectangle{ix + lbhalf + 10, yy, lbhalf, 28}
+      if !submit_ready {rl.GuiDisable()}
+      if rl.GuiButton(submit_rect, "Submit run") {
+        clean, _ := strings.remove_all(nm_typed, ";", context.temp_allocator) // guard the ';' command splitter
+        panel_enqueue(&ps, fmt.tprintf("leaderboard submit %s", clean))
+      }
+      if !submit_ready {rl.GuiEnable()}
+      // Explain WHY submit is greyed out (drawn on top at the end of the modal so nothing covers it).
+      submit_tip: cstring = nil
+      if !submit_ready && rl.CheckCollisionPointRec(mouse, submit_rect) {
+        if !lb_has_run_s {
+          submit_tip = "Press \"Start recording\" first."
+        } else if lb_submitted_s {
+          submit_tip = "This run is already on the board - Start a new run to submit again."
+        } else if nm_typed == "" {
+          submit_tip = "Enter a name to appear on the board."
+        } else if lb_busy_s {
+          submit_tip = "A submission is already in flight..."
+        } else {
+          rem := LB_MIN_SEC - lb_elapsed_s
+          submit_tip = fmt.ctprintf("Record at least %d min to submit - %d:%02d more to go.", LB_MIN_SEC / 60, rem / 60, rem % 60)
+        }
+      }
+      yy += 34
+      run_state := lb_active_s ? "RECORDING" : (lb_has_run_s ? "stopped" : "idle")
+      rl.DrawText(fmt.ctprintf("%s   %s   %d kills   %d penya", run_state, fmt_elapsed(i64(lb_elapsed_s) * 1_000_000_000), lb_kills_s, lb_penya_s), i32(ix), i32(yy), 11, rl.RAYWHITE)
+      yy += 16
+      if lb_elapsed_s >= LB_MIN_SEC {
+        rl.DrawText(fmt.ctprintf("%.1f kpm   peak-density %d   %d species   -   READY to submit", lb_kpm_s, lb_density_s, lb_species_s), i32(ix), i32(yy), 11, PANEL_DIM)
+      } else {
+        rem := LB_MIN_SEC - lb_elapsed_s
+        rl.DrawText(fmt.ctprintf("%.1f kpm   peak-density %d   %d species   -   %d:%02d until submit", lb_kpm_s, lb_density_s, lb_species_s, rem / 60, rem % 60), i32(ix), i32(yy), 11, PANEL_DIM)
+      }
+      yy += 22
+      rl.DrawLine(i32(ix), i32(yy), i32(ix + iw), i32(yy), PANEL_SEP)
+      yy += 8
+
+      // BOARD group: sort toggle (re-fetches on change) + Refresh + rows with a per-row "cfg" download.
+      rl.DrawText("BOARD", i32(ix), i32(yy), 13, PANEL_HDR)
+      if rl.GuiButton({ix + iw - 80, yy - 4, 80, 22}, "Refresh") {
+        panel_enqueue(&ps, fmt.tprintf("leaderboard refresh %s", LB_SORTS[clamp(int(ps.lb_sort), 0, len(LB_SORTS) - 1)]))
+      }
+      yy += 20
+      prev_sort := ps.lb_sort
+      rl.GuiToggleGroup({ix, yy, (iw - 8) / 5, 22}, "penya;kpm;kills;mobs;dens", &ps.lb_sort)
+      if ps.lb_sort != prev_sort {
+        panel_enqueue(&ps, fmt.tprintf("leaderboard refresh %s", LB_SORTS[clamp(int(ps.lb_sort), 0, len(LB_SORTS) - 1)]))
+      }
+      yy += 28
+      cx_rank := ix
+      cx_name := ix + 24
+      cx_kills := ix + 166
+      cx_penya := ix + 212
+      cx_kpm := ix + 296
+      cx_dens := ix + 342
+      cx_cfg := ix + iw - 42
+      rl.DrawText("#", i32(cx_rank), i32(yy), 10, PANEL_DIM)
+      rl.DrawText("name", i32(cx_name), i32(yy), 10, PANEL_DIM)
+      rl.DrawText("kills", i32(cx_kills), i32(yy), 10, PANEL_DIM)
+      rl.DrawText("penya", i32(cx_penya), i32(yy), 10, PANEL_DIM)
+      rl.DrawText("kpm", i32(cx_kpm), i32(yy), 10, PANEL_DIM)
+      rl.DrawText("dns", i32(cx_dens), i32(yy), 10, PANEL_DIM)
+      yy += 14
+      rl.DrawLine(i32(ix), i32(yy), i32(ix + iw), i32(yy), PANEL_SEP)
+      yy += 4
+      max_rows := 13
+      if len(lb_rows_s) == 0 {
+        rl.DrawText("(no entries yet - press Refresh)", i32(ix), i32(yy + 4), 11, PANEL_DIM)
+      }
+      shown := min(len(lb_rows_s), max_rows)
+      for ri in 0 ..< shown {
+        r := &lb_rows_s[ri]
+        ry := yy + f32(ri) * 20
+        nm := panel_buf_str(r.name[:])
+        if len(nm) > 18 {nm = nm[:18]}
+        rl.DrawText(fmt.ctprintf("%d", ri + 1), i32(cx_rank), i32(ry + 3), 11, rl.RAYWHITE)
+        rl.DrawText(fmt.ctprintf("%s", nm), i32(cx_name), i32(ry + 3), 11, rl.RAYWHITE)
+        rl.DrawText(fmt.ctprintf("%d", r.kills), i32(cx_kills), i32(ry + 3), 11, rl.RAYWHITE)
+        rl.DrawText(fmt.ctprintf("%d", r.penya), i32(cx_penya), i32(ry + 3), 11, rl.RAYWHITE)
+        rl.DrawText(fmt.ctprintf("%.1f", r.kpm), i32(cx_kpm), i32(ry + 3), 11, rl.RAYWHITE)
+        rl.DrawText(fmt.ctprintf("%d", r.max_density), i32(cx_dens), i32(ry + 3), 11, rl.RAYWHITE)
+        if rl.GuiButton({cx_cfg, ry, 40, 18}, "cfg") {
+          panel_enqueue(&ps, fmt.tprintf("leaderboard getcfg %d", r.id))
+        }
+      }
+
+      // status line + Close (anchored to the modal bottom, independent of the row count above)
+      if lb_status_s != "" {
+        rl.DrawText(fmt.ctprintf("%s", lb_status_s), i32(ix), i32(ly + lh - 62), 11, rl.Color{150, 200, 160, 255})
+      }
+      if rl.GuiButton({ix, ly + lh - 40, iw, 28}, "Close") {
+        ps.leaderboard_open = false
+        ps.lb_name_edit = false
+      }
+      // disabled-Submit explanation, drawn last so it sits above the whole modal
+      if submit_tip != nil {
+        tw := rl.MeasureText(submit_tip, 12)
+        tx := mouse.x + 14
+        ty := mouse.y + 18
+        if tx + f32(tw) + 10 > fw {tx = fw - f32(tw) - 10}
+        rl.DrawRectangle(i32(tx - 4), i32(ty - 3), tw + 10, 20, rl.Color{12, 16, 22, 250})
+        rl.DrawRectangleLines(i32(tx - 4), i32(ty - 3), tw + 10, 20, rl.Color{90, 100, 115, 255})
+        rl.DrawText(submit_tip, i32(tx + 1), i32(ty), 12, rl.RAYWHITE)
+      }
+    }
+
     rl.EndDrawing()
     } // end Radar_Draw zone scope (free_all / relock / drain below run outside the draw zone)
 

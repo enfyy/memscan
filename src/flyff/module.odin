@@ -182,6 +182,8 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_position(s, args)
   case "findmove":
     cli_findmove(s, args)
+  case "leaderboard", "lb":
+    cli_leaderboard(s, args)
   case:
     return false
   }
@@ -255,8 +257,14 @@ on_attach :: proc(es: ^engine.Session) {
   clear(&s.penya_events)
   s.kill_seq = 0
   clear(&s.kill_events)
+  s.last_kill_ns = 0
   s.manual_kill_obj = 0
   s.manual_kill_recorded = false
+
+  // Fresh leaderboard recording span for the new process (see leaderboard.odin).
+  lb_run_reset(s)
+  s.lb_net_busy = false
+  s.lb_status_buf[0] = 0
 
   if s.ptr_size == 4 && s.layout.sendsettarget_rva != 0 && s.layout.objid_off != 0 {
     fmt.println("srvsync: ON (default). 'srvsync off' to disable.")
@@ -298,6 +306,8 @@ on_close :: proc(es: ^engine.Session) {
   }
   delete(s.last_auto_names)
   tc_scan_invalidate(s) // free an unconsumed background batch; an in-flight worker self-discards
+  lb_run_free(s) // free the leaderboard run's monster-name map + keys
+  delete(s.lb_board)
   delete(s.penya_events)
   delete(s.kill_events)
   delete(s.tc_recent)
@@ -359,9 +369,11 @@ farming (day to day)
                              fix), a Setup dialog, the auto-farm toggle, a mob search + chip picker, the
                              attack_range slider, and fence/view buttons. same window as 'radar'.
   fence [sub]                geo-fence: never target mobs outside a drawn area. no arg = status. subs:
-                             add circle <r>|<x,z> <r> [-] / add rect <halfx,halfz>|<min> <max> [-] /
+                             add circle <r>|<x,z> <r> [-|!] / add rect <halfx,halfz>|<min> <max> [-|!] /
                              poly start|point|end / undo / erase <x,z> / clear / on / off / test <x,z> /
-                             save <name> / load <name> / list. a trailing '-' makes a carve-out (exclude).
+                             save <name> / load <name> / list. trailing tag: '+' include (default), '-' exclude
+                             (carve-out; don't target inside), '!' AVOID (a hard no-go: don't target inside OR
+                             behind it, and the player never walks through it - e.g. a tower teleport pad).
                              adding a shape auto-activates the gate; 'fence off' overrides without clearing.
   ring [radius] [Ns]         draw your attack_range as a cyan circle on the ground (follows you, ~30s,
                              non-blocking); attack a mob to see if the ring reaches it. 'ring off' stops
@@ -426,4 +438,22 @@ deep recon (rarely needed)
   findpenya <penya> [span]   pin penya_off (your gold field) by its value -> radar '+penya' pop.
                              read your penya off the UI; if ambiguous, kill a mob + re-run w/ the new value
   findinv [slots]            auto-pin inv_off + item_stride (no value needed) -> enables 'inv'
-  inv                        report inventory fill (used/free/capacity, FULL); needs 'findinv'`
+  inv                        report inventory fill (used/free/capacity, FULL); needs 'findinv'
+
+leaderboards (submit a timed farm run to a self-hosted backend)
+  set leaderboard_url <url>  point the client at your backend (e.g. https://host/); enables everything below.
+                             'set leaderboard_url -' (or "" / off) clears it. saves flyff.cfg
+  leaderboard start   (lb)   begin a recording span: kills, penya collected, peak local density, and the set
+                             of monster species farmed accrue while it runs
+  leaderboard stop           freeze the span (keeps the numbers for inspection / submit)
+  leaderboard status         span progress + whether the 5-min minimum is met + last network result
+  leaderboard submit <name>  finalize + POST the run under <name> (needs >=5 min). Uploads your farming
+                             setup (behavior keys only, never memory offsets). Runs off the main loop (no UI hitch)
+  leaderboard top [sort]     fetch + print the board. sort: penya|kpm|kills|monsters|density (default penya)
+  leaderboard getcfg <id> [path]  download entry <id>'s flyff.cfg (to path, or flyff_<id>.cfg)
+  set lb_penya_cap <n>       anti-cheat: penya counts ONLY gains paired with a recent kill AND <= <n> (default
+                             10M) - for BOTH the panel "penya:" total and a submission. A 100M Perin is ignored.
+                             cheat-proofing is layered + honest: build-hash gate + HMAC signing + server-side
+                             plausibility (>=5 min, rate caps) + rate limiting. A memory tool's self-reported
+                             stats are still spoofable by a determined attacker - this raises the bar, not anti-cheat.
+  the "Leaderboards..." button appears at the bottom of the radar sidebar once leaderboard_url is set.`

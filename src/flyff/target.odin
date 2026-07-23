@@ -155,7 +155,10 @@ tc_cand_skip :: proc(session: ^Session, ctx: Pick_Ctx, cands: []TC_Cand, i: int,
     return true
   }
   if ctx.fence_on && !fence_contains(session.fence, c.pos[0], c.pos[2]) {
-    return true // outside the configured geo-fence area
+    return true // outside the configured geo-fence area (or inside an exclude/avoid carve-out)
+  }
+  if ctx.fence_on && fence_blocks_path(session.fence, ctx.player_pos[0], ctx.player_pos[2], c.pos[0], c.pos[2]) {
+    return true // an avoid(!) zone lies across the path - can't reach this mob without entering the no-go zone
   }
   return false
 }
@@ -803,6 +806,7 @@ tc_finish_select :: proc(
     session.auto_sel_pos = chosen.pos
     session.auto_sel_obj = chosen.obj
     session.auto_sel_set = true
+    lb_note_commit(session, chosen.obj, len(dens) == len(cands) ? dens[idx] : 0) // leaderboard kill attribution (no-op unless recording)
     // Carry the cluster commitment forward (density feature). Forced off when the toggle is off, so
     // switching density off mid-run cleans the state up immediately.
     if session.layout.density_on {
@@ -976,6 +980,9 @@ tc_precompute_still_valid :: proc(session: ^Session, obj: uintptr, cached_pos: [
   }
   if session.fence.active && !fence_contains(session.fence, lp[0], lp[2]) {
     return {}, false // drifted outside the geo-fence
+  }
+  if session.fence.active && fence_blocks_path(session.fence, player_pos[0], player_pos[2], lp[0], lp[2]) {
+    return {}, false // an avoid(!) zone now sits across the path to it
   }
   return lp, true
 }

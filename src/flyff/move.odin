@@ -48,6 +48,10 @@ cli_moveto :: proc(session: ^Session, args: []string) {
   } else {
     dest = {f32(coords[0]), f32(coords[1]), f32(coords[2])}
   }
+  if !fence_move_ok(session.fence, ppos, dest) {
+    fmt.eprintln("moveto: refused - the destination is inside or behind an avoid(!) zone.")
+    return
+  }
   d := engine.dist_horizontal(ppos, dest)
   if !write_dest_pos(session, ppos, dest) {
     fmt.eprintln("moveto failed (couldn't write the destination fields - is the player resolved?).")
@@ -70,6 +74,11 @@ cli_moveto :: proc(session: ^Session, args: []string) {
 // (m_vPos - dest) > 0, which is exactly what ProcessMove recomputes and compares each tick; a mismatch
 // makes it think it already passed the target and arrive instantly.
 write_dest_pos :: proc(session: ^Session, cur: [3]f32, dest: [3]f32) -> bool {
+  // Never route the player into or through an avoid(!) fence zone (auto approach / side-step / hunt all
+  // funnel through here). Escaping a zone you're already in is allowed (see fence_move_ok).
+  if !fence_move_ok(session.fence, cur, dest) {
+    return false
+  }
   handle := session.proc_info.handle
   player := read_ptr_at(handle, session.proc_info.base + session.layout.player_rva, engine.Value_Type.U32)
   if player == 0 {

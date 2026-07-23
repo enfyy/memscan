@@ -1,0 +1,38 @@
+# systemd unit for the memscan leaderboard backend.
+# Install: copy the built binary to /usr/local/bin, create /etc/memscan-leaderboard.env with the
+# LB_* variables (chmod 600 - it holds LB_SECRET), then:
+#   sudo cp memscan-leaderboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now memscan-leaderboard
+# Put nginx/Caddy in front for TLS and proxy to 127.0.0.1:8080.
+
+[Unit]
+Description=memscan leaderboard backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EnvironmentFile holds LB_SECRET, LB_ALLOWED_HASHES, LB_MIN_SEC, LB_DB_PATH, LB_LISTEN, ...
+EnvironmentFile=/etc/memscan-leaderboard.env
+ExecStart=/usr/local/bin/memscan-leaderboard
+Restart=on-failure
+RestartSec=3
+
+# Run unprivileged with its own state dir (/var/lib/memscan-lb). Point LB_DB_PATH there.
+DynamicUser=yes
+StateDirectory=memscan-lb
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
