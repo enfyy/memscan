@@ -866,11 +866,21 @@ cli_objects :: proc(session: ^Session, args: []string) {
 // object-collision reach: segment vs each nearby OBB (placed props the grid misses)
 // ---------------------------------------------------------------------------
 
+// The two collidable CObj types, by m_dwType (see ot_name). Worth naming: the distinction is load-bearing
+// for anything that asks "can I WALK here" rather than "is the sightline clear" - OT_CTRL boxes (walls,
+// housing, railings) are solid all the way down, while an OT_OBJ prop's box is the whole model silhouette,
+// so a tree's canopy makes its OBB far wider than the trunk you actually bump into. See sweep_obj_block.
+OT_OBJ :: u32(0) // static props: trees, rocks, bushes
+OT_CTRL :: u32(3) // walls, housing, railings (plus ground drops / effect zones, filtered by CTRL_DROP_MAX_*)
+
 Obb :: struct {
   center:     [3]f32,
   ext:        [3]f32, // HALF-extents
   axis:       [3][3]f32, // orthonormal box axes
+  ty:         u32, // m_dwType: OT_OBJ / OT_CTRL (the only two collected). See the note above.
   decorative: bool, // OT_OBJ with no dedicated collision mesh (GMT_ERROR) - walk-through, not a real blocker
+  obj:        uintptr, // the live CObj* this box came from (0 = unknown). Set by obj_to_obb so the radar's
+  // inspect mode can trace a clicked box back to its object and re-read identity. Reach math never uses it.
 }
 
 // Read CObj::m_OBB (BBOX at pos_off-0x3C): Center(+0x0), Extent[3](+0xC), Axis[3][3](+0x18). sizeof 0x3C.
@@ -906,6 +916,17 @@ point_in_obb :: proc(p: [3]f32, o: Obb) -> bool {
   return true
 }
 
+// Is world point (wx,wz) inside the OBB's xz FOOTPRINT? The vertical axis is ignored (a mouse pick on the
+// top-down radar has no world Y), so this projects onto axis[0]/axis[2] only - the same footprint
+// radar_draw_obb renders. Used by the radar inspect mode to map a click to the box under the cursor.
+point_in_obb_xz :: proc(wx, wz: f32, o: Obb) -> bool {
+  dx := wx - o.center[0]
+  dz := wz - o.center[2]
+  u := dx * o.axis[0][0] + dz * o.axis[0][2] // project onto axis[0]'s xz
+  v := dx * o.axis[2][0] + dz * o.axis[2][2] // project onto axis[2]'s xz
+  return math.abs(u) <= o.ext[0] && math.abs(v) <= o.ext[2]
+}
+
 // Segment (p0->p1) vs OBB via slab clip in the box's local frame. Mirrors IntrSegment3Box3_Test.
 seg_vs_obb :: proc(p0, p1: [3]f32, o: Obb) -> bool {
   s0, d: [3]f32
@@ -934,6 +955,24 @@ seg_vs_obb :: proc(p0, p1: [3]f32, o: Obb) -> bool {
     }
   }
   return true
+}
+
+// Does one collider box obstruct the horizontal segment (ax,ay,az)->(bx,ay,bz)? The per-box half of the
+// object oracle, factored out so every caller applies the SAME four rules: walk-through props don't
+// count, far boxes are pruned, standing inside a box (a loose canopy we're already under) is not an
+// approach blocker, and the rest is a slab clip. Shared by obj_segment_blocked (the reach oracle) and
+// sweep_obj_block (which classifies the hit by type instead of just returning "blocked").
+obb_blocks_segment :: proc(o: Obb, ax, ay, az, bx, bz: f32) -> bool {
+  if o.decorative {
+    return false // no dedicated collision mesh -> the game walks straight through it (bush/grass)
+  }
+  if seg_dist_2d(o.center[0], o.center[2], ax, az, bx, bz) > 48 {
+    return false
+  }
+  if point_in_obb({ax, ay, az}, o) {
+    return false
+  }
+  return seg_vs_obb({ax, ay, az}, {bx, ay, bz}, o)
 }
 
 // Horizontal distance from point (px,pz) to segment (ax,az)-(bx,bz). Prune for the object scan.
@@ -976,6 +1015,9 @@ obj_obb_blocks :: proc(session: ^Session, obj: uintptr, ax, az, bx, bz, knee: f3
   ty := rd_u32le(buf[:], po + 0x10)
   if ty != 0 && ty != 3 {
     return // OT_OBJ (trees/rocks/buildings) or OT_CTRL (walls/railings/housing) only
+  }
+  if collider_denied(session, ty, rd_u32le(buf[:], po + 0x14)) {
+    return // ignore-listed kind - never blocks (mirrors obj_to_obb's drop for the cached path)
   }
   rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
   px, pz := rf(buf[:], po), rf(buf[:], po + 8)
@@ -1020,16 +1062,7 @@ obj_segment_blocked :: proc(session: ^Session, ax, ay, az, bx, bz: f32, allow_as
       obbs := collect_area_colliders(session, world, ax, az, allow_async)
       ok_scan = true
       for o in obbs {
-        if o.decorative {
-          continue // no dedicated collision mesh -> walk-through (bush/grass)
-        }
-        if seg_dist_2d(o.center[0], o.center[2], ax, az, bx, bz) > 48 {
-          continue
-        }
-        if point_in_obb({ax, knee, az}, o) {
-          continue // standing inside it (loose canopy) - not an approach blocker
-        }
-        if seg_vs_obb({ax, knee, az}, {bx, knee, bz}, o) {
+        if obb_blocks_segment(o, ax, knee, az, bx, bz) {
           return true, o, true
         }
       }
@@ -1199,6 +1232,7 @@ collect_nearby_obbs :: proc(session: ^Session, cx, cz, radius: f32) -> [dynamic]
     o.axis[0] = {rf(buf[:], oo + 0x18), rf(buf[:], oo + 0x1C), rf(buf[:], oo + 0x20)}
     o.axis[1] = {rf(buf[:], oo + 0x24), rf(buf[:], oo + 0x28), rf(buf[:], oo + 0x2C)}
     o.axis[2] = {rf(buf[:], oo + 0x30), rf(buf[:], oo + 0x34), rf(buf[:], oo + 0x38)}
+    o.ty = ty
     o.decorative = obj_is_decorative(session, p, ty)
     append(&out, o)
   }
@@ -1248,6 +1282,9 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
   if ty != 0 && ty != 3 {
     return // OT_OBJ (trees/rocks/buildings) or OT_CTRL (walls/housing) only - the collidable props
   }
+  if collider_denied(session, ty, rd_u32le(buf[:], po + 0x14)) {
+    return // this kind (m_dwType + m_dwIndex) is on the radar-inspect ignore-list - drop it entirely
+  }
   rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
   pos = {rf(buf[:], po), rf(buf[:], po + 4), rf(buf[:], po + 8)}
   oo := po - 0x3C
@@ -1261,7 +1298,9 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
   o.axis[0] = {rf(buf[:], oo + 0x18), rf(buf[:], oo + 0x1C), rf(buf[:], oo + 0x20)}
   o.axis[1] = {rf(buf[:], oo + 0x24), rf(buf[:], oo + 0x28), rf(buf[:], oo + 0x2C)}
   o.axis[2] = {rf(buf[:], oo + 0x30), rf(buf[:], oo + 0x34), rf(buf[:], oo + 0x38)}
+  o.ty = ty
   o.decorative = obj_is_decorative(session, obj, ty)
+  o.obj = obj // keep the object handle so the radar inspect mode can trace this box back to its CObj
   ok = true
   return
 }
@@ -1356,6 +1395,85 @@ Collider_Job_Req :: struct {
   world:   uintptr,
   px, pz:  f32,
   gen:     int,
+}
+
+// Force the next collect_area_colliders to rebuild: mark the cache stale AND bump the job generation so an
+// in-flight (pre-change) background rebuild's publish is discarded. Called after the ignore-list changes so
+// a newly-ignored kind leaves the cache (and the radar) on the next scan. Caller holds exec_mutex.
+collider_cache_invalidate :: proc(session: ^Session) {
+  session.collider_cache_valid = false
+  session.collider_job.gen += 1
+}
+
+// Add or remove an object kind (type + index) from the collider ignore-list, invalidate the cache so the
+// change takes effect on the next scan, and persist to flyff.cfg. Returns added=true if it was added (false
+// if removed); ok=false only when the list is full. Caller must hold exec_mutex (mutates layout + cache).
+collider_ignore_toggle :: proc(session: ^Session, ty, idx: u32) -> (added: bool, ok: bool) {
+  L := &session.layout
+  for i in 0 ..< int(L.collider_ignore_n) {
+    if L.collider_ignore[i].ty == ty && L.collider_ignore[i].idx == idx {
+      L.collider_ignore[i] = L.collider_ignore[L.collider_ignore_n - 1] // swap-with-last remove
+      L.collider_ignore_n -= 1
+      collider_cache_invalidate(session)
+      if session.attached {flyff_save_cfg(session.layout, flyff_cfg_path())}
+      return false, true
+    }
+  }
+  if int(L.collider_ignore_n) >= FLYFF_MAX_COLLIDER_IGNORE {
+    return false, false // full
+  }
+  L.collider_ignore[L.collider_ignore_n] = {ty, idx}
+  L.collider_ignore_n += 1
+  collider_cache_invalidate(session)
+  if session.attached {flyff_save_cfg(session.layout, flyff_cfg_path())}
+  return true, true
+}
+
+// collignore [clear | rm <ty> <idx>] - view or edit the collider ignore-list (object kinds dropped from
+// reach + the radar). No args = list it. Kinds are normally added by clicking a phantom box in the radar
+// inspect mode (key I); this command is the headless way to view or remove them. ty: 0=OT_OBJ, 3=OT_CTRL.
+cli_collignore :: proc(session: ^Session, args: []string) {
+  L := &session.layout
+  if len(args) > 0 {
+    switch args[0] {
+    case "clear":
+      n := int(L.collider_ignore_n)
+      L.collider_ignore_n = 0
+      collider_cache_invalidate(session)
+      if session.attached {flyff_save_cfg(session.layout, flyff_cfg_path())}
+      fmt.printfln("collignore: cleared %d kind(s).", n)
+      return
+    case "rm", "remove":
+      if len(args) < 3 {
+        fmt.println("usage: collignore rm <ty> <idx>   (ty: 0=OT_OBJ, 3=OT_CTRL)")
+        return
+      }
+      tv, tok := strconv.parse_int(args[1])
+      iv, iok := strconv.parse_int(args[2])
+      if !tok || !iok {
+        fmt.println("collignore: <ty> and <idx> must be integers.")
+        return
+      }
+      if !collider_denied(session, u32(tv), u32(iv)) {
+        fmt.printfln("collignore: %s(%d) idx=%d not in the list.", ot_name(u32(tv)), tv, iv)
+        return
+      }
+      collider_ignore_toggle(session, u32(tv), u32(iv)) // present -> removes it
+      fmt.printfln("collignore: removed %s(%d) idx=%d.", ot_name(u32(tv)), tv, iv)
+      return
+    }
+  }
+  n := int(L.collider_ignore_n)
+  if n == 0 {
+    fmt.println("collignore: empty. In the radar press I (inspect) and click a phantom box to ignore its kind.")
+    return
+  }
+  fmt.printfln("collignore: %d ignored kind(s) (hidden from reach + radar):", n)
+  for i in 0 ..< n {
+    k := L.collider_ignore[i]
+    fmt.printfln("  %s(%d) idx=%d", ot_name(k.ty), k.ty, k.idx)
+  }
+  fmt.println("  edit: 'collignore rm <ty> <idx>'  |  'collignore clear'")
 }
 
 // Kick a background collider-cache rebuild if none is already in flight. Caller holds exec_mutex (the
@@ -1730,6 +1848,21 @@ obj_coll_type :: proc(session: ^Session, obj: uintptr) -> (t: i32, ok: bool) {
   return
 }
 
+// Is this object "kind" (m_dwType + m_dwIndex) on the user's collider ignore-list? Kinds are curated by
+// clicking phantom boxes in the radar inspect mode (collider_ignore_toggle) and persisted in flyff.cfg. A
+// denied kind is dropped from the collider set in obj_to_obb / obj_obb_blocks, so a mis-collected effect
+// (e.g. a player-following OT_CTRL aura, index 1726) never walls off a mob or draws as a radar box. Reads
+// session.layout by reference (the list is a fixed array in the layout) so it's cheap in the per-object scan.
+collider_denied :: proc(session: ^Session, ty, idx: u32) -> bool {
+  for i in 0 ..< int(session.layout.collider_ignore_n) {
+    k := session.layout.collider_ignore[i]
+    if k.ty == ty && k.idx == idx {
+      return true
+    }
+  }
+  return false
+}
+
 // Is this prop decorative (the game's pursuit collision walks straight through it)? Mirrors
 // CWorld::ProcessCollision: OT_OBJ static props are tested with bNeedCollObject=TRUE, which SKIPS any
 // whose m_CollObject.m_Type == GMT_ERROR (no dedicated collision mesh - bushes/grass/butterflies).
@@ -1959,6 +2092,46 @@ collwatch_identify :: proc(session: ^Session, obj: uintptr, ppos: [3]f32, radius
     obj, ot_name(ty), ty, d, ext[0], ext[1], ext[2], coll_s,
   )
   return line, is_coll, true, true
+}
+
+// Build the multi-line identity readout for the radar inspect-mode tooltip: address, OT type + distance,
+// .o3d model name, collision-mesh type + box half-extents, and whether reach blocks on it (decorative
+// props are walk-through). Returns temp-allocated cstrings for the caller to draw this frame. Read-only;
+// mirrors collwatch_identify's fields. `o` is a cached Obb (its .obj is the live CObj*, 0 if unknown).
+collider_inspect_lines :: proc(session: ^Session, o: Obb, ppos: [3]f32) -> []cstring {
+  lines := make([dynamic]cstring, 0, 5, context.temp_allocator)
+  dx := o.center[0] - ppos[0]
+  dz := o.center[2] - ppos[2]
+  d := math.sqrt(dx * dx + dz * dz)
+  append(&lines, fmt.ctprintf("INSPECT  0x%08X", o.obj))
+  ty := u32(0xFFFFFFFF)
+  idx := u32(0)
+  if o.obj != 0 {
+    ty = u32(read_i32_at(session.proc_info.handle, o.obj + uintptr(session.layout.pos_off + 0x10)))
+    idx = u32(read_i32_at(session.proc_info.handle, o.obj + uintptr(session.layout.pos_off + 0x14)))
+  }
+  if ty == 0 || ty == 3 {
+    append(&lines, fmt.ctprintf("%s(%d) idx=%d   d=%.1f", ot_name(ty), ty, idx, d))
+  } else {
+    append(&lines, fmt.ctprintf("type ? idx=%d   d=%.1f", idx, d)) // object freed / read failed
+  }
+  model_s := "unknown"
+  mesh_s := "?"
+  if o.obj != 0 {
+    if fname, _, _, coll, cok := probe_model_coll(session, o.obj); cok {
+      model_s = fname // temp-allocated by probe_model_coll - survives the frame
+      mesh_s = gmt_name(coll)
+    }
+  }
+  append(&lines, fmt.ctprintf("model: %s", model_s))
+  append(&lines, fmt.ctprintf("mesh: %s   box=(%.1f,%.1f,%.1f)", mesh_s, o.ext[0], o.ext[1], o.ext[2]))
+  append(&lines, fmt.ctprintf("BLOCKS REACH: %s", o.decorative ? "no (walk-through)" : "yes"))
+  if (ty == 0 || ty == 3) && collider_denied(session, ty, idx) {
+    append(&lines, fmt.ctprintf("IGNORED  (collignore rm %d %d to restore)", ty, idx))
+  } else {
+    append(&lines, "click: ignore this kind (hides all like it)")
+  }
+  return lines[:]
 }
 
 // collwatch [seconds] [radius] - see the section header above.

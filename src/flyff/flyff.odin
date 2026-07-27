@@ -18,6 +18,23 @@ FLYFF_HP_OFF :: 0x814 // CMover current HP (LONG); 0 => dead/despawning (don't t
 // next field (+0x818) and equals currentHP at full health - calibrate_derive steps DOWN to this (lower)
 // offset so it never pins maxHP by mistake (maxHP never hits 0, so pets/corpses would misread as alive).
 FLYFF_PENYA_OFF :: 0 // player penya/gold (u32, inline in CMover); 0 => unpinned (run 'findpenya')
+
+// CMover::m_dwPetId - the SUMMONED-pet flag. Holds the inventory slot of the pet item while a system
+// pet (the loot-collecting kind) is out, and NULL_ID (0xFFFFFFFF) when none is. That is exactly the
+// client's own HasActivatedSystemPet() test (Mover.h: `return m_dwPetId != NULL_ID`).
+//
+// Located by summon/unsummon diffing the player object on this build: it read 0xFFFFFFFF with the pet
+// away and 0x89 (slot 137) with a "Baby Cow" out, reproducibly across three toggles. Note this is the
+// only reliable link - the player holds NO pointer to the pet object and the pet holds none back
+// (verified by scanning all writable memory for both addresses), so the association is by slot/OBJID
+// only. Build-specific like every other offset; re-pin by toggling the pet if a patch moves it.
+// 0 => the pet_active script event goes inert.
+FLYFF_PETID_OFF :: 0x15E0
+
+// The client's "no id / empty" sentinel (ProjectCmn.h). Used for m_idDest in dest-POS mode and as the
+// "no pet summoned" value of m_dwPetId. It was already being written as a bare 0xFFFFFFFF in a couple
+// of places; named here so the intent reads.
+NULL_ID :: u32(0xFFFFFFFF)
 // Leaderboard anti-cheat: a single penya gain larger than this is NOT credited to a recording span (it's
 // a Perin conversion / big trade / quest reward, not a kill drop). A Perin is 100,000,000 penya, so the
 // default sits well below that and above any realistic single-mob drop. Tune per server: `set lb_penya_cap`.
@@ -68,6 +85,14 @@ FLYFF_HMAP_OFF :: 0x0 // CLandscape.m_pHeightMap (float*, 129x129 corner grid)
 // attack_range <n>`. 0 => test the full path to the mob's cell.
 FLYFF_ATTACK_RANGE :: 1.7
 
+// Priority-ladder rung 2 radius (NOT a memory offset): a mob within this many world units of the player
+// is "on top of us" and is taken before the pack-stickiness ranking gets a say. Was a compiled-in 1.7,
+// which equalled the DEFAULT attack_range - so the melee rung and the pocket rung covered the identical
+// radius and rung 2 was a no-op out of the box. 3.0 matches ARRIVE_DIST (what the stuck monitor already
+// treats as "arrived / in combat"), so "close enough to be fighting" means one thing across the tool.
+// Clamped to the engage range by pick_ranges. `priority melee <range>` or `set melee_range <n>`.
+FLYFF_MELEE_RANGE :: f32(3.0)
+
 // Radar display: how far (world units) the radar gathers + draws mob dots around the player. Only the
 // mover blips - obstacle/collider gathering is a separate collision-driven radius (COLLIDER_RADIUS) and
 // is deliberately NOT tied to this. Clamped to [RADAR_RANGE_MIN, RADAR_RANGE_MAX] at use; a range past
@@ -103,6 +128,34 @@ FLYFF_REACH_GATE_ON :: true
 // without lookalive. Side-stepping walks the character, so it needs 'findmove' (else it just keeps
 // re-issuing the game's walk-in AI without stepping). See Session.hunt_on / cli_hunt.
 FLYFF_HUNT_ON :: false
+// Combat watch: hold off the target-drop fallbacks (stuck-plateau + reach re-watch) for as long as the
+// locked mob's HP is actually falling. Both fallbacks were written for a farm where mobs die in a hit or
+// two, so "we're not closing in" reliably meant "we're jammed"; against a tanky mob you legitimately
+// stand still for 10+ seconds while whittling it down, and they mis-read that as blocked and dropped the
+// target mid-fight. HP dropping is proof the fight is real, so nothing gets skipped; once damage stops
+// landing for combat_grace seconds the fallbacks come back and a genuinely blocked mob is still dropped.
+// combat_grace must comfortably exceed your slowest hit interval (cast time / attack speed).
+// See auto_combat_watch / auto_in_combat (autofarm.odin) + Session.combat_watch_on.
+FLYFF_COMBAT_WATCH_ON :: true
+FLYFF_COMBAT_GRACE :: f32(4.0) // seconds since the last HP drop that still count as "in a fight"
+
+// Stuck-detection enable. Session-authoritative like the others; the layout mirror exists only so it
+// PERSISTS - before this key it was the one auto toggle that silently reverted to on every restart.
+FLYFF_AUTO_STUCK_ON :: true
+
+// --- Priority ladder (see tc_pick_one) -------------------------------------------------------------
+// The pick cascade is an ordered ladder: each rung answers "is there a mob I should take before even
+// considering the next rung". These three switch the top rungs off individually, so the whole targeting
+// policy is inspectable and tunable instead of being implied by hardcoded gates. Rung order:
+//   1 aggro  - it is coming for ME (m_idDest == my objid), any distance
+//   2 melee  - within melee_range of me ("on top of us")
+//   3 avoid  - one-shot post-stuck steer (part of stuck recovery, not separately switchable)
+//   4 pocket - within attack_range, ranked nearest-to-last-kill (pack stickiness)
+//   5/6      - cluster + density detour (owned by `density on|off`)
+//   7 nearest- the always-on fallback
+FLYFF_AGGRO_FIRST_ON :: true // rung 1: a mob that is chasing/attacking us outranks everything
+FLYFF_MELEE_FIRST_ON :: true // rung 2: a mob on top of us outranks the pack-stickiness ranking
+FLYFF_POCKET_ON :: true      // rung 4: in-attack_range pack stickiness (off = fall straight to density/nearest)
 FLYFF_SFX_ON :: true
 FLYFF_FX_LASER_ON :: true
 
@@ -276,6 +329,16 @@ MOVERPROP_NAME_OFF :: 4 // MoverProp.szName sits right after the 4-byte dwID at 
 // overwritten by flyff.cfg on attach, re-derived by `calibrate`, and persisted back to the cfg.
 // Offsets are i64 (cast to uintptr at address sites); RVAs are uintptr; read_obj_type still
 // assumes m_dwType sits at pos_off+0x10 (TYPE_REL).
+// One entry in the collider ignore-list: an object "kind" (its m_dwType + m_dwIndex) the reach/radar
+// collider filter drops entirely. Curated by clicking phantom boxes in the radar inspect mode - keyed on
+// the kind (not an address) so it survives respawns. See collider_denied / collider_ignore_toggle.
+Collider_Kind :: struct {
+  ty:  u32, // m_dwType (OT_OBJ=0 / OT_CTRL=3 - the only collidable types)
+  idx: u32, // m_dwIndex (the object "kind" id, e.g. a ctrl effect id like 1726)
+}
+
+FLYFF_MAX_COLLIDER_IGNORE :: 32 // hand-curated list; fixed size so Flyff_Layout copies cleanly into snapshots
+
 Flyff_Layout :: struct {
   world_rva:         uintptr,
   player_rva:        uintptr,
@@ -285,6 +348,7 @@ Flyff_Layout :: struct {
   name_off:          i64,
   hp_off:            i64,
   penya_off:         i64,
+  petid_off:         i64, // CMover::m_dwPetId - != NULL_ID means a system pet is summoned
   inv_off:           i64,
   item_stride:       i64,
   model_off:         i64,
@@ -325,6 +389,13 @@ Flyff_Layout :: struct {
   la_max_range:      f32,  // look-alive: beyond this distance, approach in shrinking hops (world units)
   reach_gate_on:     bool, // cfg mirror of Session.reach_gate_on
   hunt_on:           bool, // cfg mirror of Session.hunt_on (commit-to-one-target hunt mode)
+  combat_watch_on:   bool, // cfg mirror of Session.combat_watch_on (hold the drop-fallbacks while HP falls)
+  combat_grace:      f32,  // seconds since the target's last HP drop that still count as "in a fight"
+  auto_stuck_on:     bool, // cfg mirror of Session.auto_stuck_on (stuck-plateau detection enable)
+  aggro_first_on:    bool, // cfg mirror of Session.aggro_first_on (ladder rung 1: mobs coming for us)
+  melee_first_on:    bool, // cfg mirror of Session.melee_first_on (ladder rung 2: mobs on top of us)
+  melee_range:       f32,  // rung 2 radius in world units (was the compiled-in MELEE_RANGE)
+  pocket_on:         bool, // cfg mirror of Session.pocket_on (ladder rung 4: in-range pack stickiness)
   sfx_on:            bool, // radar sound effects (penya chime + kill zap)
   fx_laser_on:       bool, // radar kill laser-beam effect
   trail_on:          bool, // radar display: fading player-path trail
@@ -359,6 +430,13 @@ Flyff_Layout :: struct {
   // (a Perin = 100M, a trade, a sale) are ignored so the board's penya reflects kill drops. See
   // FLYFF_LB_PENYA_CAP + lb_note_penya_gain (leaderboard.odin). `set lb_penya_cap <n>`.
   lb_penya_cap:      i64,
+
+  // Collider ignore-list: object kinds (type+index) the collider filter drops, so a mis-collected effect
+  // (e.g. a player-following OT_CTRL aura) never becomes a phantom wall or a radar box. Curated by clicking
+  // boxes in the radar inspect mode (key I). A FIXED array (not a slice) so the whole struct copies by value
+  // into the collider worker's Session snapshot without aliasing. collider_ignore_n = live count.
+  collider_ignore:   [FLYFF_MAX_COLLIDER_IGNORE]Collider_Kind,
+  collider_ignore_n: i32,
 }
 
 flyff_layout_default :: proc() -> Flyff_Layout {
@@ -371,6 +449,7 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     name_off          = FLYFF_NAME_OFF,
     hp_off            = FLYFF_HP_OFF,
     penya_off         = FLYFF_PENYA_OFF,
+    petid_off         = FLYFF_PETID_OFF,
     inv_off           = FLYFF_INV_OFF,
     item_stride       = FLYFF_ITEM_STRIDE,
     model_off         = FLYFF_MODEL_OFF,
@@ -411,6 +490,13 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     la_max_range      = FLYFF_LA_MAX_RANGE,
     reach_gate_on     = FLYFF_REACH_GATE_ON,
     hunt_on           = FLYFF_HUNT_ON,
+    combat_watch_on   = FLYFF_COMBAT_WATCH_ON,
+    combat_grace      = FLYFF_COMBAT_GRACE,
+    auto_stuck_on     = FLYFF_AUTO_STUCK_ON,
+    aggro_first_on    = FLYFF_AGGRO_FIRST_ON,
+    melee_first_on    = FLYFF_MELEE_FIRST_ON,
+    melee_range       = FLYFF_MELEE_RANGE,
+    pocket_on         = FLYFF_POCKET_ON,
     sfx_on            = FLYFF_SFX_ON,
     fx_laser_on       = FLYFF_FX_LASER_ON,
     trail_on          = FLYFF_TRAIL_ON,

@@ -63,6 +63,11 @@ Session :: struct {
   app_version:    string,
   app_build_hash: string,
 
+  // Session variables (see vars.odin). `var x 5` then `@x` anywhere in a command line; expanded by
+  // execute_line before dispatch, so every command inherits it. Keys and values are heap-owned
+  // (cloned on set, freed on rebind/clear); freed wholesale by session_close.
+  vars:          map[string]string,
+
   // ---- Module interface -------------------------------------------------------------------
   // A module (currently only flyff) registers these so the generic engine can call into it
   // without importing it. All are nil / false until flyff_register runs. Each proc receives a
@@ -135,4 +140,5 @@ session_close :: proc(session: ^Session) {
   free_all(virtual.arena_allocator(&session.scan_arena))
   delete(session.targets)
   delete(session.hotkeys)
+  session_vars_free(session)
 }

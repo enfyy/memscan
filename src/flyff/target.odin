@@ -17,6 +17,13 @@ TC_Cand :: struct {
   obj: uintptr,
   d:   f32, // horizontal (ground-plane) distance to the player - the picker's sort + range gates use it
   pos: [3]f32, // mob world position (for the post-stuck opposite-direction retarget)
+  // This mob is chasing/attacking US: its CMover.m_idDest (iddest_off) equals the player's own OBJID.
+  // The monster AI itself is server-side (CMover::m_pAIInterface is #ifdef __WORLDSERVER and Neuz never
+  // even compiles the AI classes), but the server mirrors its chase decision down to every client so the
+  // monster model can be animated walking at you - AIMonster2 AI2_TRACKING -> SetDestObj -> m_idDest,
+  // applied client-side by OnMoverSetDestObj for ANY visible mover. So this is a read of the server's
+  // real aggro decision, not a guess. Ladder rung 1 (see tc_pick_one). False when uncomputable.
+  aggro: bool,
 }
 
 // A mob target_closest recently selected. We skip these for TC_RECENT_NS so a just-killed
@@ -95,15 +102,46 @@ cand_reachable :: proc(session: ^Session, world: uintptr, player_pos, cand_pos: 
 // Which cascade stage selected a target (for the debug map + logs). Excluded = never eligible.
 // Cluster = continuing an existing cluster commitment; Density = a fresh pick where the mingain/detour
 // gate steered the walk to a denser pack instead of the nearest mob.
+// Sweep = a painted-lane pick (sweep mode owns the route, so only in-range mobs are eligible).
 TC_Stage :: enum {
   None,
+  Aggro,
   Melee,
   Avoid,
   Cluster,
   Pocket,
   Nearest,
   Density,
+  Sweep,
   Excluded,
+}
+
+// Human name for a ladder rung, shared by `priority`, the `auto` status line and the tdbg legend so the
+// three can't drift. Matches the numbering tc_pick_one actually runs in (which is NOT the enum order).
+tc_stage_name :: proc(s: TC_Stage) -> string {
+  switch s {
+  case .Aggro:
+    return "aggro"
+  case .Melee:
+    return "melee"
+  case .Avoid:
+    return "avoid"
+  case .Pocket:
+    return "pocket"
+  case .Cluster:
+    return "cluster"
+  case .Density:
+    return "density"
+  case .Nearest:
+    return "nearest"
+  case .Sweep:
+    return "sweep"
+  case .Excluded:
+    return "excluded"
+  case .None:
+    return "none"
+  }
+  return "none"
 }
 
 // Everything the pick cascade reads, snapshotted so a pick never touches live session state mid-run.
@@ -116,9 +154,13 @@ Pick_Ctx :: struct {
   // so "in range" always means "within attack_range of where I stand" (not of the rolling kill anchor).
   world:         uintptr, // for the reach gate (reads game memory; never mutated)
   now:           i64,
-  name_filtered: bool, // len(names) > 0 -> the melee fast-path is enabled
+  name_filtered: bool, // len(names) > 0 (reported by tdbg; no longer gates the melee rung)
   require_fresh: bool, // auto (true) vs manual target_closest (false)
+  aggro_on:      bool, // ladder rung 1 enabled (session.aggro_first_on)
+  melee_on:      bool, // ladder rung 2 enabled (session.melee_first_on)
+  pocket_on:     bool, // ladder rung 4 enabled (session.pocket_on)
   gate:          bool, // proactive reach filter on
+  sweep_on:      bool, // a painted lane is armed (session.sweep_on) - in-range-only selection, see tc_pick_one
   fence_on:      bool, // geo-fence gate on (session.fence.active) - skip mobs outside the fenced area
   avoid_on:      bool, // one-shot: prefer the opposite side from the last stuck mob
   avoid_dir:     [2]f32,
@@ -167,17 +209,75 @@ tc_cand_skip :: proc(session: ^Session, ctx: Pick_Ctx, cands: []TC_Cand, i: int,
 // run the SAME logic (no drift). Returns the index into cands of the pick and which stage chose it, or
 // (-1, .None) when nothing is eligible. Pure: reads ctx + game memory, mutates neither session nor ctx.
 // Cands MUST be sorted nearest-first (tc_collect_cands does this) - the melee/pocket range breaks rely
-// on it. Stages, in order: melee fast-path (name-filtered auto), opposite-side avoid (one-shot),
-// bow-pocket nearest-to-last-kill (in-range mobs ALWAYS win - the anchor leaves attack_range only when
-// it has to), cluster commitment (density on), switch-threshold density (density on), then plain
-// nearest. With density off the two density stages are dead code, so the cascade is exactly the v0.4.0
-// one (melee/avoid/pocket/nearest).
+// on it. The PRIORITY LADDER, in the order it actually runs (each rung fully answers the pick; only if
+// it finds nothing does the next get a say):
+//   1 aggro   - a mob that is coming for US (ctx.aggro_on)
+//   2 melee   - a mob on top of us, within ctx.melee (ctx.melee_on)
+//   3 avoid   - one-shot post-stuck steer to the opposite side (part of stuck recovery)
+//   4 pocket  - inside attack_range, ranked nearest-to-last-kill / pack stickiness (ctx.pocket_on)
+//   5 cluster - keep eating a committed pack (density on)
+//   6 density - detour to a denser pack past the mingain/detour gate (density on)
+//   7 nearest - always-on fallback
+// With density off rungs 5+6 are dead code. Rungs 1/2/4 are user-switchable (`priority`); turning all
+// three off leaves avoid+nearest, i.e. "always take the closest eligible mob".
+//   SWEEP mode replaces the whole ladder while a painted lane is armed - see the short-circuit below.
 tc_pick_one :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage) {
-  // Melee fast-path: a mob in melee range is immediately reachable, so take the nearest such and skip
-  // the anchor heuristics. Name-filtered auto ONLY: in any-monster mode something is almost always in
-  // melee range, so this would grab whatever's closest and ignore the last-kill anchor, making the pick
-  // ping-pong across the field.
-  if ctx.require_fresh && ctx.name_filtered {
+  // SWEEP: the painted lane owns the route, so selection may never propose a walk. Only mobs already
+  // inside attack_range of where we STAND are eligible; nearest wins. Deliberately RETURNS instead of
+  // falling through - rungs 1 (aggro) and 7 (nearest) are distance-unbounded by design and would pull the
+  // character off the lane, which is the one thing sweep mode exists to prevent.
+  //   Shaped like the pocket rung below, but ranked nearest-to-PLAYER rather than nearest-to-last-kill:
+  // pack stickiness is meaningless when the route is fixed. tc_cand_skip still runs, so the reach gate,
+  // the geo-fence, the just-killed cooldown and the stuck blacklist all still apply inside the circle.
+  // Auto only (require_fresh) - an explicit `tc` / `target_at` is the user overriding the route by hand.
+  if ctx.require_fresh && ctx.sweep_on {
+    best := -1
+    best_d := f32(1e30)
+    for c, i in cands {
+      pd := engine.dist_horizontal(c.pos, ctx.live_player)
+      if pd > ctx.engage {
+        continue // outside the circle we are standing in - taking it would mean walking off the lane
+      }
+      if tc_cand_skip(session, ctx, cands, i, alive) {
+        continue
+      }
+      if pd < best_d {
+        best_d = pd
+        best = i
+      }
+    }
+    if best >= 0 {
+      return best, .Sweep
+    }
+    return -1, .None
+  }
+  // Rung 1 - AGGRO: something is already committed to attacking us, so it will reach us and chip at us
+  // whatever else we pick. Killing it first is strictly better than kiting it around the field while we
+  // farm something else. Deliberately unbounded by distance (the user's call): a mob that aggroed from
+  // across the room still outranks a mob at our feet, because it is coming either way. Ranked nearest
+  // first (cands are sorted), so a pack of adds is eaten closest-out. Inert when the aggro flag can't be
+  // computed - see TC_Cand.aggro - which makes this rung fail-safe: no reads, no picks, ladder unchanged.
+  if ctx.require_fresh && ctx.aggro_on {
+    for c, i in cands {
+      if !c.aggro {
+        continue
+      }
+      if tc_cand_skip(session, ctx, cands, i, alive) {
+        continue
+      }
+      return i, .Aggro
+    }
+  }
+  // Rung 2 - MELEE: a mob within melee_range is on top of us and immediately killable, so it wins before
+  // any anchor heuristic gets to reason about packs.
+  //   This used to be gated on ctx.name_filtered, i.e. it was SWITCHED OFF in any-monster mode ('auto'
+  // with no names) on the theory that something is always in melee range there and the pick would
+  // ping-pong. That reasoning was wrong in an important way: the rung below (pocket) ranks by distance to
+  // the LAST KILL, not to the player, so with this rung off a mob 15 units away can outrank the one
+  // hitting you in the face - which is exactly the "melee targets are ignored" bug. Ping-pong is already
+  // prevented by the recent-pick cooldown (TC_RECENT_NS) and by melee_range being a tight radius.
+  // Switchable now (`priority melee off`) instead of being implied by whether you typed a mob name.
+  if ctx.require_fresh && ctx.melee_on {
     for c, i in cands {
       if c.d > ctx.melee {
         break // sorted by distance - nothing further is in melee range
@@ -201,7 +301,7 @@ tc_pick_one :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: [
       return i, .Avoid
     }
   }
-  // In-range priority ("stay on the pack, but never leave my reach"): among the mobs within attack_range
+  // Rung 4 - POCKET. In-range priority ("stay on the pack, but never leave my reach"): among the mobs within attack_range
   // of where the PLAYER actually stands, take the one NEAREST THE LAST-KILL spot (pack stickiness). Above
   // the cluster stage: whatever is in range dies first, and we only leave the player's range when nothing
   // eligible is inside it.
@@ -211,7 +311,7 @@ tc_pick_one :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: [
   // marched the target off along the pack (targets at 16, 23, 33, 45+ units while the mob next to you was
   // ignored). The RANKING stays nearest-to-last-kill so pack behaviour is unchanged; before the first kill
   // (no anchor) it falls back to nearest-to-player. c.d is anchor-relative, so the gate can't break early.
-  if ctx.require_fresh {
+  if ctx.require_fresh && ctx.pocket_on {
     best := -1
     best_rank := f32(1e30)
     for c, i in cands {
@@ -508,6 +608,17 @@ tc_collect_cands :: proc(
       prop_gate = false // couldn't resolve the array; fall back to no gate rather than mis-filter
     }
   }
+  // Aggro flag input (ladder rung 1): our own OBJID, resolved ONCE here. A mob whose CMover.m_idDest
+  // equals it is chasing/attacking us (see TC_Cand.aggro). Both offsets are already pinned - objid_off by
+  // findsettarget, iddest_off by findmove/the build-stable seed - so this needs no new finder. Zero means
+  // "can't tell": every candidate then reports aggro=false and the rung finds nothing, leaving the ladder
+  // exactly as it was. layout-only reads, so the background scan worker's snapshot Session is fine.
+  player_objid: u32 = 0
+  if session.layout.objid_off != 0 && session.layout.iddest_off != 0 && player != 0 {
+    if v, ok := engine.read_value(handle, player + uintptr(session.layout.objid_off), .U32); ok {
+      player_objid = u32(engine.value_as_u64(.U32, v))
+    }
+  }
   wval := engine.ptr_to_value(world, session.ptr_size)
   regions := engine.collect_regions(handle, true) // all writable - complete, no stale cache
   defer delete(regions)
@@ -529,10 +640,66 @@ tc_collect_cands :: proc(
     if !posok {
       continue
     }
-    append(&cands, TC_Cand{obj = obj, d = engine.dist_horizontal(pos, player_pos), pos = pos})
+    append(
+      &cands,
+      TC_Cand {
+        obj = obj,
+        d = engine.dist_horizontal(pos, player_pos),
+        pos = pos,
+        aggro = mob_targets_player(session, obj, player_objid),
+      },
+    )
   }
   slice.sort_by(cands[:], proc(a, b: TC_Cand) -> bool {return a.d < b.d})
   return cands
+}
+
+// Is <obj> chasing/attacking the player? Reads CMover.m_idDest (iddest_off) and compares it against the
+// player's own OBJID. <player_objid> of 0 means the caller couldn't resolve it (offsets unpinned), which
+// reports false for everything - the aggro rung then simply never fires.
+//
+// Why this is the right field: a monster's actual AI (CAIMonster/CAIMonster2, m_dwIdTarget, the hate
+// list) lives entirely in the WorldServer build - CObj::SetAIInterface is #ifdef __WORLDSERVER and Neuz
+// never compiles the AI classes at all, so m_pAIInterface is permanently NULL client-side. But the
+// server has to tell every nearby client which way to walk a monster, and that arrives as
+// OnMoverSetDestObj -> CMover::SetDestObj -> m_idDest, for ANY visible mover. So m_idDest is the
+// client's copy of the server's chase decision. It's set on entering AI2_TRACKING (AIMonster2.cpp), i.e.
+// while the mob is closing on us; whether it survives the switch to AI2_ATTACK on arrival is the one
+// thing the source doesn't settle - run the `aggro` command in game to see. If it does get cleared on
+// arrival, ladder rung 2 (melee) covers the arrived case anyway.
+//
+// layout+proc_info reads only, so this is safe on the background scan worker (see tc_collect_cands).
+mob_targets_player :: proc(session: ^Session, obj: uintptr, player_objid: u32) -> bool {
+  if player_objid == 0 || session.layout.iddest_off == 0 {
+    return false
+  }
+  v, ok := engine.read_value(session.proc_info.handle, obj + uintptr(session.layout.iddest_off), .U32)
+  if !ok {
+    return false
+  }
+  return u32(engine.value_as_u64(.U32, v)) == player_objid
+}
+
+// The player's own OBJID (objid_off), for the aggro comparison above and the `aggro` diagnostic.
+// ok=false when objid_off isn't pinned, the player can't be resolved, or the read fails.
+read_player_objid :: proc(session: ^Session) -> (id: u32, ok: bool) {
+  if session.layout.objid_off == 0 {
+    return 0, false
+  }
+  handle := session.proc_info.handle
+  pt := session.ptr_size == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  pv, pok := engine.read_value(handle, session.proc_info.base + session.layout.player_rva, pt)
+  if !pok {
+    return 0, false
+  }
+  player := uintptr(engine.value_as_u64(pt, pv))
+  if player == 0 {
+    return 0, false
+  }
+  if v, rok := engine.read_value(handle, player + uintptr(session.layout.objid_off), .U32); rok {
+    return u32(engine.value_as_u64(.U32, v)), true
+  }
+  return 0, false
 }
 
 // The density scorer's neighborhood radius (world units) - what counts as one "pack". Derived from the
@@ -766,7 +933,11 @@ tc_finish_select :: proc(
     now           = now,
     name_filtered = len(names) > 0,
     require_fresh = require_fresh,
-    gate          = require_fresh && session.reach_gate_on && !session.hunt_on, // reach filter (auto only; hunt commits even to a blocked target - it side-steps in)
+    aggro_on      = session.aggro_first_on, // ladder rung 1 (see tc_pick_one)
+    melee_on      = session.melee_first_on, // rung 2
+    pocket_on     = session.pocket_on,      // rung 4
+    gate          = require_fresh && session.reach_gate_on && !hunt_steering_on(session), // reach filter (auto only; hunt commits even to a blocked target - it side-steps in)
+    sweep_on      = session.sweep_on, // painted lane armed -> in-range-only selection (auto only)
     fence_on      = session.fence.active, // geo-fence gate (auto + manual when active; 'fence off' to override)
     avoid_on      = session.auto_avoid_on,
     avoid_dir     = session.auto_avoid_dir,
@@ -918,7 +1089,11 @@ tc_finish_precompute :: proc(
     now           = now,
     name_filtered = len(names) > 0,
     require_fresh = true,
-    gate          = session.reach_gate_on && !session.hunt_on, // hunt commits even to a blocked target (see tc_finish_select)
+    aggro_on      = session.aggro_first_on, // ladder rung 1 (see tc_pick_one)
+    melee_on      = session.melee_first_on, // rung 2
+    pocket_on     = session.pocket_on,      // rung 4
+    gate          = session.reach_gate_on && !hunt_steering_on(session), // hunt commits even to a blocked target (see tc_finish_select)
+    sweep_on      = session.sweep_on, // (sweep_tick disables pre-select outright, but keep the ctx honest)
     fence_on      = session.fence.active,
     avoid_on      = false, // pre-select never runs the one-shot stuck-avoid steer
     last_kill_set = anchor_set,
@@ -975,7 +1150,7 @@ tc_precompute_still_valid :: proc(session: ^Session, obj: uintptr, cached_pos: [
   if engine.dist_horizontal(lp, cached_pos) > PRESELECT_DRIFT_MAX {
     return {}, false // wandered too far - the precomputed choice may no longer make sense
   }
-  if session.reach_gate_on && !session.hunt_on && !cand_reachable(session, world, player_pos, lp) {
+  if session.reach_gate_on && !hunt_steering_on(session) && !cand_reachable(session, world, player_pos, lp) {
     return {}, false // approach is blocked NOW (terrain/object), whatever it looked like at precompute (hunt commits anyway)
   }
   if session.fence.active && !fence_contains(session.fence, lp[0], lp[2]) {
@@ -1182,8 +1357,8 @@ REACH_BLOCKED_DEBOUNCE :: 2 // consecutive blocked probes (~1s) before skipping 
 // 'set attack_range <n>' to your real range - pick_ranges uses that. See the pocket pass in tc_pick_one.
 BOW_RANGE :: f32(16.0)
 
-// Melee range: a mob this close is "on top of us" and immediately reachable, so it gets top pick
-// priority (name-filtered auto only). Capped to the engage range. See the melee pass in tc_pick_one.
+// Fallback melee radius, used only when layout.melee_range isn't set (an old cfg, or 0). The live value
+// is the cfg key - see FLYFF_MELEE_RANGE / `priority melee <range>`. Capped to engage by pick_ranges.
 MELEE_RANGE :: f32(1.7)
 
 // Floor for the density scorer's pack radius (density_radius), so a melee character with a tiny engage
@@ -1209,11 +1384,178 @@ pick_ranges :: proc(session: ^Session) -> (melee: f32, engage: f32) {
   if engage <= 0 {
     engage = BOW_RANGE
   }
-  melee = MELEE_RANGE
+  melee = f32(session.layout.melee_range)
+  if melee <= 0 {
+    melee = MELEE_RANGE // cfg key absent/zeroed - fall back to the compiled-in seed
+  }
   if melee > engage {
     melee = engage
   }
   return
+}
+
+// priority                    -> print the whole ladder: every rung, in the order tc_pick_one runs them,
+//                                with its enable state and tunable.
+// priority aggro on|off       -> rung 1: a mob coming for US outranks everything, at any distance
+// priority melee on|off       -> rung 2: a mob within melee_range outranks the pack-stickiness ranking
+// priority melee <range>      -> set that radius (world units) and enable the rung
+// priority pocket on|off      -> rung 4: in-attack_range, ranked nearest-to-last-kill (pack stickiness)
+// Rungs 5+6 (cluster/density) belong to `density on|off` and are only DISPLAYED here, so there is exactly
+// one command that owns each setting. Rung 3 (avoid) is part of stuck recovery, not separately switchable;
+// rung 7 (nearest) is the always-on fallback. All three toggles persist to flyff.cfg.
+cli_priority :: proc(session: ^Session, args: []string) {
+  usage :: "usage: priority [aggro|melee|pocket on|off]  |  priority melee <range>"
+  changed := false
+  if len(args) >= 1 {
+    rung := strings.to_lower(args[0])
+    if len(args) < 2 {
+      fmt.eprintln(usage)
+      return
+    }
+    val := strings.to_lower(args[1])
+    on := val == "on"
+    if val != "on" && val != "off" {
+      // 'priority melee 4.5' - a bare number sets the radius (and enables the rung).
+      if rung != "melee" {
+        fmt.eprintln(usage)
+        return
+      }
+      r, rok := strconv.parse_f64(args[1])
+      if !rok || r <= 0 {
+        fmt.eprintln("priority melee wants on|off or a radius > 0 in world units (e.g. 3).")
+        return
+      }
+      session.layout.melee_range = f32(r)
+      session.melee_first_on = true
+      changed = true
+    } else {
+      switch rung {
+      case "aggro":
+        session.aggro_first_on = on
+      case "melee":
+        session.melee_first_on = on
+      case "pocket":
+        session.pocket_on = on
+      case "cluster", "density":
+        fmt.eprintln("rungs 5-6 belong to the density feature - use 'density on|off' (see 'density').")
+        return
+      case "avoid":
+        fmt.eprintln("rung 3 (avoid) is part of stuck recovery - use 'stuck on|off'.")
+        return
+      case "nearest":
+        fmt.eprintln("rung 7 (nearest) is the fallback and can't be turned off - something has to be picked.")
+        return
+      case:
+        fmt.eprintln(usage)
+        return
+      }
+      changed = true
+    }
+  }
+  if changed {
+    // cfg mirrors (see on_attach); attach-gated save so defaults never clobber a calibrated cfg.
+    session.layout.aggro_first_on = session.aggro_first_on
+    session.layout.melee_first_on = session.melee_first_on
+    session.layout.pocket_on = session.pocket_on
+    if session.attached {
+      flyff_save_cfg(session.layout, flyff_cfg_path())
+    }
+  }
+  melee, engage := pick_ranges(session)
+  onoff :: proc(b: bool) -> string {return b ? "ON " : "off"}
+  fmt.println("target priority ladder - the first rung that finds an eligible mob wins:")
+  aggro_note := ""
+  if session.aggro_first_on && (session.layout.objid_off == 0 || session.layout.iddest_off == 0) {
+    aggro_note = "  [INERT: needs objid_off + iddest_off - run 'setup <name>']"
+  }
+  // pick_ranges clamps the melee radius to the engage range (never prefer a mob you can't actually hit
+  // from where you stand). Say so when it bites, or 'priority melee 4.5' looks like it did nothing.
+  cfg_melee := session.layout.melee_range > 0 ? session.layout.melee_range : MELEE_RANGE
+  melee_note := ""
+  if melee < cfg_melee {
+    melee_note = fmt.tprintf("  [clamped from %.1f to attack_range - 'set attack_range <n>' to your real reach]", cfg_melee)
+  }
+  fmt.printfln("  1. %s  attacking me   it is coming for ME, any distance    ('priority aggro on|off')%s", onoff(session.aggro_first_on), aggro_note)
+  fmt.printfln("  2. %s  melee range    within %.1f units of me%s", onoff(session.melee_first_on), melee, melee_note)
+  fmt.printfln("  3. %s  in range       within attack_range (%.1f), nearest my last kill - pack stickiness", onoff(session.pocket_on), engage)
+  if session.layout.density_on {
+    fmt.printfln("  4. ON   pack steering  commit to a pack; detour only past mingain %d / detour %.0f", session.layout.density_min_gain, session.layout.density_max_detour)
+  } else {
+    fmt.println("  4. off  pack steering  ('density on' to enable cluster commitment + denser-pack detours)")
+  }
+  fmt.println("  5. ON   nearest        the closest eligible mob (fallback, can't be turned off)")
+  fmt.printfln("  +      after a stuck-skip, one pick steers AWAY from the jam  (%s, 'stuck on|off')", session.auto_stuck_on ? "on" : "off")
+  if !session.aggro_first_on && !session.melee_first_on && !session.pocket_on && !session.layout.density_on {
+    fmt.println("  note: every optional rung is off - auto is in plain 'always take the closest mob' mode.")
+  }
+}
+
+// aggro -> read-only diagnostic: which nearby movers have US as their destination object, i.e. which ones
+// the server has told this client are chasing/attacking the player (ladder rung 1's input). Prints our own
+// OBJID and each mover's m_idDest so a mismatch is obvious. Use it to answer the one thing the game source
+// doesn't settle: whether m_idDest STAYS pointed at us once the mob arrives and starts swinging (it's set
+// on entering AI2_TRACKING). Stand still, let something attack you, run this - no writes, no injection.
+cli_aggro :: proc(session: ^Session, args: []string) {
+  if !session.attached {
+    fmt.eprintln("not attached.")
+    return
+  }
+  radius := f32(60)
+  if len(args) >= 1 {
+    if v, ok := strconv.parse_f64(args[0]); ok && v > 0 {
+      radius = f32(v)
+    }
+  }
+  if session.layout.objid_off == 0 || session.layout.iddest_off == 0 {
+    fmt.eprintfln(
+      "aggro needs objid_off (%s) and iddest_off (%s) - run 'setup <name>' (findsettarget + findmove).",
+      session.layout.objid_off == 0 ? "MISSING" : "ok", session.layout.iddest_off == 0 ? "MISSING" : "ok",
+    )
+    return
+  }
+  me, meok := read_player_objid(session)
+  if !meok || me == 0 {
+    fmt.eprintln("could not read the player's own OBJID (wrong build, or not in-game?).")
+    return
+  }
+  world, player, ppos, aok := tc_resolve_anchors(session)
+  if !aok {
+    fmt.eprintln("could not read world/player anchors (not in-game?).")
+    return
+  }
+  cands := tc_collect_cands(session, nil, world, player, ppos)
+  fmt.printfln("my OBJID = %d (0x%X)   scanning %d movers within %.0f units:", me, me, len(cands), radius)
+  n_aggro := 0
+  shown := 0
+  for c in cands {
+    if c.d > radius {
+      break // sorted nearest-first
+    }
+    nm, _ := read_mover_name(session, c.obj)
+    dest: i64 = -1
+    if v, ok := engine.read_value(session.proc_info.handle, c.obj + uintptr(session.layout.iddest_off), .U32); ok {
+      dest = i64(u32(engine.value_as_u64(.U32, v)))
+    }
+    if c.aggro {
+      n_aggro += 1
+    }
+    fmt.printfln(
+      "  %-20s d=%6.1f  m_idDest=%-12s%s",
+      nm == "" ? "?" : nm, c.d,
+      dest < 0 ? "<unreadable>" : fmt.tprintf("%d", dest),
+      c.aggro ? "  <-- AGGRO (targeting me)" : "",
+    )
+    shown += 1
+    if shown >= 40 {
+      fmt.println("  ... (truncated at 40)")
+      break
+    }
+  }
+  fmt.printfln("%d of %d shown movers are targeting you.", n_aggro, shown)
+  if n_aggro == 0 {
+    fmt.println("none right now. if something IS hitting you and this says 0, m_idDest is cleared on arrival -")
+    fmt.println("ladder rung 2 (melee) still covers that case; see BACKLOG for the m_idTarget follow-up.")
+  }
 }
 
 // density                -> show the cluster-steering state

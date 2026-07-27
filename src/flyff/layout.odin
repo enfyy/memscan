@@ -6,6 +6,7 @@ import "core:mem"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 import win "core:sys/windows"
 
 // ===========================================================================
@@ -44,6 +45,8 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.hp_off = i64(v)
   case "penya_off":
     layout.penya_off = i64(v)
+  case "petid_off":
+    layout.petid_off = i64(v)
   case "lb_penya_cap":
     layout.lb_penya_cap = i64(v)
   case "inv_off":
@@ -156,6 +159,7 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "name_off=0x%X", layout.name_off)
   fmt.sbprintfln(&b, "hp_off=0x%X", layout.hp_off)
   fmt.sbprintfln(&b, "penya_off=0x%X", layout.penya_off)
+  fmt.sbprintfln(&b, "petid_off=0x%X", layout.petid_off)
   fmt.sbprintfln(&b, "inv_off=0x%X", layout.inv_off)
   fmt.sbprintfln(&b, "item_stride=0x%X", layout.item_stride)
   fmt.sbprintfln(&b, "model_off=0x%X", layout.model_off)
@@ -196,6 +200,13 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "la_max_range=%v", layout.la_max_range)
   fmt.sbprintfln(&b, "reach_gate_on=%d", layout.reach_gate_on ? 1 : 0)
   fmt.sbprintfln(&b, "hunt_on=%d", layout.hunt_on ? 1 : 0)
+  fmt.sbprintfln(&b, "combat_watch_on=%d", layout.combat_watch_on ? 1 : 0)
+  fmt.sbprintfln(&b, "combat_grace=%v", layout.combat_grace)
+  fmt.sbprintfln(&b, "auto_stuck_on=%d", layout.auto_stuck_on ? 1 : 0)
+  fmt.sbprintfln(&b, "aggro_first_on=%d", layout.aggro_first_on ? 1 : 0)
+  fmt.sbprintfln(&b, "melee_first_on=%d", layout.melee_first_on ? 1 : 0)
+  fmt.sbprintfln(&b, "melee_range=%v", layout.melee_range)
+  fmt.sbprintfln(&b, "pocket_on=%d", layout.pocket_on ? 1 : 0)
   fmt.sbprintfln(&b, "sfx_on=%d", layout.sfx_on ? 1 : 0)
   fmt.sbprintfln(&b, "fx_laser_on=%d", layout.fx_laser_on ? 1 : 0)
   fmt.sbprintfln(&b, "trail_on=%d", layout.trail_on ? 1 : 0)
@@ -221,6 +232,15 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "sendplayermoved_rva=0x%X", layout.sendplayermoved_rva)
   fmt.sbprintfln(&b, "leaderboard_url=%s", layout.leaderboard_url) // string key (may be empty)
   fmt.sbprintfln(&b, "lb_penya_cap=%d", layout.lb_penya_cap)
+  // Collider ignore-list as one "ty:idx,ty:idx,..." line (empty if none). See collider_denied (terrain.odin).
+  fmt.sbprint(&b, "collider_ignore=")
+  for i in 0 ..< int(layout.collider_ignore_n) {
+    if i > 0 {
+      fmt.sbprint(&b, ",")
+    }
+    fmt.sbprintf(&b, "%d:%d", layout.collider_ignore[i].ty, layout.collider_ignore[i].idx)
+  }
+  fmt.sbprintln(&b, "")
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
   return err == nil
 }
@@ -253,6 +273,25 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     if key == "radar_range" {
       if fv, ok := strconv.parse_f64(val); ok {
         layout.radar_range = f32(fv) // world-unit gather radius - parse as float
+      }
+      continue
+    }
+    if key == "collider_ignore" {
+      // "ty:idx,ty:idx,..." - the radar-inspect ignore-list. Rebuild the fixed array from scratch.
+      layout.collider_ignore_n = 0
+      if val != "" {
+        for p in strings.split(val, ",", context.temp_allocator) {
+          c := strings.index_byte(p, ':')
+          if c < 0 {
+            continue
+          }
+          tv, tok := strconv.parse_int(strings.trim_space(p[:c]))
+          iv, iok := strconv.parse_int(strings.trim_space(p[c + 1:]))
+          if tok && iok && int(layout.collider_ignore_n) < FLYFF_MAX_COLLIDER_IGNORE {
+            layout.collider_ignore[layout.collider_ignore_n] = {u32(tv), u32(iv)}
+            layout.collider_ignore_n += 1
+          }
+        }
       }
       continue
     }
@@ -292,6 +331,18 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
       }
       continue
     }
+    if key == "combat_grace" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.combat_grace = f32(fv) // seconds since the last HP drop - parse as float
+      }
+      continue
+    }
+    if key == "melee_range" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.melee_range = f32(fv) // ladder rung 2 radius (world units) - parse as float
+      }
+      continue
+    }
     // Look-alive fractional tunables (seconds / world units). la_jump_chance + la_step_chance are plain
     // ints -> generic path below.
     if key == "la_hold_min" || key == "la_hold_max" || key == "la_jump_min" || key == "la_jump_max" || key == "la_step_spread" || key == "la_max_range" {
@@ -321,7 +372,7 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     // Persisted runtime toggles - bool-parsed like density_on. Deliberately NOT in layout_set_field:
     // the first three are session-mirrored (their CLI toggles keep both sides in sync; a raw `set`
     // would silently desync), and sfx/fxlaser have their own commands.
-    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "hunt_on" || key == "sfx_on" || key == "fx_laser_on" || key == "trail_on" || key == "hillshade_on" || key == "density_hue_on" || key == "la_hesitate_on" || key == "la_jump_on" || key == "la_step_on" || key == "la_maxrange_on" {
+    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "hunt_on" || key == "combat_watch_on" || key == "auto_stuck_on" || key == "aggro_first_on" || key == "melee_first_on" || key == "pocket_on" || key == "sfx_on" || key == "fx_laser_on" || key == "trail_on" || key == "hillshade_on" || key == "density_hue_on" || key == "la_hesitate_on" || key == "la_jump_on" || key == "la_step_on" || key == "la_maxrange_on" {
       bv := val == "1" || strings.equal_fold(val, "true") || strings.equal_fold(val, "on")
       switch key {
       case "preselect_on":
@@ -332,6 +383,16 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
         layout.reach_gate_on = bv
       case "hunt_on":
         layout.hunt_on = bv
+      case "combat_watch_on":
+        layout.combat_watch_on = bv
+      case "auto_stuck_on":
+        layout.auto_stuck_on = bv
+      case "aggro_first_on":
+        layout.aggro_first_on = bv
+      case "melee_first_on":
+        layout.melee_first_on = bv
+      case "pocket_on":
+        layout.pocket_on = bv
       case "sfx_on":
         layout.sfx_on = bv
       case "fx_laser_on":
@@ -392,6 +453,9 @@ cli_status :: proc(session: ^Session, args: []string) {
   fmt.println("=== memscan status ===")
   if !session.attached {
     fmt.println("process : NOT attached   fix: attach <Neuz|pid>")
+    // Behaviour scripts are authorable (and runnable, for the game-free blocks) with nothing
+    // attached, so this half of the status is still meaningful here.
+    fmt.printfln("behaviour: %s", script_status_line(session))
     return
   }
   pname := session.proc_info.name == "" ? "Neuz" : session.proc_info.name
@@ -414,6 +478,12 @@ cli_status :: proc(session: ^Session, args: []string) {
   for o in optional_pins(session) {
     fmt.printfln("  %-5s %-32s %s", o.ok ? "[OK]" : "[--]", o.label, o.need)
   }
+  if n := int(session.layout.collider_ignore_n); n > 0 {
+    fmt.printfln("collider ignore-list: %d kind(s) hidden from reach + radar ('collignore' to view/clear)", n)
+  } else {
+    fmt.println("collider ignore-list: empty (radar inspect mode 'I' + click a phantom box to add its kind)")
+  }
+  fmt.printfln("behaviour: %s", script_status_line(session))
   fmt.println("more detail: `status full`")
 }
 
@@ -548,6 +618,39 @@ cli_status_full :: proc(session: ^Session) {
     fmt.println("  note: step + max-range approach (and jumps) are inert until 'findmove' is set up; hesitation still applies.")
   }
 
+  // --- Sweep mode (painted route; per-run state, nothing persisted) ---
+  // Two hard dependencies, both reported above: attack_range (it IS the brush width AND the eligibility
+  // radius, so 0 makes the whole feature meaningless) and moveto (nothing steps the character forward
+  // without it). Called out here as one verdict so you don't have to cross-reference two sections.
+  fmt.println("")
+  sweep_ar_ok := L.attack_range > 0
+  if !sweep_ar_ok || !move_ok {
+    fmt.printfln("SWEEP mode: %s  <- paint a route on the radar (right-drag the green ring) and clear it lane by lane.", sweep_ar_ok ? "[OFF]" : "[BROKEN]")
+    if !sweep_ar_ok {
+      fmt.println("  attack_range is 0 - it is BOTH the lane's brush width and the 'only kill what's already in reach' radius.")
+      fmt.println("    fix: set attack_range <n>   (your real reach, floats ok - e.g. 'set attack_range 1.75')")
+    }
+    if !move_ok {
+      fmt.println("  moveto is inert, so a lane can be painted but never walked (the paint still erases where you walk by hand).")
+      fmt.println("    fix: findmove   (in-game)")
+    }
+  } else if session.sweep_on {
+    pct, left, nodes_left := sweep_progress(session)
+    fmt.printfln(
+      "SWEEP mode: ARMED - %.0f%% done, %.0f units / %d of %d nodes left, %s elapsed, %d kills.",
+      pct, left, nodes_left, session.sweep_nodes_total,
+      fmt_elapsed(time.now()._nsec - session.sweep_started_at),
+      max(session.auto_count - session.sweep_kills_start, 0),
+    )
+    fmt.printfln(
+      "  brush width = attack_range (%.1f); only mobs already inside it are eligible, so nothing pulls you off the route.%s",
+      L.attack_range, session.hunt_on ? "  hunt is suppressed until the lane ends." : "",
+    )
+    fmt.println("  'sweep' for detail, 'sweep off' to drop it.")
+  } else {
+    fmt.printfln("SWEEP mode: [OK] ready, no lane armed  <- right-drag inside the green ring on the radar, or 'sweep to <x,z>'. brush width = attack_range (%.1f).", L.attack_range)
+  }
+
   // --- Hunt mode (commit-to-one-target; standalone, mirrored in Session) ---
   fmt.println("")
   fmt.printfln("HUNT mode: %s  <- commit to one target (giant/quest), never drop it for being far/unreachable. 'hunt on|off'.", session.hunt_on ? "ON" : "off")
@@ -587,6 +690,26 @@ cli_status_full :: proc(session: ^Session) {
   fmt.printfln(
     "  object reach: cached full-scan (finds every collidable prop; no findcull needed)   auto reach-gate: %s",
     session.reach_gate_on ? (world != 0 ? "ON" : "on (activates once in-game)") : "OFF",
+  )
+  {
+    // The priority ladder in one line per rung - the same order tc_pick_one runs, so `status full` and
+    // `priority` can't tell different stories. Full detail + the toggles live in `priority`.
+    melee_r, engage_r := pick_ranges(session)
+    fmt.printfln(
+      "  priority ladder: 1.attacking-me %s  2.melee %s (%.1f)  3.in-range %s (%.1f)  4.pack-steering %s  5.nearest ON   <- 'priority' to change",
+      session.aggro_first_on ? (L.objid_off != 0 && L.iddest_off != 0 ? "ON" : "on/INERT") : "off",
+      session.melee_first_on ? "ON" : "off", melee_r,
+      session.pocket_on ? "ON" : "off", engage_r,
+      L.density_on ? "ON" : "off",
+    )
+    if session.aggro_first_on && (L.objid_off == 0 || L.iddest_off == 0) {
+      fmt.println("    ! rung 1 is INERT: it compares each mob's m_idDest against your own OBJID, so it needs objid_off + iddest_off. fix: setup <name>")
+    }
+  }
+  fmt.printfln(
+    "  combat-watch: %s  <- while the locked mob's HP is falling, the stuck-plateau + reach re-watch never drop it (high-HP mobs get finished instead of skipped mid-fight). 'combatwatch on|off|<seconds>', 'set combat_grace <s>' (default %v).",
+    session.combat_watch_on ? (L.hp_off != 0 ? fmt.tprintf("ON (grace %.1fs)", L.combat_grace) : "on but INERT - hp_off unset, run 'setup <name> [hp]'") : "OFF",
+    FLYFF_COMBAT_GRACE,
   )
   coll_set := L.coll_obj3d_off != 0 && L.coll_type_off != 0
   fmt.printfln(
@@ -679,6 +802,9 @@ cli_status_full :: proc(session: ^Session) {
   fmt.printfln("  lb_penya_cap=%d  anti-cheat: span penya counts only kill-paired gains <= this (a 100M Perin is ignored). `set lb_penya_cap <n>`", L.lb_penya_cap)
 
   fmt.println("")
+  cli_status_behaviour(session)
+
+  fmt.println("")
   fmt.println("SETUP - the whole thing is one command (re-run after a game patch):")
   fmt.println("  setup <name> [hp]            stand in a field on the ground with a few distinct monsters on screen, then")
   fmt.println("                               run it. Anchors on your character NAME (no /position) and pins EVERYTHING:")
@@ -758,7 +884,7 @@ cli_set :: proc(session: ^Session, args: []string) {
   }
   // attack_range / radar_range / density_weight / density_max_detour / la_* delays are the fractional
   // fields - parse as floats (la_jump_chance is an int and takes the generic parse_addr path below).
-  if args[0] == "attack_range" || args[0] == "radar_range" || args[0] == "trail_len" || args[0] == "trail_fade" || args[0] == "hillshade_z" || args[0] == "hillshade_light" || args[0] == "density_weight" || args[0] == "density_max_detour" || args[0] == "la_hold_min" || args[0] == "la_hold_max" || args[0] == "la_jump_min" || args[0] == "la_jump_max" || args[0] == "la_step_spread" || args[0] == "la_max_range" {
+  if args[0] == "attack_range" || args[0] == "radar_range" || args[0] == "trail_len" || args[0] == "trail_fade" || args[0] == "hillshade_z" || args[0] == "hillshade_light" || args[0] == "density_weight" || args[0] == "density_max_detour" || args[0] == "combat_grace" || args[0] == "melee_range" || args[0] == "la_hold_min" || args[0] == "la_hold_max" || args[0] == "la_jump_min" || args[0] == "la_jump_max" || args[0] == "la_step_spread" || args[0] == "la_max_range" {
     fv, ok := strconv.parse_f64(args[1])
     if !ok || fv < 0 {
       fmt.eprintfln("invalid value: %s (want a number >= 0, e.g. 1.75)", args[1])
@@ -777,6 +903,10 @@ cli_set :: proc(session: ^Session, args: []string) {
       session.layout.density_weight = f32(fv)
     case "density_max_detour":
       session.layout.density_max_detour = f32(fv)
+    case "combat_grace":
+      session.layout.combat_grace = f32(fv)
+    case "melee_range":
+      session.layout.melee_range = f32(fv)
     case "la_hold_min":
       session.layout.la_hold_min = f32(fv)
     case "la_hold_max":
@@ -806,7 +936,11 @@ cli_set :: proc(session: ^Session, args: []string) {
     return
   }
   if !layout_set_field(&session.layout, args[0], u64(v)) {
+    // Deliberately NOT a fallback that creates a variable: `set` writes memory offsets/RVAs, and a
+    // typo'd key silently becoming a variable is how you end up writing at a wrong address. Point at
+    // the right command instead (see engine/vars.odin).
     fmt.eprintfln("unknown field '%s' (run 'offsets' for the field names).", args[0])
+    fmt.eprintfln("  if you meant a script variable, that's a different command: var %s %s", args[0], args[1])
     return
   }
   fmt.printfln("set %s = 0x%X", args[0], v)

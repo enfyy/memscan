@@ -109,6 +109,30 @@ write_dest_pos :: proc(session: ^Session, cur: [3]f32, dest: [3]f32) -> bool {
   return ok
 }
 
+// Halt an in-progress walk - the inverse of write_dest_pos, and the only thing in the codebase that
+// cancels a move. Writes m_vDestPos = {0,0,0}, which is the client's OWN "no destination" sentinel:
+// ProcessMove calls IsEmptyDestPos and returns early (see the ordering note above - that's exactly why
+// destpos is written LAST when arming). Then clears the staged g_DPlay playerdestpos.fValid so the
+// per-frame SendSnapshot stops re-broadcasting the old destination and other clients stop us too.
+// No injection. Inert (returns false) until 'findmove' pins the dest-field offsets.
+move_stop :: proc(session: ^Session) -> bool {
+  L := session.layout
+  if !session.attached || session.ptr_size != 4 || L.destpos_off == 0 {
+    return false
+  }
+  handle := session.proc_info.handle
+  player := read_ptr_at(handle, session.proc_info.base + L.player_rva, engine.Value_Type.U32)
+  if player == 0 {
+    return false
+  }
+  ok := wr_vec3(handle, player + uintptr(L.destpos_off), {0, 0, 0}) // m_vDestPos = empty -> ProcessMove bails
+  if L.gdplay_rva != 0 && L.dplay_destpos_off != 0 {
+    vp := session.proc_info.base + L.gdplay_rva + uintptr(L.dplay_destpos_off)
+    if !wr_u32(handle, vp + 0x10, 0) {ok = false} // playerdestpos.fValid = FALSE -> nothing left to send
+  }
+  return ok
+}
+
 // jump - make the player jump by sending the client's own OBJMSG_JUMP (jump_msg). The in-client guards
 // (grounded / not casting/attacking/sitting / not NOMOVE) run as normal; the handler's return code is
 // reported (1 = jumped, else the guard that blocked it).

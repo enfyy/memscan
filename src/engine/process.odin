@@ -90,6 +90,46 @@ find_process_id_by_name :: proc(name: string, allocator := context.allocator) ->
   return results[:]
 }
 
+// Find the MAIN top-level window of <process_id> - the one input should be posted to.
+//
+// Deliberately stricter than find_window_title_by_process_id below, which takes the first window
+// carrying the pid: a process usually owns several (hidden message-only windows, tool windows,
+// tooltips), and posting a keystroke to one of those goes nowhere at all. Requires the window to be
+// visible, unowned (an owned window is a popup, not the main frame), and titled.
+find_main_window_by_process_id :: proc(process_id: u32) -> (hwnd: win.HWND, ok: bool) {
+  Find :: struct {
+    hwnd: win.HWND,
+    pid:  u32,
+  }
+
+  cb :: proc(h: win.HWND, lparam: win.LPARAM) -> win.BOOL {
+    f := transmute(^Find)lparam
+    pid: u32
+    win.GetWindowThreadProcessId(h, &pid)
+    if pid != f.pid {
+      return true
+    }
+    if !win.IsWindowVisible(h) {
+      return true
+    }
+    if win.GetWindow(h, win.GW_OWNER) != nil {
+      return true // owned popup / tool window, not the main frame
+    }
+    buf: [8]u16
+    if win.GetWindowTextW(h, raw_data(&buf), 8) == 0 {
+      return true // untitled -> not the game frame
+    }
+    f.hwnd = h
+    return false // found it; stop enumerating
+  }
+
+  f := Find {
+    pid = process_id,
+  }
+  win.EnumWindows(win.Window_Enum_Proc(cb), transmute(win.LPARAM)&f)
+  return f.hwnd, f.hwnd != nil
+}
+
 find_window_title_by_process_id :: proc(
   process_id: u32,
   allocator := context.temp_allocator,

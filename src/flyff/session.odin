@@ -1,5 +1,7 @@
 package flyff
 
+import "core:mem/virtual"
+
 import "../engine"
 
 // The flyff automation session. It EMBEDS the generic engine.Session as its first field so all
@@ -35,6 +37,26 @@ Session :: struct {
   auto_stuck_on:    bool, // stuck-detection enabled (default on; 'stuck off' disables, e.g. for ranged)
   auto_avoid_dir:   [2]f32, // horizontal (x,z) player->last-stuck-mob delta; one-shot steer-away hint
   auto_avoid_on:    bool, // next auto pick prefers a mob on the opposite side (dot < 0) from auto_avoid_dir
+
+  // Priority ladder rung enables (see tc_pick_one / cli_priority). The pick cascade is an ordered
+  // ladder; these switch its top rungs off individually so the targeting policy is one inspectable
+  // thing instead of a set of hardcoded gates. Rung 1 (aggro) needs objid_off + iddest_off - both
+  // already pinned - and goes inert (finds nothing, ladder falls through) if either is missing.
+  // cfg-mirrored like reach_gate_on; the melee radius lives on layout.melee_range.
+  aggro_first_on:   bool, // rung 1: a mob whose m_idDest is US outranks everything, at any distance
+  melee_first_on:   bool, // rung 2: a mob within layout.melee_range of us outranks pack stickiness
+  pocket_on:        bool, // rung 4: in-attack_range, ranked nearest-to-last-kill (pack stickiness)
+
+  // Combat watch (see auto_combat_watch / auto_in_combat). Both target-drop fallbacks above assume a mob
+  // dies fast, so "distance stopped dropping" == "jammed on an obstacle". Against a high-HP mob that's
+  // false: you stand still whittling it down for 10+ seconds and the fallbacks drop the target mid-fight.
+  // While the locked mob's HP is FALLING we're demonstrably fighting it, so both fallbacks are held off;
+  // layout.combat_grace seconds after the last HP drop they resume, so a mob we genuinely can't hit
+  // (blocked, out of reach) is still skipped. Needs hp_off (pinned by `setup`); inert without it.
+  combat_watch_on:  bool,    // cfg-mirrored ('combatwatch off' to get the old drop-on-plateau behavior)
+  auto_hp_obj:      uintptr, // mob the HP anchor belongs to (0 = none / just changed)
+  auto_hp_last:     i64,     // last HP seen for it (a RISE re-anchors: regen / heal, never damage)
+  auto_hp_drop_at:  i64,     // time.now()._nsec of its last observed HP drop (0 = none yet this target)
 
   // Proactive reach gate (see cand_reachable / tc_select). When on, auto skips candidate mobs whose
   // straight approach is blocked by terrain OR a placed-object OBB (the reach oracle) BEFORE selecting -
@@ -182,6 +204,26 @@ Session :: struct {
   la_approach_best:        f32,     // closest player->waypoint distance seen (progress watchdog)
   la_approach_progress_at: i64,     // nsec of the last real progress toward the waypoint (stuck timeout)
 
+  // Sweep mode (see sweep.odin / cli_sweep): a painted lane the character clears circle-by-circle. While
+  // sweep_on, the picker short-circuits to "nearest mob already inside attack_range" (tc_pick_one) so
+  // selection can never propose a walk, and sweep_tick owns the route - it erases the paint under us,
+  // halts on engage, and hops one brush width forward once the circle has been clear for SWEEP_SETTLE_NS.
+  // Same mutex discipline as `fence`: mutated and read only under exec_mutex. Cleared on attach, freed on
+  // close. Deliberately NOT persisted - a lane is per-run state. auto_stop keeps the path + cursor (so an
+  // F10 pause/resume continues where it left off) and resets only the walk bookkeeping.
+  sweep_on:          bool, // a lane is armed / running
+  sweep_path:        [dynamic]Sweep_Node,
+  sweep_idx:         int, // cursor: the node we have swept up to
+  sweep_walking:     bool, // a hop is currently issued (drives the halt-on-engage)
+  sweep_wp:          [3]f32, // the hop waypoint we are walking to
+  sweep_wp_idx:      int, // its node index (so an arrival / a blocked-hop skip lands the cursor exactly)
+  sweep_best:        f32, // closest distance seen to sweep_wp (progress watchdog)
+  sweep_progress_at: i64, // nsec of the last real progress toward sweep_wp
+  sweep_clear_since: i64, // nsec since focus went empty (the "circle is clear" settle); 0 = not empty
+  sweep_started_at:  i64, // nsec the lane was armed (the run timer)
+  sweep_kills_start: int, // auto_count when it was armed - the completion message's kill delta
+  sweep_nodes_total: int, // node count at arm time (the progress readout's denominator)
+
   // Hunt mode (cli_hunt, cfg mirror layout.hunt_on): commit to ONE target and never drop it for being
   // far/unreachable. Suppresses the reach-watch/stuck-plateau drops and relaxes the selection reach-gate;
   // when the path stalls it side-steps (unlock -> moveto a perpendicular waypoint via the la_approach
@@ -190,6 +232,40 @@ Session :: struct {
   hunt_on:             bool,
   hunt_side_flip:      bool, // which side the next side-step offsets to (flips every HUNT_SIDESTEP_FLIP stalls)
   hunt_sidestep_count: int,  // consecutive side-steps on the current target (paces hunt_side_flip)
+
+  // Behaviour machine (see behaviour.odin): the declared state machine that will eventually own
+  // routing and replace auto's implicit flag-precedence chain. bh_state is the durable, printable
+  // state tag - the live State_Function is rebuilt from it every tick and never stored. bh_board is
+  // this tick's sense latch (cleared and refilled inside one exec_mutex hold, so a REPL reader always
+  // sees a complete board). The bh_*_seen / bh_hp_* fields are observation baselines only: senses
+  // read the game and compare against these, and never write game or auto state. All reset by
+  // behaviour_reset on attach/detach - a sequence counter belongs to the process that produced it.
+  bh_state:          Behaviour_State,
+  bh_state_at:       i64, // nsec the current state was entered (the state timer)
+  bh_entered:        bool, // has the STARTING state's Enter run? (a self-return is not a transition,
+  // so state_machine_tick would never enter the first state - behaviour_tick does it once, see there)
+  bh_board:          Behaviour_Board,
+  bh_sense_on:       bool, // continuous sensing on the watcher tick ('sense on'); off = on-demand only
+  bh_sense_next:     [Behaviour_Event]i64, // per-event throttle deadline (Sense_Def.poll_ns)
+  bh_raised:         bit_set[Behaviour_Event], // signals an ACTION raised, published next tick
+  bh_raised_sig:     [Behaviour_Event]Behaviour_Signal,
+  bh_kill_seq_seen:  i64, // last kill_seq observed (kill sense baseline)
+  bh_penya_seq_seen: i64, // last penya_seq observed (penya sense baseline)
+  bh_hp_last:        i64, // last player HP observed (hp_fell sense baseline)
+  bh_hp_seeded:      bool, // the first HP observation is a baseline, not a drop
+  // Scratch arena for the senses that enumerate (see behaviour_scratch). NOT context.temp_allocator:
+  // nothing frees temp on the watcher tick, so a per-tick temp allocation there grows forever.
+  bh_scratch:        virtual.Arena,
+  bh_scratch_ok:     bool,
+
+  // Behaviour scripts (see script.odin / script_run.odin / script_blocks.odin). `script` is the live
+  // run - owned steps, hoisted interrupt watchers, the program counter, and the call stack. The
+  // authoring buffer is kept as TEXT lines rather than parsed steps: `script add` re-parses the whole
+  // buffer each time, so a half-written program is always re-validated as a whole and jump resolution
+  // never sees a stale partial parse. Both freed in on_close; the run is stopped in on_detach.
+  script:          Script_Run,
+  script_buf:      [dynamic]string, // authoring buffer, one source line per entry (owned)
+  script_buf_name: string, // owned
 
   // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
@@ -253,6 +329,10 @@ session_init :: proc(session: ^Session) -> bool {
     return false
   }
   session.auto_stuck_on = true // obstacle/stuck detection on by default (see auto_monitor)
+  session.combat_watch_on = true // never drop a target whose HP is falling (see auto_combat_watch)
+  session.aggro_first_on = true // ladder rung 1: kill what is coming for us first (see tc_pick_one)
+  session.melee_first_on = true // ladder rung 2: kill what is on top of us before the pack ranking
+  session.pocket_on = true // ladder rung 4: stay on the pack while it's inside attack_range
   session.reach_gate_on = true // proactive reach gate on by default (inert until findcull sets aobjcull_rva)
   session.preselect_on = true // precompute the next target during combat -> instant advance on kill
   // Mesh-accurate reach confirm defaults OFF: it injects a game-code thread (IntersectObjLine) per

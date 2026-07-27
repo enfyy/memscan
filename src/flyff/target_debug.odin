@@ -33,6 +33,7 @@ TC_Factors :: struct {
   cluster:      int, // local pack size (# candidates within density_radius, incl. self)
   in_melee:     bool,
   in_engage:    bool,
+  aggro:        bool, // its m_idDest is us - it's coming for us (ladder rung 1). See TC_Cand.aggro.
   on_cooldown:  bool,
   blocked:      bool,
   reachable:    bool,
@@ -157,6 +158,7 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
       cluster      = dens[i],
       in_melee     = c.d <= melee,
       in_engage    = c.d <= engage,
+      aggro        = c.aggro,
       on_cooldown  = recent_list_contains(session.tc_recent[:], c.obj, now, TC_RECENT_NS),
       blocked      = recent_list_contains(session.auto_blocked[:], c.obj, now, BLOCKED_NS),
       reachable    = rs == .Clear,
@@ -179,7 +181,16 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
     now           = now,
     name_filtered = len(names) > 0,
     require_fresh = true,
-    gate          = session.reach_gate_on,
+    aggro_on      = session.aggro_first_on, // ladder rungs 1/2/4 - must match the live picker exactly
+    melee_on      = session.melee_first_on,
+    pocket_on     = session.pocket_on,
+    // The live picker drops the reach gate under hunt mode (hunt commits to a blocked target and
+    // side-steps in rather than skipping) - see tc_finish_select/tc_finish_precompute. Without the same
+    // term here the prediction showed mobs gated out that live auto would happily take.
+    gate          = session.reach_gate_on && !hunt_steering_on(session),
+    // Sweep mode replaces the whole ladder with "nearest mob already inside attack_range" - without this
+    // the prediction would show the normal ladder's walk-to-the-next-pack order, not what auto will do.
+    sweep_on      = session.sweep_on,
     fence_on      = session.fence.active,
     avoid_on      = session.auto_avoid_on,
     avoid_dir     = session.auto_avoid_dir,
@@ -220,7 +231,8 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
     }
     slice.sort_by(refs, proc(a, b: View_Ref) -> bool {return a.d < b.d})
     for r, j in refs {
-      view[j] = TC_Cand{obj = cands[r.i].obj, d = r.d, pos = cands[r.i].pos}
+      // aggro must ride along or the sim's rung 1 never fires and tdbg mispredicts every aggroed pull.
+      view[j] = TC_Cand{obj = cands[r.i].obj, d = r.d, pos = cands[r.i].pos, aggro = cands[r.i].aggro}
       view_alive[j] = alive[r.i]
       view_dens[j] = dens[r.i]
     }
@@ -257,9 +269,14 @@ tc_predict_order :: proc(session: ^Session, names: []string) -> (dbg: TC_Debug, 
     }
     ctx.last_kill_set = true
     ctx.last_kill_pos = cands[idx].pos
-    // Move the stand-point ONLY when we had to leave our range to take this pick (Melee/Pocket are
-    // in-range, so a ranged char stays put; Nearest/Cluster/Density/Avoid are walks toward the mob).
-    if stage != .Melee && stage != .Pocket {
+    // Move the stand-point ONLY when we had to leave our range to take this pick (Melee/Pocket/Sweep are
+    // in-range by construction, so a ranged char stays put; Nearest/Cluster/Density/Avoid are walks
+    // toward the mob). Aggro has no range bound - it can be either - so judge that one by real distance.
+    stay := stage == .Melee ||
+      stage == .Pocket ||
+      stage == .Sweep ||
+      (stage == .Aggro && engine.dist_horizontal(cands[idx].pos, cur_pos) <= engage)
+    if !stay {
       cur_pos = cands[idx].pos
     }
     ctx.avoid_on = false // one-shot, consumed by the first pick
@@ -359,6 +376,8 @@ tc_summarize :: proc(dbg: TC_Debug) -> TC_Summary {
 
 stage_name :: proc(s: TC_Stage) -> string {
   switch s {
+  case .Aggro:
+    return "aggro"
   case .Melee:
     return "melee"
   case .Avoid:
@@ -371,6 +390,8 @@ stage_name :: proc(s: TC_Stage) -> string {
     return "nearest"
   case .Density:
     return "density"
+  case .Sweep:
+    return "sweep"
   case .None:
     return "-"
   case .Excluded:
@@ -384,6 +405,8 @@ stage_name :: proc(s: TC_Stage) -> string {
 fact_color :: proc(f: TC_Factors) -> string {
   if f.rank >= 0 {
     switch f.stage {
+    case .Aggro:
+      return "#ff4757" // red - it is coming for us (ladder rung 1)
     case .Melee:
       return "#1abc9c"
     case .Avoid:
@@ -396,6 +419,8 @@ fact_color :: proc(f: TC_Factors) -> string {
       return "#2ecc71"
     case .Density:
       return "#f1c40f"
+    case .Sweep:
+      return "#ffb02e" // amber - the same hue the radar paints a sweep lane in
     case .None, .Excluded:
       return "#8899aa"
     }
@@ -802,7 +827,7 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
   // ---- side panel: legend + summary ----
   fmt.sbprint(&b, "<div>\n")
   fmt.sbprint(&b, "<div class=card lg><h2>legend</h2>\n")
-  fmt.sbprint(&b, "<div><span style='background:#2ecc71'></span>nearest <span style='background:#e84393'></span>cluster <span style='background:#f1c40f'></span>density <span style='background:#3498db'></span>pocket <span style='background:#1abc9c'></span>melee <span style='background:#e67e22'></span>avoid</div>\n")
+  fmt.sbprint(&b, "<div><span style='background:#ff4757'></span>aggro <span style='background:#2ecc71'></span>nearest <span style='background:#e84393'></span>cluster <span style='background:#f1c40f'></span>density <span style='background:#3498db'></span>pocket <span style='background:#1abc9c'></span>melee <span style='background:#e67e22'></span>avoid <span style='background:#ffb02e'></span>sweep</div>\n")
   fmt.sbprint(&b, "<div><span style='background:#e74c3c'></span>stuck-blacklist <span style='background:#e67e22'></span>walled <span style='background:#9b59b6'></span>blocked by object <span style='background:#b8912f'></span>cooldown</div>\n")
   fmt.sbprintf(&b, "<div style='margin-top:4px;color:#7f8c98'>dot colour = predicted kill order: <b style='color:#ffec82'>warm/bright = next</b> &rarr; cool/dim = later. Numbers mark the first %d picks; small dots are later picks. Faint grey rings = distance markers (world units); cyan ring = attack_range; gold &times; = anchor. <b style='color:#9b59b6'>Solid purple boxes</b> = real object collision (trees/rocks/buildings), <b style='color:#8a95a5'>faint dashed boxes</b> = decorative props (bushes/grass) the game walks through, <b style='color:#e67e22'>orange squares</b> = terrain walls; a line from you to an excluded mob shows what its straight path clips. Toggle any layer with the checkboxes above the map.</div>\n", TDBG_NUM)
   fmt.sbprint(&b, "</div>\n")
@@ -813,7 +838,7 @@ tc_render_html :: proc(session: ^Session, dbg: TC_Debug, s: TC_Summary, names: [
   }
   row(&b, "vertical spread |Δy|", fmt.tprintf("max %.1f, mean %.1f", s.dy_max, s.dy_mean))
   row(&b, "mob spacing (nn horiz)", fmt.tprintf("min %.1f, mean %.1f, max %.1f", s.spacing_min, s.spacing_mean, s.spacing_max))
-  row(&b, "stages", fmt.tprintf("melee %d, avoid %d, cluster %d, pocket %d, nearest %d, density %d", s.stage_counts[.Melee], s.stage_counts[.Avoid], s.stage_counts[.Cluster], s.stage_counts[.Pocket], s.stage_counts[.Nearest], s.stage_counts[.Density]))
+  row(&b, "stages", fmt.tprintf("aggro %d, melee %d, avoid %d, cluster %d, pocket %d, nearest %d, density %d, sweep %d", s.stage_counts[.Aggro], s.stage_counts[.Melee], s.stage_counts[.Avoid], s.stage_counts[.Cluster], s.stage_counts[.Pocket], s.stage_counts[.Nearest], s.stage_counts[.Density], s.stage_counts[.Sweep]))
   row(&b, "walk reversals", fmt.tprintf("%d of %d picks turned around", dbg.reversals, len(dbg.order)))
   row(&b, "excluded", fmt.tprintf("%d  (cooldown %d, blocked %d, unreachable %d)", s.excluded, s.n_cooldown, s.n_blocked, s.n_unreach))
   fmt.sbprint(&b, "</div>\n")
@@ -897,13 +922,15 @@ tc_print_console :: proc(dbg: TC_Debug, s: TC_Summary, names: []string) {
     s.spacing_mean,
   )
   fmt.printfln(
-    "  stages: melee %d avoid %d cluster %d pocket %d nearest %d density %d | reversals %d/%d | excluded: cooldown %d blocked %d unreach %d",
+    "  stages: aggro %d melee %d avoid %d cluster %d pocket %d nearest %d density %d sweep %d | reversals %d/%d | excluded: cooldown %d blocked %d unreach %d",
+    s.stage_counts[.Aggro],
     s.stage_counts[.Melee],
     s.stage_counts[.Avoid],
     s.stage_counts[.Cluster],
     s.stage_counts[.Pocket],
     s.stage_counts[.Nearest],
     s.stage_counts[.Density],
+    s.stage_counts[.Sweep],
     dbg.reversals,
     len(dbg.order),
     s.n_cooldown,

@@ -60,6 +60,14 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_kills(s, args)
   case "stuck":
     cli_stuck(s, args)
+  case "combatwatch":
+    cli_combatwatch(s, args)
+  case "priority", "prio":
+    cli_priority(s, args)
+  case "preset":
+    cli_preset(s, args)
+  case "aggro":
+    cli_aggro(s, args)
   case "preselect":
     cli_preselect(s, args)
   case "lookalive":
@@ -152,6 +160,8 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_objects(s, args)
   case "collscan":
     cli_collscan(s, args)
+  case "collignore":
+    cli_collignore(s, args)
   case "linkscan":
     cli_linkscan(s, args)
   case "reach":
@@ -174,6 +184,8 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_radar(s, args)
   case "fence":
     cli_fence(s, args)
+  case "sweep":
+    cli_sweep(s, args)
   case "moveto", "walkto", "go":
     cli_moveto(s, args)
   case "jump":
@@ -184,6 +196,14 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_findmove(s, args)
   case "leaderboard", "lb":
     cli_leaderboard(s, args)
+  case "sense":
+    cli_sense(s, args)
+  case "script", "sc":
+    cli_script(s, args)
+  case "key":
+    cli_key(s, args)
+  case "test":
+    cli_test(s, args)
   case:
     return false
   }
@@ -212,6 +232,10 @@ module_tick :: proc(es: ^engine.Session) {
     }
   }
   s.pause_key_prev = toggle_down
+  // Behaviour machine FIRST - that is where it belongs once it owns routing (see behaviour.odin).
+  // Today it only senses + ticks an idle state, and it is inert unless 'sense on', so this changes
+  // nothing about how the farm behaves.
+  behaviour_tick(s)
   auto_tick(s) // hands-free farm: advance focus when the target dies
   penya_tick(s) // accrue penya total + record gains for the radar (works with the radar closed)
   range_ring_tick(s) // attack-range circle overlay (ring / draw_range) - non-blocking
@@ -225,6 +249,11 @@ on_attach :: proc(es: ^engine.Session) {
   s.tc_recent = nil
   s.collider_cache_valid = false
   s.collider_job.gen += 1 // orphan any in-flight collider rebuild from the previous process
+  // A painted lane belongs to the world it was drawn in - never carry one across processes. The walk flag
+  // is dropped FIRST so sweep_clear's halt-the-hop write can't fire into the new process with the old
+  // (about to be reloaded) layout; the previous process is gone, so there is no walk left to stop.
+  s.sweep_walking = false
+  sweep_clear(s)
 
   // Load the persisted Flyff layout (flyff.cfg next to memscan.exe) fresh over defaults, so a
   // patched build just needs 'calibrate' once. Absent file -> built-in defaults.
@@ -243,6 +272,11 @@ on_attach :: proc(es: ^engine.Session) {
   s.lookalive_on = s.layout.lookalive_on
   s.reach_gate_on = s.layout.reach_gate_on
   s.hunt_on = s.layout.hunt_on
+  s.combat_watch_on = s.layout.combat_watch_on
+  s.auto_stuck_on = s.layout.auto_stuck_on
+  s.aggro_first_on = s.layout.aggro_first_on
+  s.melee_first_on = s.layout.melee_first_on
+  s.pocket_on = s.layout.pocket_on
 
   // srvsync defaults ON now that the anti-DC path is proven - it's always needed. It stays inert
   // (notify_server_target no-ops) until sendsettarget_rva/objid_off are set on a 32-bit client, so
@@ -260,6 +294,10 @@ on_attach :: proc(es: ^engine.Session) {
   s.last_kill_ns = 0
   s.manual_kill_obj = 0
   s.manual_kill_recorded = false
+
+  // Fresh behaviour-machine baselines for the new process (see behaviour.odin) - kill/penya sequence
+  // counters and the HP anchor belong to the process that produced them.
+  behaviour_reset(s)
 
   // Fresh leaderboard recording span for the new process (see leaderboard.odin).
   lb_run_reset(s)
@@ -287,6 +325,11 @@ on_detach :: proc(es: ^engine.Session) {
   remote_free_dplay_page(s)
   s.collider_cache_valid = false // stale across processes
   s.collider_job.gen += 1 // discard a collider rebuild still running against the detached process
+  // Stop a running script BEFORE the baselines are reset: it goes through the state machine, so the
+  // in-flight action's Exit still runs against the process it was issued in (halting a walk while
+  // there is still something to halt). Same reasoning as sweep_walking being dropped on attach.
+  script_stop(s)
+  behaviour_reset(s) // drop the sense baselines with the process they were measured against
 }
 
 // Session-end teardown: free the remote pages (if still attached) + all flyff lifetime-owned data.
@@ -299,7 +342,10 @@ on_close :: proc(es: ^engine.Session) {
     remote_free_actmsg_page(s)
     remote_free_dplay_page(s)
   }
+  script_run_free(&s.script) // owned steps + watchers
+  behaviour_scratch_free(s)
   fence_destroy(&s.fence)
+  delete(s.sweep_path)
   auto_free_names(s)
   for n in s.last_auto_names {
     delete(n)
@@ -336,7 +382,19 @@ farming (day to day)
                              resumes. F10 = full auto stop/start toggle (re-arms the last target spec)
   timer <minutes>            auto-disable 'auto' after N minutes (e.g. 'timer 60'); 'timer off' cancels
   kills <n>                  auto-disable 'auto' after N confirmed kills (e.g. 'kills 100'); 'kills off' cancels
+  priority                   show the target PRIORITY LADDER - the ordered rungs auto picks by. the first
+                             rung that finds an eligible mob wins; each optional rung toggles independently
+  priority aggro on|off      rung 1: a mob that is coming for YOU outranks everything, at any distance
+  priority melee on|off|<r>  rung 2: a mob within <r> units of you outranks pack-stickiness (default 3)
+  priority pocket on|off     rung 3: inside attack_range, prefer the mob nearest your last kill (pack sticky)
+  preset [name]              apply a whole playstyle at once (tower|tanky|ranged|quest|boss); bare 'preset'
+                             lists them and marks the one your current settings match
+  aggro [radius]             diagnostic: which nearby mobs are targeting YOU (their m_idDest vs your objid).
+                             read-only - use it to confirm rung 1 sees what you expect
   stuck [on|off]             toggle reactive obstacle skip-detection (on by default; 'stuck off' for ranged/standing)
+  combatwatch [on|off|<s>]   never drop a target whose HP is falling - fixes high-HP mobs being skipped mid-fight
+                             by the stuck/reach fallbacks (on by default; <s> = seconds since the last hit that
+                             still count as fighting, default 4 - raise it above your slowest attack/cast interval)
   density [on|off]           cluster steering: OFF (default) = target the plain nearest mob (v0.4.0 behaviour).
                              ON commits to a mob pack until it's wiped; a farther pack steals the pick only past the gates below
   density mingain <n>        gate 1: extra pack members a farther pack needs to steal the pick (default 3)
@@ -375,6 +433,20 @@ farming (day to day)
                              (carve-out; don't target inside), '!' AVOID (a hard no-go: don't target inside OR
                              behind it, and the player never walks through it - e.g. a tower teleport pad).
                              adding a shape auto-activates the gate; 'fence off' overrides without clearing.
+  sweep [sub]                SWEEP MODE - paint a route and clear it lane by lane. RIGHT-DRAG from inside
+                             the green attack-range ring on the radar to paint a swath the width of your
+                             reach; release and auto clears the circle it stands in, steps forward along
+                             the stroke, clears again (a lawnmower pass). The paint erases behind you, so
+                             you can see what's left. While a lane is armed the picker will ONLY take mobs
+                             already inside attack_range, so nothing can pull you off the route (hunt and
+                             the look-alive walk behaviors are suppressed until it ends). The stroke is
+                             validated as you draw it: terrain walls, avoid(!) fence zones and OT_CTRL
+                             walls/buildings turn the rest of it red and are trimmed on release. Tree and
+                             rock silhouettes do NOT trim - their OBB is the whole canopy, not the trunk,
+                             and you walk under canopies - so those stretches stay, tinted olive, and the
+                             hop watchdog steps past one that turns out to be solid.
+                             RIGHT-CLICK the lane to cancel. Needs 'findmove'.
+                             no arg = status. subs: to <x,z> (straight lane from you - scriptable) / off
   ring [radius] [Ns]         draw your attack_range as a cyan circle on the ground (follows you, ~30s,
                              non-blocking); attack a mob to see if the ring reaches it. 'ring off' stops
   draw_range                 toggle a PERSISTENT range circle that live-tracks attack_range (so
@@ -386,10 +458,43 @@ farming (day to day)
 character control (no keypress simulation; run 'findmove' once to pin it)
   moveto <x,z> | <x,y,z>     walk to a world point - writes CMover's dest fields, so the client walks
                              there itself (like a ground click). Y defaults to your height. aliases: walkto, go
+  key <name>                 press one game hotkey now (1-9, a-z, f1-f12, space...). posts to the
+                             game window, so it does NOT need focus. the primitive behind press_key
   jump                       jump (sends the client's own OBJMSG_JUMP; all in-game jump guards apply)
   position (pos)             print your world position (copy-paste x,y,z for moveto / findpos)
   findmove                   pin the move/jump config (dest-field offsets + sendactmsg_rva via the
                              actmover vtable + actmover_off + jump_msg); re-run after a game patch. saves flyff.cfg
+
+live verification (run these once after a build, with the game running)
+  test                       list the checks; each is ONE command, in the order worth doing them
+  test all                   run every check that does NOT move your character
+  test <name> [arg]          run one (e.g. 'test pet 9', 'test walkstop')
+                             most decide PASS/FAIL themselves by reading the game's own memory
+
+behaviour scripts (build your own farming behaviour out of blocks; 'auto' becomes one script among many)
+  script blocks              THE CATALOG: every action + event, with [OK] / [--] and what a missing
+                             one still needs. this is both the reference and the roadmap
+  script new <name>          start a buffer; 'script add <block...>' appends one block at a time
+  script show [name]         print the script back from its PARSED form - if it differs from what you
+                             typed, the parse lost something
+  script save <name>         write scripts/<name>.ms      script load <name>   read one back
+  script list                what's saved
+  script run [name] [once|loop]   validate every block, then run it. no name = the buffer.
+                             '#! loop' as the script's first line makes looping the default
+  script                     status: which step, how long, which interrupts are armed
+  script step [off]          debug: freeze the run and execute ONE block at a time ('off' resumes).
+                             interrupts keep running while stepping, so you can still break out
+  script stop                end the run - whatever was in flight gets torn down (a walk halts)
+  syntax: one block per line, '#' comments.  if <event> / else / end,  repeat <n> / end,
+          while <event> / end,  wait_for <event>,  <action> until <event>,  on <event> -> <action>
+          'on' is an INTERRUPT: checked before every step, first match wins. @vars interpolate.
+
+behaviour machine (the declared state machine that will replace the hardcoded 'auto' - see behaviour.odin)
+  sense                      one-shot: what the machine can SEE right now (target, kills, penya, HP, bag).
+                             read-only - a sense can never change what the bot does
+  sense on|off               continuous sensing on the background tick (off by default; costs a few
+                             small reads per tick, the enumerating ones are throttled)
+  sense list                 every sense, what it means, and how often it is polled
 
 setup & health (run once after a game patch)
   setup <name> [hp]          ONE-STEP setup: stand in a field on the ground with a few DISTINCT monster

@@ -189,8 +189,10 @@ auto_count_reached :: proc(session: ^Session, now: i64) -> bool {
 // Progress monitor for the focused mob, called every tick while a live target is selected. Detects
 // the character jamming against an obstacle: if the player->target distance stops dropping for
 // STUCK_NS while still farther than ARRIVE_DIST, the mob is unreachable -> blacklist it and clear
-// focus so the next tick re-acquires a reachable one. Reaching/attacking keeps d <= ARRIVE_DIST so
-// combat is never flagged; a kill clears focus through the normal (advance) path instead.
+// focus so the next tick re-acquires a reachable one. A kill clears focus through the normal (advance)
+// path instead. Two things keep a real fight from ever being flagged: melee keeps d <= ARRIVE_DIST, and
+// the combat watch (auto_in_combat) covers everything else - a high-HP mob fought from range plateaus
+// the distance for the whole kill, which is indistinguishable from a jam by distance alone.
 auto_monitor :: proc(session: ^Session, focus: uintptr, now: i64) {
   // New target (or first sighting) -> (re)establish the baseline; judge progress from the next tick.
   if focus != session.auto_focus_obj {
@@ -206,8 +208,10 @@ auto_monitor :: proc(session: ^Session, focus: uintptr, now: i64) {
     return // transient read failure; retry next tick
   }
   d := engine.dist_3d(ppos, tpos)
-  if d <= ARRIVE_DIST {
-    // Arrived / in melee - keep the window fresh so standing in combat never trips the monitor.
+  if d <= ARRIVE_DIST || auto_in_combat(session, now) {
+    // Arrived / in melee, OR we're landing hits on it (its HP is falling): keep the window fresh so
+    // standing still in a real fight never trips the monitor. The second case is what makes high-HP
+    // mobs work - a ranged/slow kill legitimately plateaus the distance for the whole fight.
     session.auto_best_dist = d
     session.auto_progress_at = now
     return
@@ -221,13 +225,21 @@ auto_monitor :: proc(session: ^Session, focus: uintptr, now: i64) {
   }
   // Plateaued while still far. Once that's persisted for STUCK_NS, treat the mob as blocked.
   if now - session.auto_progress_at >= STUCK_NS {
-    if session.hunt_on {
+    if hunt_steering_on(session) {
       // Hunt commits to this target: never drop it - side-step around the obstacle and re-lock (below).
       hunt_on_stuck(session, focus, ppos, tpos, now)
     } else {
       auto_skip_blocked(session, focus, ppos, tpos, fmt.tprintf("blocked (d=%.1f)", d), true, now)
     }
   }
+}
+
+// Is hunt's commit-and-chase steering live? Hunt never drops a target and side-steps around blockers to
+// keep chasing it - which is exactly the "walk wherever the mob is" behaviour a painted sweep lane must
+// not have, so a live lane suppresses it. hunt_on itself is left alone, so hunt comes straight back when
+// the sweep ends. Gate every hunt-vs-farm BRANCH on this, not on session.hunt_on directly.
+hunt_steering_on :: proc(session: ^Session) -> bool {
+  return session.hunt_on && !session.sweep_on
 }
 
 // Blacklist <focus> and clear m_pObjFocus so the next tick advances to a different mob. Shared by the
@@ -269,6 +281,10 @@ clear_focus :: proc(session: ^Session) {
     }
   }
   session.auto_focus_obj = 0
+  // Drop the combat-watch anchor too: the allocator can hand the same CObj* back for a later mob, and a
+  // stale "damage landed" stamp would grant that fresh target an unearned grace window.
+  session.auto_hp_obj = 0
+  session.auto_hp_drop_at = 0
 }
 
 // Reach re-watch for the LOCKED target (reach used to be checked only at pick time): a mob can be
@@ -277,7 +293,8 @@ clear_focus :: proc(session: ^Session) {
 // straight approach every REACH_RECHECK_NS; REACH_BLOCKED_DEBOUNCE consecutive blocked probes
 // (transient clips happen while rounding corners) skip the mob like a stuck-skip, minus the steer
 // hint. Cheap: compute_reach is pure math once the collider cache is warm. Gated on reach_gate_on at
-// the call site (auto_tick).
+// the call site (auto_tick), and held off entirely while the combat watch says we're landing hits (a
+// mob we're demonstrably damaging is reachable enough, whatever the sightline probe thinks).
 auto_reach_watch :: proc(session: ^Session, focus: uintptr, now: i64) {
   if focus != session.auto_reach_obj {
     session.auto_reach_obj = focus
@@ -289,6 +306,10 @@ auto_reach_watch :: proc(session: ^Session, focus: uintptr, now: i64) {
     return
   }
   session.auto_reach_next_check = now + REACH_RECHECK_NS
+  if auto_in_combat(session, now) {
+    session.auto_reach_fail_count = 0 // its HP is falling, so we're hitting it - a blocked sightline is moot
+    return
+  }
   handle := session.proc_info.handle
   base := session.proc_info.base
   pt := session.ptr_size == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
@@ -318,6 +339,44 @@ auto_reach_watch :: proc(session: ^Session, focus: uintptr, now: i64) {
     session.auto_reach_fail_count = 0
     auto_skip_blocked(session, focus, ppos, tpos, "unreachable", false, now)
   }
+}
+
+// Combat watch: track the locked mob's HP and stamp the moment it last DROPPED. Called every tick from
+// auto_tick (one 4-byte read) while a target is focused, ahead of the two drop-fallbacks that consult it
+// through auto_in_combat. Only a strict decrease counts as damage - a RISE (mob regen, a heal, or the
+// pointer being reused by a fresh mob) just re-anchors, so we never fake a fight out of noise.
+auto_combat_watch :: proc(session: ^Session, focus: uintptr, now: i64) {
+  hp, ok := read_mob_hp(session, focus)
+  if !ok {
+    return // hp_off unset or a transient read failure - leave the anchor alone, retry next tick
+  }
+  if focus != session.auto_hp_obj {
+    // New target: anchor its HP and start with NO grace, so a mob we never damage is dropped on the
+    // normal schedule (the fallbacks must still work for the "walked into a wall" case).
+    session.auto_hp_obj = focus
+    session.auto_hp_last = hp
+    session.auto_hp_drop_at = 0
+    return
+  }
+  if hp < session.auto_hp_last {
+    session.auto_hp_drop_at = now // damage landed - this is a real fight, hold the fallbacks off
+  }
+  session.auto_hp_last = hp
+}
+
+// True while the locked target took damage recently enough to call this an ongoing fight (within
+// layout.combat_grace seconds of the last HP drop). The two target-drop fallbacks - the distance-plateau
+// monitor (auto_monitor) and the reach re-watch (auto_reach_watch) - skip their drop while this holds.
+// Always false when the watch is off or hp_off was never pinned, so both fall back to the old behavior.
+auto_in_combat :: proc(session: ^Session, now: i64) -> bool {
+  if !session.combat_watch_on || session.auto_hp_drop_at == 0 {
+    return false
+  }
+  grace := f64(session.layout.combat_grace)
+  if grace <= 0 {
+    grace = f64(FLYFF_COMBAT_GRACE)
+  }
+  return now - session.auto_hp_drop_at < i64(grace * 1_000_000_000)
 }
 
 // Read a mover's current HP (hp_off). ok=false when hp_off isn't configured or the read fails.
@@ -368,6 +427,7 @@ pause_resume :: proc(session: ^Session, killed_obj: uintptr, now: i64) {
   session.pause_obj = 0
   session.auto_count += 1 // the kill that resumes us counts too (this is the first kill when armed)
   lb_record_kill(session, killed_obj) // attribute to the leaderboard span (no-op unless recording)
+  script_note_kill(session, killed_obj) // per-species tally for a script's `kills_of` (no-op unless running)
   if pos, ok := engine.read_vec3(session.proc_info.handle, killed_obj + uintptr(session.layout.pos_off)); ok {
     session.last_kill_pos = pos
     session.last_kill_set = true
@@ -411,6 +471,13 @@ auto_tick :: proc(session: ^Session) {
     pause_tick(session, now)
     return
   }
+  // Sweep mode (a painted lane): it owns the ROUTE, so it gets first refusal on the tick - it erases the
+  // paint under us, halts any hop the moment something locks, and steps the character forward once the
+  // circle has been clear a beat. It hands the tick back (returns false) whenever the normal focus-live
+  // combat branch or the (sweep-gated, in-range-only) picker should run instead. See sweep.odin.
+  if sweep_tick(session, now) {
+    return
+  }
   // Look-alive approach in progress: we've picked the next mob but are still WALKING to it (waypoints)
   // before locking. Runs every tick (unthrottled) for responsive arrival detection, ahead of the normal
   // focus-live / advance logic - nothing is locked yet, so the focus-live branch below would never fire.
@@ -421,10 +488,15 @@ auto_tick :: proc(session: ^Session) {
   // A live target is still selected: watch it for obstacle-stuck (every tick, unthrottled) and, while
   // we fight it, precompute the NEXT target so the advance is instant when it dies (pre-select).
   if focus, fok := read_focus_ptr(session); fok && focus != 0 && focus_obj_live(session, focus) {
+    // Damage watch FIRST: both fallbacks below ask auto_in_combat whether this tick's HP is falling, so
+    // the stamp has to be current before either one can decide to drop the target.
+    if session.combat_watch_on {
+      auto_combat_watch(session, focus, now)
+    }
     if session.auto_stuck_on {
       auto_monitor(session, focus, now)
     }
-    if session.reach_gate_on && !session.hunt_on {
+    if session.reach_gate_on && !hunt_steering_on(session) {
       auto_reach_watch(session, focus, now) // reach can be lost AFTER selection - watch it, don't jam
       // (hunt commits to the target and never drops it for reachability - it side-steps instead, below)
     }
@@ -433,7 +505,10 @@ auto_tick :: proc(session: ^Session) {
     if session.la_approach_on {
       return
     }
-    if session.preselect_on && focus != session.auto_next_for {
+    // (!sweep_on: sweep_tick invalidates the cache every tick anyway - a pick measured from this fight's
+    // spot can drift out of the circle once we hop a brush width forward - so precomputing one would just
+    // burn a full background enumeration per tick for a result that is thrown away.)
+    if session.preselect_on && !session.sweep_on && focus != session.auto_next_for {
       // One precompute per distinct locked target, stutter-safe: the expensive enumeration runs on a
       // background worker (tc_scan_request) with no lock held; only the cheap cascade tail runs here.
       // auto_next_for is marked when the batch is CONSUMED (not requested), so this branch re-enters
@@ -503,6 +578,7 @@ auto_tick :: proc(session: ^Session) {
     if died {
       session.auto_count += 1
       lb_record_kill(session, session.auto_sel_obj) // attribute to the leaderboard span (no-op unless recording)
+      script_note_kill(session, session.auto_sel_obj) // per-species tally for a script's `kills_of`
       session.last_kill_pos = session.auto_sel_pos
       session.last_kill_set = true
       record_kill_event(session, session.auto_sel_pos, now) // radar laser + zap
@@ -534,7 +610,12 @@ auto_tick :: proc(session: ^Session) {
   // arrival (see lookalive_approach_tick). Needs moveto (findmove). This mode bypasses the pre-select fast
   // path - fine, since look-alive targets low-spawn grinds where a per-kill synchronous pick isn't a
   // stutter concern (the background-scan fix exists for high kill rates).
-  if session.lookalive_on && (session.layout.la_step_on || session.layout.la_maxrange_on) && moveto_configured(session) {
+  // (!sweep_on: the walk-first approach walks TOWARD MOBS, which is exactly what a painted lane must
+  // never do - sweep_tick owns every step while a lane is armed.)
+  if session.lookalive_on &&
+     (session.layout.la_step_on || session.layout.la_maxrange_on) &&
+     moveto_configured(session) &&
+     !session.sweep_on {
     session.auto_next_set = false // the pre-select cache is unused in approach mode; don't let it commit stale
     session.auto_next_for = 0
     if obj, tpos, stage, pack, _, ok := tc_precompute_next(session, session.auto_names[:], 0); ok {
@@ -743,6 +824,17 @@ auto_stop :: proc(session: ^Session) {
   session.auto_reach_obj = 0 // reach re-watch state is per-run
   session.auto_reach_next_check = 0
   session.auto_reach_fail_count = 0
+  // Sweep: reset the WALK bookkeeping but KEEP the path + cursor, so an F10 pause/resume continues the
+  // lane exactly where it left off. Only completing it, 'sweep off', or a radar right-click drops it.
+  // The kill baseline is re-zeroed because auto_count is (above), so the tally counts the resumed run.
+  if session.sweep_walking {
+    move_stop(session) // don't leave a hop running after the farm has been told to stop
+  }
+  session.sweep_walking = false
+  session.sweep_best = 1e30
+  session.sweep_progress_at = 0
+  session.sweep_clear_since = 0
+  session.sweep_kills_start = 0
   clear(&session.auto_blocked)
   tc_scan_invalidate(session) // orphan any in-flight background scan; its publish will discard
 }
@@ -771,13 +863,21 @@ cli_auto :: proc(session: ^Session, args: []string) {
   if len(args) == 0 && session.auto_on {
     state := session.auto_paused ? "ARMED/paused" : "ON"
     fmt.printfln("auto-farm %s: %s.  %s", state, auto_target_desc(session.auto_names[:]), auto_stats(session, time.now()._nsec))
+    melee_r, engage_r := pick_ranges(session)
     fmt.printfln(
-      "  stuck:%s  preselect:%s  lookalive:%s  reachgate:%s  density:%s",
+      "  priority: %s > %s > %s > %s > nearest   ('priority' for the full ladder)",
+      session.aggro_first_on ? "attacking-me" : "(attacking-me off)",
+      session.melee_first_on ? fmt.tprintf("melee<%.1f", melee_r) : "(melee off)",
+      session.pocket_on ? fmt.tprintf("in-range<%.1f", engage_r) : "(in-range off)",
+      session.layout.density_on ? fmt.tprintf("pack(mingain=%d detour=%v)", session.layout.density_min_gain, session.layout.density_max_detour) : "(pack steering off)",
+    )
+    fmt.printfln(
+      "  stuck:%s  combatwatch:%s  preselect:%s  lookalive:%s  reachgate:%s",
       session.auto_stuck_on ? "on" : "off",
+      session.combat_watch_on ? fmt.tprintf("on (grace %.1fs)", session.layout.combat_grace) : "off",
       session.preselect_on ? "on" : "off",
       session.lookalive_on ? "on" : "off",
       session.reach_gate_on ? "on" : "off",
-      session.layout.density_on ? fmt.tprintf("on (mingain=%d detour=%v)", session.layout.density_min_gain, session.layout.density_max_detour) : "off",
     )
     return
   }
@@ -827,6 +927,8 @@ cli_auto :: proc(session: ^Session, args: []string) {
   session.auto_count = 0
   session.auto_start = time.now()._nsec
   session.auto_focus_obj = 0 // reset obstacle/stuck tracking for the new run
+  session.auto_hp_obj = 0 // and the combat-watch anchor (see auto_combat_watch)
+  session.auto_hp_drop_at = 0
   session.auto_avoid_on = false
   session.auto_sel_set = false
   session.last_kill_set = false
@@ -861,7 +963,53 @@ cli_stuck :: proc(session: ^Session, args: []string) {
     fmt.eprintln("usage: stuck [on|off]")
     return
   }
+  session.layout.auto_stuck_on = session.auto_stuck_on // cfg mirror (see on_attach) - this used to be the
+  if session.attached {                                // one auto toggle that silently reverted on restart
+    flyff_save_cfg(session.layout, flyff_cfg_path()) // attach-gated (see cli_preselect note)
+  }
   fmt.printfln("stuck-detection %s.", session.auto_stuck_on ? "ON" : "OFF")
+}
+
+// combatwatch | combatwatch on|off | combatwatch <seconds> -> never drop a target whose HP is falling.
+// The stuck-plateau monitor and the reach re-watch both exist for mobs we can't reach, but they judge
+// that by "the distance stopped dropping", which is also exactly what a long fight against a high-HP mob
+// looks like - so tanky targets got skipped mid-kill and auto churned through them without finishing any.
+// With this on, damage landing on the locked mob (its HP falling) suppresses both drops; combat_grace
+// seconds after the last hit lands they resume as before, so a mob we genuinely can't hit is still
+// skipped. On by default. Set the grace above your slowest hit interval (cast time / attack speed).
+cli_combatwatch :: proc(session: ^Session, args: []string) {
+  switch {
+  case len(args) == 0:
+    session.combat_watch_on = !session.combat_watch_on
+  case len(args) == 1 && args[0] == "on":
+    session.combat_watch_on = true
+  case len(args) == 1 && args[0] == "off":
+    session.combat_watch_on = false
+  case len(args) == 1:
+    // A bare number is the grace window in seconds (and implies on) - 'combatwatch 6' for a slow caster.
+    secs, ok := strconv.parse_f64(args[0])
+    if !ok || secs <= 0 {
+      fmt.eprintln("usage: combatwatch [on|off|<seconds>]")
+      return
+    }
+    session.layout.combat_grace = f32(secs)
+    session.combat_watch_on = true
+  case:
+    fmt.eprintln("usage: combatwatch [on|off|<seconds>]")
+    return
+  }
+  session.layout.combat_watch_on = session.combat_watch_on // cfg mirror (see on_attach)
+  if session.attached {
+    flyff_save_cfg(session.layout, flyff_cfg_path()) // attach-gated (see cli_preselect note)
+  }
+  hint := ""
+  if session.combat_watch_on && session.layout.hp_off == 0 {
+    hint = "  (INERT: hp_off isn't pinned - run 'setup <name> [hp]')"
+  }
+  fmt.printfln(
+    "combat-watch %s (grace %.1fs).%s",
+    session.combat_watch_on ? "ON" : "OFF", session.layout.combat_grace, hint,
+  )
 }
 
 // preselect | preselect on|off -> toggle pre-selection: while fighting a mob, precompute the NEXT target
@@ -1142,7 +1290,7 @@ lookalive_approach_tick :: proc(session: ^Session, now: i64) {
       session.la_approach_progress_at = now
     } else if now - session.la_approach_progress_at >= STUCK_NS {
       session.la_approach_on = false
-      if session.hunt_on {
+      if hunt_steering_on(session) {
         hunt_on_stuck(session, obj, ppos, tpos, now) // sets up a fresh (flipped) side-step; never drops
       } else {
         auto_skip_blocked(session, obj, ppos, tpos, "blocked on approach", true, now)

@@ -40,7 +40,16 @@ run_repl :: proc(session: ^Session) {
 // sequentially without short-circuiting). Shared by the REPL and the hotkey watcher;
 // callers must hold session.exec_mutex. Returns true if a 'quit' command ran.
 execute_line :: proc(session: ^Session, line: string) -> (quit: bool) {
-  normalized, _ := strings.replace_all(line, "&&", ";", context.temp_allocator)
+  // @name interpolation happens FIRST, on the whole line, so it reaches every command in the
+  // chain identically (see vars.odin). An unknown name abandons the entire line rather than
+  // letting the literal "@typo" reach a command that would take it as an address or a value.
+  expanded, vars_ok, bad := expand_vars(session, line, context.temp_allocator)
+  if !vars_ok {
+    fmt.eprintfln("unknown variable '@%s' - 'var' lists what's set, 'var %s <value>' sets it.", bad, bad)
+    free_all(context.temp_allocator)
+    return false
+  }
+  normalized, _ := strings.replace_all(expanded, "&&", ";", context.temp_allocator)
   segments := strings.split(normalized, ";", context.temp_allocator)
   for seg in segments {
     s := strings.trim_space(seg)
@@ -154,6 +163,8 @@ dispatch :: proc(session: ^Session, cmd: string, args: []string) -> (quit: bool)
     cmd_codescan(session, args)
   case "hotkey", "hk":
     cmd_hotkey(session, args)
+  case "var":
+    cmd_var(session, args)
   case:
     if session.module_active && session.module_dispatch != nil && session.module_dispatch(session, cmd, args) {
       return false
@@ -244,7 +255,10 @@ disassembly / code recon
 
 automation
   hotkey <command>    (hk)   bind a key (when prompted) to run <command>, even backgrounded;
-                             also: hotkey list | hotkey clear`
+                             also: hotkey list | hotkey clear
+  var <name> <value>         set a variable, then use it as @<name> in ANY command
+                             (e.g. 'var spot 6800,3300' then 'moveto @spot'). '@@' is a literal '@'.
+                             also: var (list) | var <name> (show) | var <name> - (unset) | var clear`
 
 @(private = "file")
 HELP_FOOTER :: `
