@@ -10,6 +10,10 @@ import "core:sync"
 // to the active module's command set (session.module_dispatch) for anything it
 // doesn't own. A module plugs in by registering its hooks on the session before
 // run_repl is called (see flyff.flyff_register / main).
+//
+// run_module_ui below is the ALTERNATIVE host: with a main module compiled in
+// (-define:MAIN_MODULE=<name>, see src/main.odin) the module's UI owns the
+// process from startup and no REPL is ever started.
 // ===========================================================================
 
 run_repl :: proc(session: ^Session) {
@@ -34,6 +38,32 @@ run_repl :: proc(session: ^Session) {
     }
   }
   fmt.println("bye.")
+}
+
+// Main-module host: hand the process straight to the active module's UI instead of reading commands.
+// Returns when the UI closes (which ends the app - main has nothing left to run). Returns false
+// WITHOUT opening anything if the module registered no UI, so main can fall back to the REPL rather
+// than exiting on nothing at all.
+run_module_ui :: proc(session: ^Session) -> bool {
+  if !session.module_active || session.open_ui == nil {
+    fmt.eprintfln(
+      "main module '%s' has no UI to open - falling back to the REPL.",
+      session.module_active ? session.module_name : "?",
+    )
+    return false
+  }
+  fmt.printfln("memscan - main module '%s' (no REPL in this build; this console keeps the log).", session.module_name)
+  // The watcher thread is what drives module_tick - the auto-farm, the overlays, the global
+  // interrupts. Normally a command starts it lazily (ensure_hotkey_thread), but here there is no REPL
+  // to type one in before the window opens, and the UI expects its background work live from frame one.
+  ensure_hotkey_thread(session)
+  // Same contract as cmd_module and every window command: open_ui is entered holding exec_mutex and
+  // returns with it held (the module's frame loop releases it per frame - see flyff.cli_radar).
+  sync.mutex_lock(&session.exec_mutex)
+  session.open_ui(session)
+  sync.mutex_unlock(&session.exec_mutex)
+  fmt.println("bye.")
+  return true
 }
 
 // Run one input line (possibly several commands chained with ';' or '&&', which run

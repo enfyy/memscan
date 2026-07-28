@@ -27,7 +27,7 @@ if "%~1"=="off" goto :have_hash
 
 for /f "usebackq delims=" %%h in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tool\lb_build_hash.ps1"`) do set "HASH=%%h"
 if not defined HASH (
-  echo ERROR: could not read the build hash from .out\debug\memscan.exe - run build.bat first, or pass a hash explicitly.
+  echo ERROR: could not read the build hash from a .out\debug\memscan*.exe REPL build - run build.bat debug first, or pass a hash explicitly.
   exit /b 1
 )
 

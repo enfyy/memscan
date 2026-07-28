@@ -4,7 +4,9 @@ setlocal EnableDelayedExpansion
 REM ==============================================
 REM Build Configuration
 REM ==============================================
-set "EXECUTABLE=memscan.exe"
+REM The exe name is composed further down from what the build actually IS:
+REM   <EXE_BASE>-<version>-<mode>[-<module>][-tracy].exe   e.g. memscan-1.4.0-release-flyff.exe
+set "EXE_BASE=memscan"
 set "SOURCE_DIR=src"
 set "OUTPUT_DIR=.out"
 set "DEBUG_DIR=%OUTPUT_DIR%\debug"
@@ -40,28 +42,67 @@ REM ==============================================
 REM Validate Input & Environment
 REM ==============================================
 if "%1"=="" (
-    echo Usage: build.bat [debug^|release] [tracy]
+    echo Usage: build.bat [debug^|release] [tracy] [module]
+    echo   tracy    - enable the Tracy profiler
+    echo   module   - build ^<module^> as the MAIN module: its UI opens on start, no REPL ^(e.g. flyff^)
     exit /b 1
 )
 
 if /i "%1"=="debug" (
     set "BUILD_DIR=%DEBUG_DIR%"
     set "BUILD_FLAGS=%DEBUG_FLAGS%"
+    set "BUILD_MODE=debug"
 ) else if /i "%1"=="release" (
     set "BUILD_DIR=%RELEASE_DIR%"
     set "BUILD_FLAGS=%RELEASE_FLAGS%"
+    set "BUILD_MODE=release"
 ) else (
     echo Invalid build mode. Use 'debug' or 'release'
     exit /b 1
 )
 
-REM Optional 2nd arg 'tracy' (alias 'profile') enables the Tracy profiler, independent of
-REM debug/release. Off by default: without the define, every tracy.* call compiles to nothing
-REM (see lib/odin-tracy/wrapper.odin), so normal builds are unaffected. tracy.lib is always
-REM linked but stays dormant until instrumentation runs. View captures with tool\tracy\tracy-profiler.exe.
+REM Optional args 2 and 3, in either order:
+REM
+REM 'tracy' (alias 'profile') enables the Tracy profiler, independent of debug/release. Off by
+REM default: without the define, every tracy.* call compiles to nothing (see lib/odin-tracy/wrapper.odin),
+REM so normal builds are unaffected. tracy.lib is always linked but stays dormant until instrumentation
+REM runs. View captures with tool\tracy\tracy-profiler.exe.
+REM
+REM Anything else is taken as a MODULE NAME (today: flyff) and builds that module as the MAIN module:
+REM it gains control at startup and opens its UI immediately instead of a REPL (see MAIN_MODULE in
+REM src\main.odin). Omit it for the normal REPL build; an unknown name fails the build.
 set "PROFILE_FLAGS="
-if /i "%2"=="tracy"   set "PROFILE_FLAGS=-define:TRACY_ENABLE=true"
-if /i "%2"=="profile" set "PROFILE_FLAGS=-define:TRACY_ENABLE=true"
+set "MAIN_MODULE="
+for %%a in (%2 %3) do (
+    if /i "%%a"=="tracy" (
+        set "PROFILE_FLAGS=-define:TRACY_ENABLE=true"
+    ) else if /i "%%a"=="profile" (
+        set "PROFILE_FLAGS=-define:TRACY_ENABLE=true"
+    ) else (
+        set "MAIN_MODULE=%%a"
+    )
+)
+set "MODULE_FLAGS="
+if defined MAIN_MODULE set "MODULE_FLAGS=-define:MAIN_MODULE=%MAIN_MODULE%"
+
+REM ==============================================
+REM Executable name
+REM ==============================================
+REM Name the exe after exactly what it is - memscan-<version>-<mode>[-<module>][-tracy].exe - so the
+REM variants never overwrite each other: a REPL build and a main-module build sit side by side in the
+REM same folder (and a running one can no longer lock the other's rebuild with LNK1104), and an exe
+REM copied out of .out still says which build it is. VERSION is read straight out of src\version.odin,
+REM so the filename can never drift from what the `version` command prints.
+set "VERSION="
+for /f tokens^=2^ delims^=^" %%v in ('findstr /b /c:"VERSION ::" "%SOURCE_DIR%\version.odin"') do set "VERSION=%%v"
+if not defined VERSION (
+    echo Could not read VERSION from %SOURCE_DIR%\version.odin
+    exit /b 1
+)
+set "EXECUTABLE=%EXE_BASE%-%VERSION%-%BUILD_MODE%"
+if defined MAIN_MODULE set "EXECUTABLE=%EXECUTABLE%-%MAIN_MODULE%"
+if defined PROFILE_FLAGS set "EXECUTABLE=%EXECUTABLE%-tracy"
+set "EXECUTABLE=%EXECUTABLE%.exe"
 
 REM ==============================================
 REM Build
@@ -77,11 +118,12 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo %BLUE%^> %COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS% %PROFILE_FLAGS%%RESET%
+if defined MAIN_MODULE echo %BLUE%^> main module: %MAIN_MODULE% ^(opens its UI on start - no REPL^)%RESET%
+echo %BLUE%^> %COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS% %PROFILE_FLAGS% %MODULE_FLAGS%%RESET%
 REM Stream odin's output straight to the console (preserves newlines/indentation and any '!' in
 REM messages - the old redirect-into-a-delayed-expansion-variable approach mangled all three) and
 REM capture only its exit code.
-%COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS% %PROFILE_FLAGS%
+%COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS% %PROFILE_FLAGS% %MODULE_FLAGS%
 set "BUILD_ERROR=%ERRORLEVEL%"
 
 if not "%BUILD_ERROR%"=="0" (

@@ -20,10 +20,28 @@
         "singleInstance": true,
       },
       {
+        "name": "Build debug (flyff UI)",
+        "command": ".\\build.bat debug flyff",
+        "cwd": "${workspaceFolder}",
+        "singleInstance": true,
+      },
+      {
+        "name": "Build release (flyff UI)",
+        "command": ".\\build.bat release flyff",
+        "cwd": "${workspaceFolder}",
+        "singleInstance": true,
+      },
+      {
+        "name": "Build debug tracy (flyff UI)",
+        "command": ".\\build.bat debug flyff tracy",
+        "cwd": "${workspaceFolder}",
+        "singleInstance": true,
+      },
+      {
         "name": "Sync build hash to server",
         "command": ".\\set-lb-hash.bat",
         "cwd": "${workspaceFolder}",
-        "singleInstance": true, 
+        "singleInstance": true,
       }
     ],
     "defaultColor": "white",

@@ -20,9 +20,14 @@ UI fonts are embedded in the exe - there is nothing to install and no dll to shi
 On Windows:
 
 ```
-build.bat debug      # -> .out/debug/memscan.exe
-build.bat release    # -> .out/release/memscan.exe
+build.bat debug      # -> .out/debug/memscan-<version>-debug.exe
+build.bat release    # -> .out/release/memscan-<version>-release.exe
 ```
+
+The exe is named after what it is - `memscan-<version>-<mode>[-<module>][-tracy].exe`, e.g.
+`memscan-1.4.0-release-flyff.exe`. The version comes straight from `src/version.odin`, so the
+filename always matches what the `version` command prints, and the variants never overwrite (or
+lock) each other.
 
 Or invoke the compiler directly:
 
@@ -30,14 +35,29 @@ Or invoke the compiler directly:
 odin build src -out:.out/memscan.exe -ignore-unknown-attributes -vet-shadowing -error-pos-style:unix -debug
 ```
 
+### Main-module builds (UI on start, no REPL)
+
+Naming a module as an extra build argument hands it the process at startup: it opens its own UI
+immediately and the exe quits when that window closes, so the REPL is never launched.
+
+```
+build.bat release flyff    # -> .out/release/memscan-1.4.0-release-flyff.exe
+odin build src ... -define:MAIN_MODULE=flyff
+```
+
+Leave the argument off for the normal REPL build - that is the fallback whenever the define is
+missing. An unknown module name fails the build rather than silently reverting to the REPL. The
+console still opens and keeps the log; everything the window can't do is still CLI-only, so keep a
+REPL build around for setup and recon. `tracy` and a module name can be given together, in any order.
+
 ## Run
 
 `memscan` is an interactive REPL. It also reads commands from stdin, so a whole session can be
 scripted:
 
 ```
-memscan.exe             # interactive
-memscan.exe < script    # scripted
+memscan-1.4.0-release.exe             # interactive
+memscan-1.4.0-release.exe < script    # scripted
 ```
 
 Type `help` for the command list and `quit` to exit. Chain commands on one line with `;` or `&&`.
