@@ -408,7 +408,7 @@ on :: proc(s: ^Seq, c: Script_Event, do_action: Script_Action) {
   emit(s, Script_Step{op = .On, cond = clone_event(c), action = do_action})
 }
 
-// The two interrupt bodies worth having pre-made; `on` takes any Script_Action.
+// The interrupt bodies worth having pre-made; `on` takes any Script_Action.
 do_abort :: proc() -> Script_Action {return Script_Action{kind = .Stop}}
 do_alert :: proc() -> Script_Action {return Script_Action{kind = .Alert}}
 
@@ -416,4 +416,75 @@ do_key :: proc(k: string) -> Script_Action {
   a := Script_Action{kind = .Press_Key}
   a.strs[0] = strings.clone(k)
   return a
+}
+
+do_wait :: proc(secs: f64) -> Script_Action {
+  a := Script_Action{kind = .Wait}
+  a.nums[0] = secs
+  return a
+}
+
+// --- graph authoring ----------------------------------------------------------------------------
+//
+// Everything above builds STRUCTURED programs, where the shape is nesting and Odin's own scopes close
+// the blocks. These build the other kind: a graph, where every node names its successors and an edge is
+// free to point backwards. That is what the node editor produces, and these exist so a behaviour written
+// in Odin can produce (and a self-test can exercise) exactly the same data.
+//
+// The idiom is EMIT FIRST, WIRE SECOND, because a back-edge names a node that does not exist yet when
+// you reach the node that points at it:
+//
+//     top := here(b)                       // remember where the loop starts
+//     wait(&s, 0.02)
+//     out := branch_node(&s, after_minutes(0.005))
+//     wire(b, out, .False, top)            // loop back
+//     done := ...
+//     wire(b, out, .True, done)
+//
+// A node with no outgoing edge falls through to the next emitted step, so a mostly-linear graph only
+// needs wiring where it actually branches.
+
+// Which of a node's two outgoing edges to set.
+Edge_Kind :: enum {
+  True, // goto_id - the only edge on a plain node, the TRUE arm of a branch
+  False, // else_id - a branch's false arm
+}
+
+// The id of the step most recently emitted. Nothing is emitted yet -> 0, which is "no node".
+here :: proc(b: ^Builder) -> Node_Id {
+  return len(b.steps) == 0 ? 0 : b.steps[len(b.steps) - 1].id
+}
+
+wire :: proc(b: ^Builder, from: Node_Id, edge: Edge_Kind, to: Node_Id) {
+  for &s in b.steps {
+    if s.id != from {
+      continue
+    }
+    if edge == .True {
+      s.goto_id = to
+    } else {
+      s.else_id = to
+    }
+    s.src = step_label(s)
+    return
+  }
+  builder_error(b, "wire: no node with that id in this program")
+}
+
+// An unconditional jump. Wire its .True edge to say where.
+goto_node :: proc(s: ^Seq) -> Node_Id {
+  emit(s, Script_Step{op = .Goto})
+  return here(s.b)
+}
+
+// A two-way branch. Wire .True and .False; an unwired arm ends the program.
+branch_node :: proc(s: ^Seq, c: Script_Event) -> Node_Id {
+  emit(s, Script_Step{op = .Branch, cond = clone_event(c)})
+  return here(s.b)
+}
+
+// An explicit terminator. In the main program it ends the run; inside an interrupt region it hands
+// control back to the suspended program.
+return_node :: proc(s: ^Seq) {
+  emit(s, Script_Step{op = .Return})
 }

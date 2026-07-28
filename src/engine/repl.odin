@@ -101,6 +101,8 @@ dispatch :: proc(session: ^Session, cmd: string, args: []string) -> (quit: bool)
     return true
   case "version", "ver":
     cmd_version(session)
+  case "sleep":
+    cmd_sleep(session, args)
   case "module":
     cmd_module(session, args)
   case "ps":
@@ -258,6 +260,9 @@ automation
                              also: hotkey list | hotkey clear
   var <name> <value>         set a variable, then use it as @<name> in ANY command
                              (e.g. 'var spot 6800,3300' then 'moveto @spot'). '@@' is a literal '@'.
+  sleep <ms>                 let time pass before the next command. auto, behaviour scripts and every
+                             watchdog only advance on the 20ms background tick, so a piped script needs
+                             this to see any of them actually do something ('script run x ; sleep 2000 ; var')
                              also: var (list) | var <name> (show) | var <name> - (unset) | var clear`
 
 @(private = "file")

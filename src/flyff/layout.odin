@@ -87,6 +87,8 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.attack_range = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
   case "radar_range":
     layout.radar_range = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
+  case "collider_memory_range":
+    layout.collider_memory_range = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
   case "density_weight":
     layout.density_weight = f32(v) // integer fallback; cli_set / flyff_load_cfg parse it as a float first
   case "density_on":
@@ -215,6 +217,11 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "hillshade_on=%d", layout.hillshade_on ? 1 : 0)
   fmt.sbprintfln(&b, "hillshade_z=%v", layout.hillshade_z)
   fmt.sbprintfln(&b, "hillshade_light=%v", layout.hillshade_light)
+  fmt.sbprintfln(&b, "nowalk_on=%d", layout.nowalk_on ? 1 : 0)
+  fmt.sbprintfln(&b, "collider_memory_on=%d", layout.collider_memory_on ? 1 : 0)
+  fmt.sbprintfln(&b, "collider_memory_map=%d", layout.collider_memory_map ? 1 : 0)
+  fmt.sbprintfln(&b, "collider_memory_range=%v", layout.collider_memory_range)
+  fmt.sbprintfln(&b, "ui_scale=%v", layout.ui_scale)
   fmt.sbprintfln(&b, "aobjcull_rva=0x%X", layout.aobjcull_rva)
   fmt.sbprintfln(&b, "camera_rva=0x%X", layout.camera_rva)
   fmt.sbprintfln(&b, "coll_obj3d_off=0x%X", layout.coll_obj3d_off)
@@ -319,6 +326,18 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
       }
       continue
     }
+    if key == "collider_memory_range" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.collider_memory_range = f32(fv) // obstacle-memory eviction radius - parse as float
+      }
+      continue
+    }
+    if key == "ui_scale" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.ui_scale = clamp(f32(fv), UI_SCALE_MIN, UI_SCALE_MAX) // ImGui scale - parse as float
+      }
+      continue
+    }
     if key == "density_weight" {
       if fv, ok := strconv.parse_f64(val); ok {
         layout.density_weight = f32(fv) // fractional field - parse as float
@@ -372,7 +391,7 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     // Persisted runtime toggles - bool-parsed like density_on. Deliberately NOT in layout_set_field:
     // the first three are session-mirrored (their CLI toggles keep both sides in sync; a raw `set`
     // would silently desync), and sfx/fxlaser have their own commands.
-    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "hunt_on" || key == "combat_watch_on" || key == "auto_stuck_on" || key == "aggro_first_on" || key == "melee_first_on" || key == "pocket_on" || key == "sfx_on" || key == "fx_laser_on" || key == "trail_on" || key == "hillshade_on" || key == "density_hue_on" || key == "la_hesitate_on" || key == "la_jump_on" || key == "la_step_on" || key == "la_maxrange_on" {
+    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "hunt_on" || key == "combat_watch_on" || key == "auto_stuck_on" || key == "aggro_first_on" || key == "melee_first_on" || key == "pocket_on" || key == "sfx_on" || key == "fx_laser_on" || key == "trail_on" || key == "hillshade_on" || key == "nowalk_on" || key == "collider_memory_on" || key == "collider_memory_map" || key == "density_hue_on" || key == "la_hesitate_on" || key == "la_jump_on" || key == "la_step_on" || key == "la_maxrange_on" {
       bv := val == "1" || strings.equal_fold(val, "true") || strings.equal_fold(val, "on")
       switch key {
       case "preselect_on":
@@ -401,6 +420,12 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
         layout.trail_on = bv
       case "hillshade_on":
         layout.hillshade_on = bv
+      case "nowalk_on":
+        layout.nowalk_on = bv
+      case "collider_memory_on":
+        layout.collider_memory_on = bv
+      case "collider_memory_map":
+        layout.collider_memory_map = bv
       case "density_hue_on":
         layout.density_hue_on = bv
       case "la_hesitate_on":
@@ -681,6 +706,7 @@ cli_status_full :: proc(session: ^Session) {
   fmt.printfln("  land_off=0x%X landwidth_off=0x%X hmap_off=0x%X mpu_off=0x%X", L.land_off, L.landwidth_off, L.hmap_off, L.mpu_off)
   fmt.printfln("  attack_range=%v  <- your reach; drives target selection (the picker's engage range) AND 'reach'. 'set attack_range <n>' (floats ok, e.g. 1.75).", L.attack_range)
   fmt.printfln("  radar_range=%v  <- radar display only: how far it gathers/draws mob dots (world units). Options slider or 'set radar_range <n>' (40-400).", L.radar_range)
+  fmt.printfln("  %s  <- DRAW-ONLY, never gates reach/targeting. 'collmem [on|off|map|clear]' (radar key M), 'set collider_memory_range <n>'.", collmem_status_line(session))
   fmt.printfln(
     "  density: %s  <- auto's cluster steering. OFF = plain nearest (v0.4.0 behaviour). ON commits to a mob pack until it's wiped and only detours to a denser pack past the gate. 'density on|off', 'density mingain <n>' (default %d), 'density detour <n>' (default %v).",
     L.density_on ? fmt.tprintf("ON (mingain=%d detour=%v)", L.density_min_gain, L.density_max_detour) : "OFF",
@@ -884,7 +910,7 @@ cli_set :: proc(session: ^Session, args: []string) {
   }
   // attack_range / radar_range / density_weight / density_max_detour / la_* delays are the fractional
   // fields - parse as floats (la_jump_chance is an int and takes the generic parse_addr path below).
-  if args[0] == "attack_range" || args[0] == "radar_range" || args[0] == "trail_len" || args[0] == "trail_fade" || args[0] == "hillshade_z" || args[0] == "hillshade_light" || args[0] == "density_weight" || args[0] == "density_max_detour" || args[0] == "combat_grace" || args[0] == "melee_range" || args[0] == "la_hold_min" || args[0] == "la_hold_max" || args[0] == "la_jump_min" || args[0] == "la_jump_max" || args[0] == "la_step_spread" || args[0] == "la_max_range" {
+  if args[0] == "attack_range" || args[0] == "radar_range" || args[0] == "trail_len" || args[0] == "trail_fade" || args[0] == "hillshade_z" || args[0] == "hillshade_light" || args[0] == "collider_memory_range" || args[0] == "density_weight" || args[0] == "density_max_detour" || args[0] == "combat_grace" || args[0] == "melee_range" || args[0] == "la_hold_min" || args[0] == "la_hold_max" || args[0] == "la_jump_min" || args[0] == "la_jump_max" || args[0] == "la_step_spread" || args[0] == "la_max_range" || args[0] == "ui_scale" {
     fv, ok := strconv.parse_f64(args[1])
     if !ok || fv < 0 {
       fmt.eprintfln("invalid value: %s (want a number >= 0, e.g. 1.75)", args[1])
@@ -899,6 +925,10 @@ cli_set :: proc(session: ^Session, args: []string) {
       session.layout.trail_len = f32(fv)
     case "trail_fade":
       session.layout.trail_fade = f32(fv)
+    case "collider_memory_range":
+      session.layout.collider_memory_range = f32(fv)
+      collider_memory_trim(session) // shrinking it evicts now, not at the next 16-unit rebuild
+      collider_cache_invalidate(session) // ...and growing it re-scans wide instead of waiting for one
     case "density_weight":
       session.layout.density_weight = f32(fv)
     case "density_max_detour":
@@ -923,6 +953,9 @@ cli_set :: proc(session: ^Session, args: []string) {
       session.layout.hillshade_z = f32(fv)
     case "hillshade_light":
       session.layout.hillshade_light = f32(fv)
+    case "ui_scale":
+      // Clamped: a 0.05 or a 40 would rasterize an atlas that is unreadable or enormous.
+      session.layout.ui_scale = clamp(f32(fv), UI_SCALE_MIN, UI_SCALE_MAX)
     }
     fmt.printfln("set %s = %v", args[0], f32(fv))
     if flyff_save_cfg(session.layout, flyff_cfg_path()) {

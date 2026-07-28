@@ -41,6 +41,19 @@ SCRIPT_MAX_WATCHERS :: 16
 
 // --- program representation -------------------------------------------------------------------
 
+// TWO FAMILIES OF CONTROL FLOW, on purpose.
+//
+// The STRUCTURED ops (If/Else/End/Repeat/While) are what builder.odin emits: blocks that open and close,
+// with the nesting implied by their order in the array. They are the natural shape for authoring in Odin,
+// where scope exit closes a block for you.
+//
+// The GRAPH ops (Goto/Branch/Return) are what the node editor emits: no nesting at all, every edge named
+// explicitly. A canvas has no "next line", so a node must say where control goes - including backwards,
+// which is how a loop is drawn rather than declared.
+//
+// Both compile to the same flat array and the same walker. Keeping structured blocks rather than lowering
+// them to Goto is deliberate: `script show` of an Odin behaviour then still reads as the nested program
+// that was written, instead of as a pile of jumps.
 Script_Op :: enum {
   Action, // run a block
   If, // jump past the block when the condition is false
@@ -50,6 +63,9 @@ Script_Op :: enum {
   While, // condition re-tested each iteration
   Wait_For, // block until the event fires
   On, // register an interrupt watcher (hoisted at start; never executed in sequence)
+  Goto, // graph: continue at goto_id, unconditionally
+  Branch, // graph: cond ? goto_id : else_id. Both edges are explicit - there is no fall-through arm.
+  Return, // graph: end an interrupt region and resume the main program where it was suspended
 }
 
 // A node's stable identity. Edges reference THIS, never a position, so inserting or removing a step
@@ -64,9 +80,11 @@ Script_Step :: struct {
   // Naming the End rather than "the step after the block" is deliberate: every referenced node
   // already exists when the edge is created, and inserting a step right after a block correctly
   // becomes the block's new continuation.
+  else_id:   Node_Id, // .Branch's FALSE edge. The true edge is goto_id, so a branch names both arms and
+  // neither is "the next line" - that is what lets a node sit anywhere on the canvas.
   op:        Script_Op,
   action:    Script_Action, // op == .Action, or the watcher's action for .On
-  cond:      Script_Event, // .If / .While / .Wait_For / .On
+  cond:      Script_Event, // .If / .While / .Wait_For / .On / .Branch
   until:     Script_Event, // the optional `until <event>` suffix on a long-running action
   has_until: bool,
   close:     Script_Op, // for .End: which op it closes (so the walker knows fall-through vs loop-back)
@@ -76,15 +94,25 @@ Script_Step :: struct {
   jump:      int, // DERIVED from goto_id by script_resolve_ids at load. Never author this directly:
   // it is a cache of a position, and positions move. It exists so the hot walker indexes straight
   // into the array instead of hashing an id on every branch.
+  jump_else: int, // DERIVED from else_id, same rules. -1 means "no edge" = the program ends here.
 
   // --- presentation + per-run state ---
+  ui_pos:    [2]f32, // node position on the editor canvas. AUTHORING DATA the VM never reads - it is
+  // saved and loaded like the edges are, because a graph you reopen has to look the way you left it.
   src:       string, // one-line label, owned - drives `script show` and the step trace
   scratch:   Step_Scratch,
   ev_state:  Event_State, // per-site baseline for cond/until (armed when the step is entered)
 }
 
-// Turn every goto_id into a jump index. Run once when a program is handed to the runtime - and again
-// after ANY structural edit, which is the whole point of identities existing.
+// Turn every goto_id / else_id into a jump index. Run once when a program is handed to the runtime - and
+// again after ANY structural edit, which is the whole point of identities existing.
+//
+// The two families resolve differently, and the difference is the whole reason both can share an array:
+//   structured (If/Else/Repeat/While) name their matching .End, and control resumes just PAST it (tgt+1);
+//                                     a loop's .End names its head and goes exactly there.
+//   graph      (Action/Wait_For/Goto/Branch) name the node control continues AT (tgt).
+// An unset graph edge resolves to -1, which the walker reads as "the program ends here" - never as
+// index 0, which is what a plain zero would silently mean.
 script_resolve_ids :: proc(steps: []Script_Step) -> (ok: bool, dangling: Node_Id) {
   index_of := make(map[Node_Id]int, len(steps), context.temp_allocator)
   defer delete(index_of)
@@ -94,18 +122,29 @@ script_resolve_ids :: proc(steps: []Script_Step) -> (ok: bool, dangling: Node_Id
     }
   }
   for &s in steps {
-    if s.goto_id == 0 {
-      continue
-    }
-    tgt, found := index_of[s.goto_id]
-    if !found {
-      return false, s.goto_id
-    }
     #partial switch s.op {
-    case .If, .Else, .Repeat, .While:
-      s.jump = tgt + 1 // past the matching End
-    case .End:
-      s.jump = tgt // back to the loop head, exactly
+    case .Goto, .Branch:
+      s.jump = -1 // no edge = end, not index 0
+      s.jump_else = -1
+    }
+    if s.goto_id != 0 {
+      tgt, found := index_of[s.goto_id]
+      if !found {
+        return false, s.goto_id
+      }
+      #partial switch s.op {
+      case .If, .Else, .Repeat, .While:
+        s.jump = tgt + 1 // past the matching End
+      case:
+        s.jump = tgt // .End back to the loop head; graph edges exactly where they point
+      }
+    }
+    if s.else_id != 0 {
+      tgt, found := index_of[s.else_id]
+      if !found {
+        return false, s.else_id
+      }
+      s.jump_else = tgt
     }
   }
   return true, 0
@@ -124,6 +163,17 @@ Script_Watcher :: struct {
   ev_state: Event_State,
   src:      string, // owned
   fires:    int, // how many times it has fired this run (shown by `script`)
+  entry:    int, // first step of this watcher's REGION (see Script_Run.main_len). -1 = nothing to run.
+}
+
+// The main program's position, saved while an interrupt region runs so it can be resumed exactly.
+// Saving the loop stack matters as much as the pc: an interrupt that fires inside `repeat 8` has to come
+// back to the same iteration, not to a loop that thinks it is starting over.
+Irq_Frame :: struct {
+  pc:      int,
+  entered: bool, // was the suspended step mid-flight? (a walk that is still walking)
+  nloop:   int,
+  loops:   [SCRIPT_MAX_NEST]Loop_Frame,
 }
 
 // --- run state ---------------------------------------------------------------------------------
@@ -140,6 +190,7 @@ Script_Run :: struct {
   steps:          [dynamic]Script_Step,
   watchers:       [dynamic]Script_Watcher,
   pc:             int,
+  entry_pc:       int, // index the run started at (resolved from the doc's entry node); Loop wraps here
   entered:        bool, // has the current step's start() run?
   started_at:     i64,
   step_at:        i64,
@@ -148,6 +199,16 @@ Script_Run :: struct {
   nloop:          int,
   stop_requested: bool, // set by the `stop` block / an interrupt; the walker ends the run
   stepping:       bool, // debug: the watcher does NOT advance the walker; `script step` does, one at a time
+  paused:         bool, // transport: the machine is frozen entirely - no walk AND no interrupts. Distinct
+  // from `stepping`, which keeps servicing interrupts so a kill-switch can still break you out.
+
+  // Interrupt regions. `steps` holds the main program in [0, main_len) followed by one region per
+  // watcher; each region is a body ending in .Return. Firing a watcher saves the main program's
+  // position into irq_save and jumps into its region, so an interrupt body is a full multi-step
+  // program (it can walk, wait, and have its exit run) rather than a single fire-and-forget call.
+  main_len:       int,
+  irq_depth:      int, // 0 = running the main program. Capped at 1 - an interrupt cannot interrupt itself.
+  irq_save:       Irq_Frame,
   last_line:      string, // owned - the last step's source, for `script`
   auto_owned:     bool, // a farm/sweep block turned auto on, so leaving must turn it off
   kills_by_name:  map[string]int, // per-species kill tally for `kills_of` (keys owned)
@@ -234,6 +295,16 @@ script_render_step :: proc(b: ^strings.Builder, step: Script_Step, depth: int) {
     strings.write_string(b, "else")
   case .End:
     strings.write_string(b, "end")
+  // Graph ops print their edges by NODE ID, because that is the only thing about them that is stable -
+  // a line number would mean nothing on a canvas where nodes are placed, not ordered.
+  case .Goto:
+    fmt.sbprintf(b, "goto #%d", u32(step.goto_id))
+  case .Branch:
+    strings.write_string(b, "branch ")
+    script_write_event(b, step.cond)
+    fmt.sbprintf(b, " ? #%d : #%d", u32(step.goto_id), u32(step.else_id))
+  case .Return:
+    strings.write_string(b, "return")
   }
   strings.write_string(b, "\n")
 }

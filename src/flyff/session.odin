@@ -259,13 +259,10 @@ Session :: struct {
   bh_scratch_ok:     bool,
 
   // Behaviour scripts (see script.odin / script_run.odin / script_blocks.odin). `script` is the live
-  // run - owned steps, hoisted interrupt watchers, the program counter, and the call stack. The
-  // authoring buffer is kept as TEXT lines rather than parsed steps: `script add` re-parses the whole
-  // buffer each time, so a half-written program is always re-validated as a whole and jump resolution
-  // never sees a stale partial parse. Both freed in on_close; the run is stopped in on_detach.
-  script:          Script_Run,
-  script_buf:      [dynamic]string, // authoring buffer, one source line per entry (owned)
-  script_buf_name: string, // owned
+  // run - owned steps, hoisted interrupt watchers, the program counter, and the loop stack. Freed in
+  // on_close; the run is stopped in on_detach. There is no authoring buffer here on purpose: authoring
+  // happens in Odin (builder.odin) or in the editor, and a saved behaviour is a file (behaviour_io.odin).
+  script: Script_Run,
 
   // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
@@ -318,6 +315,19 @@ Session :: struct {
   // cache; the worker publishes the fresh cache under exec_mutex. The picker's own reach gate is
   // unaffected - it stays synchronous/accurate (it already runs off-thread via scan_job).
   collider_job:          Collider_Job,
+
+  // Persistent DRAW-ONLY obstacle memory (see collider_publish / collider_memory_merge in terrain.odin).
+  // collider_cache above is a 120-unit window that is thrown away every ~16 units of walking, so props
+  // popped in and out of the radar as you moved. This store keeps every collider we have already scanned
+  // on the current map, evicted by distance (collider_memory_range) unless collider_memory_map keeps the
+  // whole map for the session. It NEVER feeds reach / target gating / sweep validation - those stay on
+  // collider_cache, because a remembered box the client has since unloaded must not be able to mark ground
+  // unreachable. Bound to one map: collect_area_colliders resets it when the world identity changes.
+  collider_memory:       [dynamic]Obb,
+  collider_memory_bound: bool, // the store currently belongs to a map (the two ids below are meaningful)
+  collider_memory_map:   u32, // CWorld::m_dwWorldID it belongs to (valid only when collider_memory_map_ok)
+  collider_memory_map_ok: bool, // false when landwidth_off isn't pinned - then the CObj* below is the identity
+  collider_memory_world: uintptr, // CWorld* fallback identity for when the map id can't be read
 }
 
 #assert(offset_of(Session, eng) == 0) // module hooks recover ^Session from ^engine.Session (offset-0 cast)

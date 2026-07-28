@@ -12,6 +12,8 @@ import rl "vendor:raylib"
 
 import "../engine"
 
+import imgui_rl "../../lib/imgui_impl_raylib"
+import imgui "../../lib/odin-imgui"
 import tracy "../../lib/odin-tracy"
 
 // NOTE (raylib static link): raylib's CloseWindow / ShowCursor collide by NAME with Win32 user32.dll's,
@@ -29,12 +31,18 @@ import tracy "../../lib/odin-tracy"
 // eye + frustum cone. The white player dot carries a facing arrow (m_fAngle, same convention as the
 // tdbg HTML). See fence.odin for the model + gate.
 //
+// This file draws the MAP. Every widget over it is Dear ImGui and lives in gui.odin.
+//
 // Runs on the calling (REPL) thread until closed (ESC / window X / optional duration). Each frame it does
 // all session-touching work (mouse fence edits, memory reads, collider snapshot) while holding the REPL's
 // exec_mutex, then RELEASES it for the draw/present so the watcher thread can run auto_tick - so auto-farm
 // keeps going while the radar is open. Because fence writes happen only inside that locked section, they
 // never race the picker (which reads session.fence under the same mutex). The text command channel stays
 // the headless/scripting interface (the fence is also fully authorable via the `fence` commands).
+//
+// It does NOT require an attached process: with none, gui.odin puts up the Attach dialog and every
+// game read is skipped (`live`). handle/base/layout are therefore re-read per frame rather than hoisted
+// out of the loop - you can attach, detach and re-attach without closing the window.
 // ===========================================================================
 
 OT_MOVER_IDX :: 5 // m_apObject[] index for OT_MOVER (mobs / players / pets)
@@ -120,17 +128,17 @@ HILL_SPAN :: 34     // luminance swing from base by slope-vs-light (lit ridge br
 HILL_CELL_PX :: 8   // on-screen cell size (px), constant at every zoom; bilinear sampling fills detail
 HILL_MAX_DIM :: 260 // hard cap on grid columns/rows (huge windows) so one rebuild stays bounded
 
-// Fence floating toolbar (edit mode only; drawn over the map's top-left). The rect is also excluded
-// from map input (mouse_in_panel) while edit is on, so a toolbar click never doubles as a fence
-// draw/erase at the same screen point.
-FENCE_TB_RECT :: rl.Rectangle{12, 36, 252, 62}
+// Radar no-walk overlay (display-only; toggle: `nowalk`, radar key N). The reach oracle already knows
+// exactly which terrain cells stop a walker - the heightmap encodes them as an attribute (see decode_hgt
+// / hattr_blocks_walk). This paints those cells onto the map, so an invisible wall becomes something you
+// SEE rather than something auto discovers by walking into it. Each square is one of the game's own
+// attribute cells (mpu world units, sampled on that exact grid - not a resampling of it), so what you see
+// is what the reach raycast tests. Needs `worldscan` pinned, same as the hillshade; drawn over the relief
+// and under obstacles/fences/dots so it never hides a mob.
+NOWALK_MAX_DIM :: 220 // cap on painted cells per side; past it the sample step coarsens instead
+NOWALK_A :: u8(104)   // fill alpha - reads as a hazard wash without burying the relief underneath
 
-// Quick-access sound mute button, top-left corner of the map (mirrors the "?" legend badge top-right).
-// Click toggles L.sfx_on (same state the Options "Sound" button and the `sfx` command drive). Excluded
-// from map input via mouse_in_panel so a click never also pans/targets. Sits above the fence toolbar.
-MUTE_BTN_RECT :: rl.Rectangle{8, 8, 34, 26}
-
-// Radar vision (mob-dot gather/draw radius, world units) - slider bounds. The max stays under one
+// Radar vision (mob-dot gather/draw radius, world units) - bounds. The max stays under one
 // landscape tile side (MAP_SIZE*mpu ~ 512u) so the current 3x3 mover tile-window always covers it; a
 // larger range would need radar_gather_movers' tile loop widened. Persisted as layout.radar_range.
 RADAR_RANGE_MIN :: f32(40)
@@ -315,6 +323,25 @@ Hill_Cell :: struct {
   col:  rl.Color,
 }
 
+// View-keyed cache guard shared by the two static-terrain layers (hillshade + no-walk). Terrain does not
+// move, so both keep their built cell lists until the camera, the zoom or the window size changes - a
+// still view costs only the rect draws. One struct per layer instead of five parallel locals each.
+Terrain_Layer_Cache :: struct {
+  cam:   [2]f32,
+  scale: f32,
+  fw:    f32,
+  fh:    f32,
+  valid: bool,
+}
+
+terrain_layer_stale :: proc(c: Terrain_Layer_Cache, cam: [2]f32, scale, fw, fh: f32) -> bool {
+  return !c.valid || c.cam != cam || c.scale != scale || c.fw != fw || c.fh != fh
+}
+
+terrain_layer_mark :: proc(c: ^Terrain_Layer_Cache, cam: [2]f32, scale, fw, fh: f32) {
+  c^ = Terrain_Layer_Cache{cam = cam, scale = scale, fw = fw, fh = fh, valid = true}
+}
+
 // Grey for one hillshade cell from its terrain slope (gx,gz = dHeight/dWorld). Directional-derivative
 // shading: flat -> HILL_BASE; a slope rising toward the light brightens, away darkens. Colourless (a
 // faint cool tint matching the background). zexag exaggerates the vertical relief; light_deg is the
@@ -328,6 +355,28 @@ radar_hillshade_color :: proc(gx, gz, zexag, light_deg: f32) -> rl.Color {
   s = clamp(s, -1, 1)
   lum := clamp(f32(HILL_BASE) + f32(HILL_SPAN) * s, 0, 255)
   return rl.Color{u8(lum * 0.86), u8(lum * 0.93), u8(lum), 255}
+}
+
+// Resolve the landscape grid once for a whole overlay rebuild: the CLandscape* array, its tile
+// dimensions and the map's meters-per-unit. ok=false = terrain offsets unpinned / world not resolved /
+// implausible dimensions, i.e. "there is no terrain to draw" - both terrain layers just draw nothing.
+terrain_grid_ctx :: proc(session: ^Session, world: uintptr) -> (arr: uintptr, lw, lh: int, mpu: f32, ok: bool) {
+  handle := session.proc_info.handle
+  pt := session.ptr_size == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
+  L := session.layout
+  if world == 0 || L.land_off == 0 || L.landwidth_off == 0 || L.hmap_off == 0 {
+    return
+  }
+  lw = int(read_i32_at(handle, world + uintptr(L.landwidth_off)))
+  lh = int(read_i32_at(handle, world + uintptr(L.landwidth_off + 4)))
+  if lw <= 0 || lh <= 0 || lw > 256 || lh > 256 {
+    return 0, 0, 0, 0, false
+  }
+  arr = read_ptr_at(handle, world + uintptr(L.land_off), pt) // m_apLand (CLandscape**)
+  if !is_heap_ptr(session, arr) {
+    return 0, 0, 0, 0, false
+  }
+  return arr, lw, lh, f32(world_mpu(session, world)), true
 }
 
 // Load (and cache for this rebuild) a landscape tile's 129x129 heightmap floats in one bulk read.
@@ -360,28 +409,30 @@ hill_tile_hmap :: proc(session: ^Session, arr: uintptr, tile: int, cache: ^map[i
   return buf
 }
 
-// Decoded terrain height at an integer heightmap corner (global grid coords gx,gz), resolving which
-// tile owns it. ok=false = off-world / unloaded. The bulk-read building block for the bilinear sampler.
-hill_corner :: proc(session: ^Session, arr: uintptr, land_width, land_height, gx, gz: int, cache: ^map[int][]f32) -> (h: f32, ok: bool) {
+// Decoded terrain attribute + height at an integer heightmap cell (global grid coords gx,gz), resolving
+// which tile owns it. ok=false = off-world / unloaded. The bulk-read building block under both the
+// hillshade's bilinear sampler (height only) and the no-walk overlay (attribute only); it mirrors the
+// per-cell math in world_attr_at, minus the per-sample pointer walk.
+hill_corner :: proc(session: ^Session, arr: uintptr, land_width, land_height, gx, gz: int, cache: ^map[int][]f32) -> (attr: int, h: f32, ok: bool) {
   if gx < 0 || gz < 0 || gx >= land_width * MAP_SIZE || gz >= land_height * MAP_SIZE {
-    return 0, false
+    return 0, 0, false
   }
   m_x := gx / MAP_SIZE
   m_z := gz / MAP_SIZE
   tile := m_x + m_z * land_width
   if tile < 0 || tile >= land_width * land_height {
-    return 0, false
+    return 0, 0, false
   }
   hm := hill_tile_hmap(session, arr, tile, cache)
   if hm == nil {
-    return 0, false
+    return 0, 0, false
   }
   cell := (gx - m_x * MAP_SIZE) + (gz - m_z * MAP_SIZE) * HMAP_STRIDE
   if cell < 0 || cell >= len(hm) {
-    return 0, false
+    return 0, 0, false
   }
-  _, height := decode_hgt(hm[cell])
-  return height, true
+  a, height := decode_hgt(hm[cell])
+  return a, height, true
 }
 
 // BILINEAR decoded terrain height at world (wx,wz) via the cached tile heightmaps - blends the 4
@@ -398,13 +449,13 @@ hill_sample :: proc(session: ^Session, arr: uintptr, land_width, land_height: in
   iz := int(uz)
   fx := ux - f32(ix)
   fz := uz - f32(iz)
-  h00, ok00 := hill_corner(session, arr, land_width, land_height, ix, iz, cache)
+  _, h00, ok00 := hill_corner(session, arr, land_width, land_height, ix, iz, cache)
   if !ok00 {
     return 0, false
   }
-  h10, ok10 := hill_corner(session, arr, land_width, land_height, ix + 1, iz, cache)
-  h01, ok01 := hill_corner(session, arr, land_width, land_height, ix, iz + 1, cache)
-  h11, ok11 := hill_corner(session, arr, land_width, land_height, ix + 1, iz + 1, cache)
+  _, h10, ok10 := hill_corner(session, arr, land_width, land_height, ix + 1, iz, cache)
+  _, h01, ok01 := hill_corner(session, arr, land_width, land_height, ix, iz + 1, cache)
+  _, h11, ok11 := hill_corner(session, arr, land_width, land_height, ix + 1, iz + 1, cache)
   if !ok10 {h10 = h00}
   if !ok01 {h01 = h00}
   if !ok11 {h11 = h00}
@@ -419,31 +470,18 @@ hill_sample :: proc(session: ^Session, arr: uintptr, land_width, land_height: in
 // visible tile's heightmap is bulk-read once into a temp cache, so a rebuild costs a handful of reads.
 radar_gather_hillshade :: proc(session: ^Session, world: uintptr, cam: [2]f32, scale: f32, center: rl.Vector2, fw, fh, zexag, light_deg: f32, out: ^[dynamic]Hill_Cell) {
   clear(out)
-  handle := session.proc_info.handle
-  ps := session.ptr_size
-  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
-  L := session.layout
-  if world == 0 || L.land_off == 0 || L.landwidth_off == 0 || L.hmap_off == 0 {
+  arr, lw, lh, mpu, gok := terrain_grid_ctx(session, world)
+  if !gok {
     return
   }
-  lw := int(read_i32_at(handle, world + uintptr(L.landwidth_off)))
-  lh := int(read_i32_at(handle, world + uintptr(L.landwidth_off + 4)))
-  if lw <= 0 || lh <= 0 || lw > 256 || lh > 256 {
-    return
-  }
-  arr := read_ptr_at(handle, world + uintptr(L.land_off), pt) // m_apLand (CLandscape**)
-  if !is_heap_ptr(session, arr) {
-    return
-  }
-  mpu := f32(world_mpu(session, world))
 
   // draw-cell world-size: keep cells ~HILL_CELL_PX on screen at EVERY zoom (the bilinear sampler below
   // fills in detail between the coarser mpu-spaced heightmap samples, so sub-mpu cells are meaningful -
   // this is what makes the relief smooth instead of stair-stepping to the 4-unit grid when zoomed in).
   d := f32(HILL_CELL_PX) / scale
-  // visible world rect (scissor region is [0,0]..[fw-PANEL_W, fh]); pad one cell for edge gradients and
-  // snap the origin to a multiple of d so cells don't shimmer as the view pans.
-  vw := fw - PANEL_W
+  // visible world rect ([0,0]..[fw, fh] - the map owns the whole window); pad one cell for edge
+  // gradients and snap the origin to a multiple of d so cells don't shimmer as the view pans.
+  vw := fw
   c0 := radar_s2w(cam, scale, center, 0, 0)
   c1 := radar_s2w(cam, scale, center, vw, fh)
   minx := math.floor(min(c0[0], c1[0]) / d) * d - d
@@ -490,6 +528,77 @@ radar_gather_hillshade :: proc(session: ^Session, world: uintptr, cam: [2]f32, s
       // the min corner + abs size so the north-up projection's flipped z can't yield a negative-height
       // rect (raylib draws nothing for those - which is what blanked the whole relief).
       append(out, Hill_Cell{rl.Rectangle{min(p0.x, p1.x), min(p0.y, p1.y), abs(p1.x - p0.x) + 1, abs(p1.y - p0.y) + 1}, col})
+    }
+  }
+}
+
+// ===========================================================================
+// Terrain no-walk overlay (display-only). See the NOWALK_* constants for the design note.
+// ===========================================================================
+
+// One painted blocked cell. Screen rect precomputed at gather time, like Hill_Cell.
+Nowalk_Cell :: struct {
+  rect: rl.Rectangle,
+  col:  rl.Color,
+}
+
+// Hazard colour per blocked attribute. Warm hues only - the map's cool greys are terrain, and blue/green
+// are already spoken for by fences and density. NOFLY is deliberately absent: a walker ignores it.
+radar_nowalk_color :: proc(attr: int) -> rl.Color {
+  switch attr {
+  case HATTR_NOWALK:
+    return rl.Color{224, 148, 46, NOWALK_A} // fly-only ground: you jam here, but it is not a wall
+  case HATTR_NOMOVE:
+    return rl.Color{214, 68, 62, NOWALK_A} // solid wall (the invisible-collision band around cliffs)
+  case HATTR_DIE:
+    return rl.Color{206, 46, 148, NOWALK_A} // instant-death cell - loudest colour on the map
+  }
+  return rl.Color{0, 0, 0, 0}
+}
+
+// Build the no-walk cell list for the current view. Called in the radar's LOCKED phase (it reads game
+// memory) and cached by view like the hillshade. Walks the attribute grid itself, one sample per game
+// cell, so a painted square IS a cell of the grid the reach raycast reads; zoomed far out the step
+// coarsens (and the squares grow to match) so one rebuild stays bounded.
+radar_gather_nowalk :: proc(session: ^Session, world: uintptr, cam: [2]f32, scale: f32, center: rl.Vector2, fw, fh: f32, out: ^[dynamic]Nowalk_Cell) {
+  clear(out)
+  arr, lw, lh, mpu, gok := terrain_grid_ctx(session, world)
+  if !gok || mpu <= 0 {
+    return
+  }
+  // Visible world rect -> inclusive cell range, padded a cell so a partially-visible edge cell still
+  // paints. The map owns the whole window, so the rect is just the two screen corners unprojected.
+  c0 := radar_s2w(cam, scale, center, 0, 0)
+  c1 := radar_s2w(cam, scale, center, fw, fh)
+  gx0 := int(math.floor(min(c0[0], c1[0]) / mpu)) - 1
+  gz0 := int(math.floor(min(c0[1], c1[1]) / mpu)) - 1
+  gx1 := int(math.floor(max(c0[0], c1[0]) / mpu)) + 1
+  gz1 := int(math.floor(max(c0[1], c1[1]) / mpu)) + 1
+  step := 1
+  if cols, rows := gx1 - gx0 + 1, gz1 - gz0 + 1; cols > NOWALK_MAX_DIM || rows > NOWALK_MAX_DIM {
+    step = (max(cols, rows) + NOWALK_MAX_DIM - 1) / NOWALK_MAX_DIM // sample every Nth cell, draw N-wide
+  }
+  d := mpu * f32(step)
+
+  tiles := make(map[int][]f32, 32, context.temp_allocator) // per-rebuild tile-heightmap cache (bulk reads)
+  for gz := gz0; gz <= gz1; gz += step {
+    for gx := gx0; gx <= gx1; gx += step {
+      attr, _, ok := hill_corner(session, arr, lw, lh, gx, gz, &tiles)
+      if !ok || !hattr_blocks_walk(attr) {
+        continue // off-world / unloaded / walkable -> nothing to paint
+      }
+      // Cell (gx,gz) governs the world square [gx*mpu, (gx+1)*mpu) - see world_attr_at's floor math.
+      p0 := radar_w2s(cam, scale, center, f32(gx) * mpu, f32(gz) * mpu)
+      p1 := radar_w2s(cam, scale, center, f32(gx) * mpu + d, f32(gz) * mpu + d)
+      // Min corner + abs size (north-up flips z, and a negative-height rect draws nothing), +1px on the
+      // far edges so neighbouring cells merge into one wall instead of showing seams between them.
+      append(
+        out,
+        Nowalk_Cell {
+          rl.Rectangle{min(p0.x, p1.x), min(p0.y, p1.y), abs(p1.x - p0.x) + 1, abs(p1.y - p0.y) + 1},
+          radar_nowalk_color(attr),
+        },
+      )
     }
   }
 }
@@ -821,6 +930,45 @@ radar_w2s :: proc(cam: [2]f32, scale: f32, center: rl.Vector2, wx, wz: f32) -> r
 radar_s2w :: proc(cam: [2]f32, scale: f32, center: rl.Vector2, sx, sy: f32) -> [2]f32 {
   return {cam[0] + (sx - center.x) / scale, cam[1] - (sy - center.y) / scale}
 }
+// ===========================================================================
+// Map overlay text + rings, drawn through ImGui instead of raylib.
+//
+// WHY NOT rl.DrawText / rl.DrawCircleLinesV. raylib's default font is a 10px bitmap face that reads as
+// a different program's UI next to Fredoka, and its circle primitives are fixed-step polygons with no
+// anti-aliasing, so a 7px hover ring comes out visibly faceted. ImGui gives us the UI font and AA
+// geometry for free, and both are already on screen this frame.
+//
+// LAYER. The BACKGROUND draw list renders after ALL raylib content but beneath every ImGui window -
+// exactly where entity labels and rings want to be (on top of the map, under a dialog). That is also
+// why the world-layer rings (attack_range, density radius) deliberately stay on raylib: they are drawn
+// UNDER the mob dots on purpose, and this layer would put them over.
+//
+// THREADING. Same rule as gui.odin: these run in the unlocked draw phase, so they take plain values,
+// never session pointers.
+// ===========================================================================
+
+// One map label, in the UI font, with the near-black shadow gui_gauge uses so it stays legible over
+// both dark terrain and a bright hillshade. (x,y) is the top-left, matching rl.DrawText's convention so
+// the call sites keep their hand-tuned offsets.
+radar_label :: proc(x, y: f32, text: cstring, col: rl.Color) {
+  dl := imgui.GetBackgroundDrawList()
+  c := imgui.ColorConvertFloat4ToU32({f32(col.r) / 255, f32(col.g) / 255, f32(col.b) / 255, f32(col.a) / 255})
+  imgui.DrawList_AddText(dl, {x + 1, y + 1}, imgui.ColorConvertFloat4ToU32({0, 0, 0, f32(col.a) / 255 * 0.75}), text)
+  imgui.DrawList_AddText(dl, {x, y}, c, text)
+}
+
+// An anti-aliased ring. num_segments 0 lets ImGui pick from CircleTessellationMaxError (gui_apply_theme
+// lowers it to 0.10px), so small rings stay round instead of hexagonal.
+radar_ring :: proc(p: rl.Vector2, r: f32, col: rl.Color, thickness: f32 = 1) {
+  c := imgui.ColorConvertFloat4ToU32({f32(col.r) / 255, f32(col.g) / 255, f32(col.b) / 255, f32(col.a) / 255})
+  imgui.DrawList_AddCircle(imgui.GetBackgroundDrawList(), {p.x, p.y}, r, c, 0, thickness)
+}
+
+// Width of a label in the UI font - the rl.MeasureText replacement for centring a pop.
+radar_text_w :: proc(text: cstring) -> f32 {
+  return imgui.CalcTextSize(text).x
+}
+
 // Rotate a 2D world (x,z) vector by a_rad. Result is fed back through radar_w2s (which handles the z-flip),
 // so this stays a plain world-space rotation.
 radar_rot2 :: proc(v: [2]f32, a_rad: f32) -> [2]f32 {
@@ -843,47 +991,6 @@ radar_draw_arrow :: proc(sp: rl.Vector2, a_deg, length, half: f32, col: rl.Color
   rl.DrawTriangleLines(tip, bl, br, col)
 }
 
-// Draw a small speaker glyph centred at (cx,cy): a back plate + a cone flaring right. When <muted> a red
-// slash crosses it; otherwise two sound-wave arcs radiate. Primitive-only (no glyph font dependency) so
-// it renders identically everywhere. <col> tints the speaker body; the waves reuse it.
-radar_draw_speaker :: proc(cx, cy: f32, muted: bool, col: rl.Color) {
-  rl.DrawRectangleRec({cx - 9, cy - 3, 5, 6}, col) // back plate (the magnet)
-  // cone: a trapezoid flaring to the right (narrow at the plate, tall at the mouth). radar_fill_quad
-  // fixes the winding so raylib's back-face cull never drops the fill.
-  radar_fill_quad({cx - 4, cy - 2}, {cx + 3, cy - 7}, {cx + 3, cy + 7}, {cx - 4, cy + 2}, col)
-  if muted {
-    red := rl.Color{231, 76, 60, 255}
-    rl.DrawLineEx({cx + 6, cy - 6}, {cx + 15, cy + 6}, 2, red)
-    rl.DrawLineEx({cx + 15, cy - 6}, {cx + 6, cy + 6}, 2, red)
-  } else {
-    wc := rl.Vector2{cx + 3, cy}
-    rl.DrawRing(wc, 7, 8.5, -42, 42, 10, col) // inner sound wave
-    rl.DrawRing(wc, 10.5, 12, -42, 42, 10, col) // outer sound wave
-  }
-}
-
-// Draw a small bag/pouch glyph centred at (cx,cy): a handle arc over a rounded body. Primitive-only (no
-// glyph font dependency) so it renders identically everywhere. <col> tints the whole bag. Used by the
-// bottom-left inventory (free/total) readout.
-radar_draw_bag :: proc(cx, cy: f32, col: rl.Color) {
-  rl.DrawRing({cx, cy - 2}, 2.6, 4, -150, -30, 12, col) // handle over the top (top = -90 deg, y is down)
-  rl.DrawRectangleRounded({cx - 6, cy - 2, 12, 10}, 0.4, 6, col) // pouch body
-}
-
-// A small coin glyph for the bottom-left penya readout (same anchor/scale as radar_draw_bag).
-radar_draw_coin :: proc(cx, cy: f32, col: rl.Color) {
-  rl.DrawCircle(i32(cx), i32(cy), 6, col)
-  rl.DrawCircleLines(i32(cx), i32(cy), 6, rl.Color{40, 34, 14, 255}) // thin dark rim
-  rl.DrawRectangleRounded({cx - 1, cy - 3, 2, 6}, 0.5, 4, rl.Color{60, 48, 16, 210}) // faint coin mark
-}
-
-// A loud throbbing bar behind a bottom-left readout (full bag / penya near the cap) so the alert is
-// impossible to miss. <cy> is the readout's vertical center, <p> the 0..1 pulse phase, <rgb> the alert hue.
-radar_alert_bg :: proc(x, cy, w: f32, p: f32, rgb: [3]u8) {
-  a := u8(45 + 170 * p) // fill throbs from faint to near-solid
-  rl.DrawRectangleRounded({x, cy - 14, w, 28}, 0.45, 6, rl.Color{rgb.r, rgb.g, rgb.b, a})
-  rl.DrawRectangleRoundedLines({x, cy - 14, w, 28}, 0.45, 6, rl.Color{rgb.r, rgb.g, rgb.b, 255})
-}
 
 // Fence editor draw-tag <-> (include, avoid, label). Tab cycles 0->1->2 (include+ / exclude- / avoid!).
 radar_fence_tag :: proc(i: int) -> (include, avoid: bool, label: cstring) {
@@ -1003,7 +1110,7 @@ sweep_seg_color :: proc(a, b: Sweep_Node) -> rl.Color {
 // segment's alpha is the dimmer of its two endpoints, so the erase front recedes smoothly.
 //
 // Runs in the UNLOCKED draw phase, so <nodes> must be a snapshot (the watcher reallocs the live list) -
-// see the temp clone in the panel-snapshot block. Off-screen segments are skipped: the node list can run
+// see the temp clone in the UI-snapshot block. Off-screen segments are skipped: the node list can run
 // to SWEEP_MAX_NODES and only the visible slice is worth two triangles.
 radar_draw_sweep :: proc(nodes: []Sweep_Node, r: f32, cam: [2]f32, scale: f32, center: rl.Vector2, fw, fh: f32, now: i64) {
   if len(nodes) < 2 || r <= 0 {
@@ -1182,297 +1289,6 @@ radar_draw_camera :: proc(eye, lookat: [3]f32, cam: [2]f32, scale: f32, center: 
   rl.DrawCircleLinesV(es, 6, CAM_COL)
 }
 
-// ===========================================================================
-// PANEL - the Phase 3 raygui control surface. A fixed strip on the right edge of the radar window whose
-// widgets drive the existing REPL commands, so the tool becomes UI-controlled without losing the headless
-// REPL. All widgets draw in cli_radar's exec_mutex-UNLOCKED section, so any action that touches session
-// automation is DEFERRED: it appends a command string to Panel_State.pending during the draw, and the
-// loop drains it through exec_line right after re-locking the mutex (matching REPL discipline). Radar-local
-// view bools (edit/show_cam/show_reach/cam) are single-threaded stack locals and mutate directly. The
-// panel READS setup_groups/optional_pins/auto_* directly, so it never drifts from `status`/`auto`.
-// ===========================================================================
-
-PANEL_W :: f32(280) // fixed right-side control panel; the radar map keeps the left region
-OPT_PAD :: f32(14) // uniform inner padding for the Options modal - every element sits within [ox+PAD, ox+ow-PAD]
-
-PANEL_BG :: rl.Color{20, 26, 34, 255} // opaque panel background (over the right strip)
-PANEL_SEP :: rl.Color{40, 50, 62, 255} // section divider / panel edge line
-PANEL_HDR :: rl.Color{200, 210, 222, 255} // section header text
-PANEL_TXT :: rl.Color{198, 206, 216, 255} // body label text
-PANEL_DIM :: rl.Color{132, 142, 154, 255} // secondary / hint text
-DOT_OK :: rl.Color{46, 204, 113, 255} // status light: pinned (green)
-DOT_REQ :: rl.Color{231, 76, 60, 255} // status light: required + missing (red)
-DOT_OPT :: rl.Color{241, 196, 15, 255} // status light: optional + missing (yellow)
-CHIP_BG :: rl.Color{52, 73, 94, 255} // selected mob-name pill
-
-// raygui's built-in theme is a low-contrast light-grey scheme; its DISABLED state (light-grey text on a
-// near-white base) reads as unreadable "white text on white background" - and the WHOLE panel renders in
-// that state whenever it draws while gui-locked (we GuiLock() the panel behind the Setup modal). Applied
-// once at window init, this overrides every control state to a dark, high-contrast look so text stays
-// legible in NORMAL/FOCUSED/PRESSED/DISABLED alike, and bumps the tiny default font. Colors are packed
-// 0xRRGGBBAA as raygui expects. See cli_radar's per-frame GuiUnlock guard for the lock-leak half of the fix.
-gui_rgba :: proc(c: rl.Color) -> i32 {
-  return i32(u32(c.r) << 24 | u32(c.g) << 16 | u32(c.b) << 8 | u32(c.a))
-}
-
-radar_apply_theme :: proc() {
-  // THE button-label fix: raygui keeps its OWN font (guiFont), separate from raylib's default. Until it's
-  // initialised it's a zero Font (texture id 0) that renders NOTHING - which is why every GuiButton label
-  // was blank while our rl.DrawText panel text drew fine. It was never a colour/contrast problem (that's
-  // why darkening the button backgrounds didn't help). GuiLoadStyleDefault initialises guiFont (=
-  // GetFontDefault) plus baseline props (text alignment / border width / padding); we override the colours
-  // + text size below. GuiSetFont is belt-and-suspenders for raygui builds that don't set the font there.
-  rl.GuiLoadStyleDefault()
-  rl.GuiSetFont(rl.GetFontDefault())
-  set :: proc(prop: rl.GuiControlProperty, col: rl.Color) {
-    rl.GuiSetStyle(.DEFAULT, i32(prop), gui_rgba(col)) // DEFAULT base props propagate to every control
-  }
-  // global: larger, more legible text + dark surfaces for GuiPanel background / dividers
-  rl.GuiSetStyle(.DEFAULT, i32(rl.GuiDefaultProperty.TEXT_SIZE), 14)
-  rl.GuiSetStyle(.DEFAULT, i32(rl.GuiDefaultProperty.TEXT_SPACING), 1)
-  rl.GuiSetStyle(.DEFAULT, i32(rl.GuiDefaultProperty.BACKGROUND_COLOR), gui_rgba(rl.Color{20, 26, 34, 255}))
-  rl.GuiSetStyle(.DEFAULT, i32(rl.GuiDefaultProperty.LINE_COLOR), gui_rgba(rl.Color{48, 60, 74, 255}))
-  // NORMAL - slate button on the dark panel, near-white label (high contrast)
-  set(.BORDER_COLOR_NORMAL, rl.Color{64, 80, 98, 255})
-  set(.BASE_COLOR_NORMAL, rl.Color{38, 48, 62, 255})
-  set(.TEXT_COLOR_NORMAL, rl.Color{206, 214, 224, 255})
-  // FOCUSED (hover) - lighter fill, blue-accent border, brighter text
-  set(.BORDER_COLOR_FOCUSED, rl.Color{92, 150, 210, 255})
-  set(.BASE_COLOR_FOCUSED, rl.Color{54, 72, 94, 255})
-  set(.TEXT_COLOR_FOCUSED, rl.Color{236, 242, 250, 255})
-  // PRESSED - bright accent
-  set(.BORDER_COLOR_PRESSED, rl.Color{120, 180, 235, 255})
-  set(.BASE_COLOR_PRESSED, rl.Color{70, 104, 146, 255})
-  set(.TEXT_COLOR_PRESSED, rl.Color{255, 255, 255, 255})
-  // DISABLED - clearly dimmed but STILL readable (never near-white on near-white)
-  set(.BORDER_COLOR_DISABLED, rl.Color{44, 54, 66, 255})
-  set(.BASE_COLOR_DISABLED, rl.Color{28, 34, 42, 255})
-  set(.TEXT_COLOR_DISABLED, rl.Color{110, 122, 136, 255})
-}
-
-// Full Flyff monster roster offered in the mob-search suggestions, MERGED (deduped, case-insensitive)
-// with the live nearby monster names each frame (see the panel snapshot). Purely a convenience corpus;
-// a typed name that isn't listed can still be added as a custom chip. Sourced from the Flyff wiki's
-// "Complete Monster list" (flyff.fandom.com/wiki/Complete_Monster_list) - regenerate from there on updates.
-AUTO_MOB_SUGGESTIONS :: []string {
-  "(Anguished Soul) Mara", "(Deathbringer) Kheldor", "(Demonic Soul) Hel", "(General) Razgul", "(God of Death) Ankou", "(Perverted Soul) Morrigan",
-  "(Tormented Soul) Nergal", "(Twisted Soul) Orcus", "(Violent Soul) Ghed", "Abraxas", "Aibatt", "Air Marshall Spiketail",
-  "Ant Turtle", "Antiquery", "Araknoid", "Arc Master of the Violet Magician Troupe", "Asmodan", "Asterius",
-  "Asuras", "Atrox", "Augu", "Axe-Jaw Ant", "Babari", "Bang",
-  "Basque", "Battle Toadrin", "Bearnerky", "Beast King Khan", "Beast Overlord Khan", "Big Muscle",
-  "Blackweb Shade", "Blighted Gryphon", "Blood Trillipy", "Bloody Mary", "Blue Meteonyker", "Blue Roach",
-  "Blue Roach Queen", "Boo", "Boss Cardpuppet", "Brigadier General Crumple", "Bucrow", "Burudeng",
-  "Cannibal Mammoth", "Cardpuppet", "Carrierbomb", "Catsy", "Chaner", "Chef Muffrin",
-  "Chief Keokuk", "Chimeradon", "Clocks", "Clockworks", "Clockworks Butler", "Club-tailed Reptilion",
-  "Colonel Club-tailed Reptilion", "Crane Machinery", "Creper", "Cursed Axe-Jaw Ant", "Cursed Giant Maul Rat", "Cursed Giant Scorpede",
-  "Cursed Maul Rat", "Cursed Razor Axe-Jaw Ant", "Cursed Scorpede", "Cyclops X", "Dantalian", "Demian",
-  "Dire Razor", "Dorian", "Doridoma", "Drakul the Diabolic", "Dread Drakul the Diabolic", "Dread Lykanos the Malevolent",
-  "Dreadful Rangda", "Driller", "Dumb Bull", "Dump", "Elderguard", "Elite Keakoon Guard",
-  "Elite Keakoon Guard Leader", "Elite Keakoon Worker", "Elite Keakoon Worker Leader", "Elite Tanuki Enforcer", "Elite Tanuki Protector", "Emeraldmantis",
-  "Fallen Necromancer", "Fefern", "Female Zombie", "Flbyrigen", "Flybat", "Forsaken Banshee",
-  "GM Cromiell", "Gangard", "Gannessa", "Garbagepider", "General Bearnerky", "General Chimeradon",
-  "General Glyphaxz", "Ghost of the Forgotten King", "Ghost of the Forgotten Prince", "Giant Abraxas", "Giant Aibatt", "Giant Antiquery",
-  "Giant Araknoid", "Giant Asterius", "Giant Asuras", "Giant Bang", "Giant Basque", "Giant Battle Toadrin",
-  "Giant Boo", "Giant Bucrow", "Giant Burudeng", "Giant Carrierbomb", "Giant Catsy", "Giant Crane Machinery",
-  "Giant Dantalian", "Giant Demian", "Giant Doridoma", "Giant Driller", "Giant Dumb Bull", "Giant Dump",
-  "Giant Elderguard", "Giant Fefern", "Giant Flbyrigen", "Giant Flybat", "Giant Gannessa", "Giant Garbagepider",
-  "Giant Giggle Box", "Giant Glaphan", "Giant Gongury", "Giant Greemong", "Giant Grrr", "Giant Gullah",
-  "Giant Hague", "Giant Harpy", "Giant Hobo", "Giant Hoppre", "Giant Iren", "Giant Jack The Hammer",
-  "Giant Kern", "Giant Lawolf", "Giant Leyena", "Giant Luia", "Giant Maul Rat", "Giant Mia",
-  "Giant Mothbee", "Giant Mr Pumpkin", "Giant Mushpang", "Giant Mushpoie", "Giant Nautrepy", "Giant Nuctuvehicle",
-  "Giant Nutty Wheel", "Giant Nyangnyang", "Giant Peakyturtle", "Giant Pukepuke", "Giant Red Mantis", "Giant Risem",
-  "Giant Rock Muscle", "Giant Rockepeller", "Giant Scorpede", "Giant Scorpicon", "Giant Shuhamma", "Giant Steamwalker",
-  "Giant Steel Knight", "Giant Syliaca", "Giant Tengu", "Giant Tombstone Bearer", "Giant Totemia", "Giant Trangfoma",
-  "Giant Volt", "Giant Wagsaac", "Giant Watangka", "Giant Wheelem", "Giant Zombiger", "Giantmage Prankster",
-  "Giggle Box", "Glaphan", "Gobbler", "Gongury", "Great Abraxas", "Great Asterius",
-  "Great Asuras", "Great Catsy", "Great Chef Muffrin", "Great Dantalian", "Great Gannessa", "Great Gullah",
-  "Great Hague", "Great Harpy", "Great Tengu", "Great White Bolo", "Greemong", "Green Meteonyker",
-  "Green Trillipy", "Grrr", "Grumble Mauler", "Guan Yu Heavyblade", "Gullah", "Hadeseor",
-  "Hague", "Hammer Kick", "Harpy", "Hazard Blood Trillipy", "Hazard Green Trillipy", "Hazard Violet Trillipy",
-  "Hellhound", "Hobo", "Hoiren", "Hoppre", "Horrible Rangda", "Hundur Sharpfoot",
-  "Hunter X", "Idol of Blighted Gryphon", "Idol of Fallen Necromancer", "Idol of Forsaken Banshee", "Idol of Scythe Protector", "Idol of Vile Flayer",
-  "Immovable Crag", "Iren", "Ivillis Black Otem", "Ivillis Boxter", "Ivillis Crasher", "Ivillis Dandysher",
-  "Ivillis Destroyer", "Ivillis Guardian", "Ivillis Leanes", "Ivillis Mushellizer", "Ivillis Poisoner", "Ivillis Puppet",
-  "Ivillis Quaker", "Ivillis Red Otem", "Ivillis Thief", "Ivillis Wrecker", "Jack The Hammer", "Kanonicus",
-  "Keakoon Guard", "Keakoon Guard Leader", "Keakoon Worker", "Keakoon Worker Leader", "Kern", "Kidler",
-  "Kingster", "Kraken", "Krrr", "Kynsy", "Kyouchish", "Lawolf",
-  "Leyena", "Lieutenant General Scythoid", "Lord Bang", "Lord Bang Hanoyan", "Lord Clockworks Alpha", "Luia",
-  "Lykanos the Malevolent", "Mage Redcloud", "Male Zombie", "Mammoth", "Master Demian", "Master Muffrin",
-  "Maul Rat", "Meral", "Meteonyker", "Mia", "Mocomochi", "Monument of Death",
-  "Mothbee", "Mr Pumpkin", "Mushmoot", "Mushpang", "Mushpoie", "Mutant Augu",
-  "Mutant Bang", "Mutant Fefern", "Mutant Giant 2nd Class Fefern", "Mutant Giant Bang King", "Mutant Giant Nyangnyang", "Mutant Keakoon Guard",
-  "Mutant Keakoon Guard Leader", "Mutant Keakoon Worker", "Mutant Keakoon Worker Leader", "Mutant Nyangnyang", "Mutant Yetti", "Mythic Prismatic Cobra",
-  "Mythic Twinstrike Cobra", "Mythic Wildwood Stalker", "Naga", "Nautrepy", "Nuctuvehicle", "Nutty Wheel",
-  "Nyangnyang", "Nyx", "Okean", "Organigor", "Peakyturtle", "Pink Roach",
-  "Pink Roach Queen", "Popcrank", "Prankster", "Prismatic Cobra", "Pukepuke", "Queen Popcrank",
-  "R. DeFeo", "Rampaging Dumb Bull", "Rangda", "Razor Axe-Jaw Ant", "Red Bang", "Red Mantis",
-  "Red Meteonyker", "Ren", "Risem", "Risen Assassin", "Risen Gladiator", "Risen Mage",
-  "Risen Pikeman", "Risen Warrior", "Rock Muscle", "Rockepeller", "Rubo", "Sakai",
-  "Samoset", "Scorpede", "Scorpicon", "Scythe Protector", "Seido", "Serus Uriel",
-  "Shacalpion", "Shadowy Wildwood Shaman", "Shuhamma", "Shuraiture", "Sisif", "Small Mushpoie",
-  "Spotted Bolo", "Steamwalker", "Steel Knight", "Syliaca", "Taiaha", "Tanuki Enforcer",
-  "Tanuki Protector", "Tengu", "Tombstone Bearer", "Totem", "Totemia", "Trangfoma",
-  "Troglodon Warlord", "Troglodon Warrior", "Twinstrike Cobra", "Uncanny Rangda", "Venel Guardian", "Vice Veduque",
-  "Vile Flayer", "Vile Thorn", "Violet Magician Troupe", "Violet Trillipy", "Volt", "Wagsaac",
-  "Watangka", "Wheelem", "Wildwood Shaman", "Wildwood Stalker", "Worm Veduque", "Yetti",
-  "Zombiger", "Mortom", "Captain Catsy", "Captain Harpy"
-}
-
-// Per-window widget state for the control panel. A LOCAL in cli_radar (like poly_wip), NOT a package
-// global - a shared global would be the forbidden Radar struct. Holds only UI buffers + the deferred
-// command queue; nothing here is read by the watcher. `pending`/`selected` strings are HEAP-owned (they
-// must outlive the frame's temp free_all, which runs before the drain) and are freed on drain / close.
-Panel_State :: struct {
-  pending:     [dynamic]string, // deferred session commands, drained under exec_mutex after each frame
-
-  setup_open:  bool, // the Setup modal is up
-  name_buf:    [64]u8, // character-name textbox (setup modal)
-  name_edit:   bool,
-  hp_buf:      [16]u8, // optional-hp textbox (setup modal)
-  hp_edit:     bool,
-  penya_buf:   [24]u8, // optional-penya textbox (setup modal) -> runs findpenya to pin penya_off
-  penya_edit:  bool,
-
-  search_buf:  [64]u8, // mob-search textbox (auto section)
-  search_edit: bool,
-  selected:    [dynamic]string, // chosen mob-name chips (heap-owned)
-
-  ar_slider:   f32, // attack_range slider value (seeded from the layout, live while dragging)
-  ar_dragging: bool, // slider held -> defer the flyff.cfg persist until release
-  ar_seeded:   bool, // one-time seed of ar_slider from the live attack_range
-
-  rr_slider:   f32, // radar-range (vision) slider value; same seed/drag/persist dance as ar_slider
-  rr_dragging: bool, // slider held -> defer the flyff.cfg persist until release
-  rr_seeded:   bool, // one-time seed of rr_slider from the live radar_range
-
-  tr_slider:   f32, // trail length slider value; same seed/drag/persist dance as rr_slider
-  tr_dragging: bool,
-  tr_seeded:   bool,
-
-  tf_slider:   f32, // trail fade-exponent slider value; same dance
-  tf_dragging: bool,
-  tf_seeded:   bool,
-
-  options_open: bool, // the Options modal is up (mutually exclusive with the Setup modal)
-  opt_ar_buf:   [16]u8, // attack_range textbox (options modal)
-  opt_ar_edit:  bool,
-  opt_mg_buf:   [8]u8, // density mingain textbox
-  opt_mg_edit:  bool,
-  opt_dt_buf:   [12]u8, // density detour textbox
-  opt_dt_edit:  bool,
-  opt_melee_buf:  [8]u8, // priority-ladder rung 2 radius (melee_range, world units)
-  opt_melee_edit: bool,
-  opt_grace_buf:  [8]u8, // combat-watch grace (seconds since the last landed hit)
-  opt_grace_edit: bool,
-  // look-alive tuning textboxes (options modal): hesitation min/max, jump interval min/max (seconds),
-  // and jump chance (percent). Seeded from the locked snapshot alongside the other option boxes.
-  opt_lahmin_buf:  [8]u8,
-  opt_lahmin_edit: bool,
-  opt_lahmax_buf:  [8]u8,
-  opt_lahmax_edit: bool,
-  opt_lajmin_buf:  [8]u8,
-  opt_lajmin_edit: bool,
-  opt_lajmax_buf:  [8]u8,
-  opt_lajmax_edit: bool,
-  opt_lajch_buf:   [8]u8, // jump chance (percent)
-  opt_lajch_edit:  bool,
-  opt_lastepch_buf: [8]u8, // step chance (percent)
-  opt_lastepch_edit: bool,
-  opt_lastepsp_buf: [8]u8, // step spread (world units)
-  opt_lastepsp_edit: bool,
-  opt_lamaxr_buf:  [8]u8, // max-range approach distance (world units)
-  opt_lamaxr_edit: bool,
-  opt_seeded:   bool, // one-time seed of the option textboxes on modal open
-  opt_scroll:   f32, // Options modal vertical scroll offset (<=0; content scrolls under the fixed title/footer)
-  opt_content_h: f32, // measured intrinsic content height (for the scroll clamp) - set each frame while open
-
-  // Leaderboards modal (see leaderboard.odin). The trigger button appears at the bottom-center of the
-  // sidebar only when leaderboard_url is set; the modal drives the same `leaderboard` subcommands as the CLI.
-  leaderboard_open: bool,
-  lb_seeded:        bool,   // one-time seed of the name box on open
-  lb_name_buf:      [64]u8, // submission-name textbox
-  lb_name_edit:     bool,
-  lb_sort:          i32,    // selected board sort (index into LB_SORTS; drives the toggle group + Refresh)
-}
-
-// Write <s> into a raygui textbox byte buffer (NUL-terminated, tail-zeroed). For seeding the Options
-// modal's textboxes from the live layout values.
-panel_buf_set :: proc(buf: []u8, s: string) {
-  n := min(len(s), len(buf) - 1)
-  copy(buf, s[:n])
-  for i in n ..< len(buf) {
-    buf[i] = 0
-  }
-}
-
-// Clear every Options-modal textbox edit flag. raygui keeps focus per-box, so on any box click we clear
-// all of them and then re-focus just the clicked one (see the option textbox handlers).
-panel_opt_clear_edits :: proc(ps: ^Panel_State) {
-  ps.opt_ar_edit = false
-  ps.opt_mg_edit = false
-  ps.opt_dt_edit = false
-  ps.opt_melee_edit = false
-  ps.opt_grace_edit = false
-  ps.opt_lahmin_edit = false
-  ps.opt_lahmax_edit = false
-  ps.opt_lajmin_edit = false
-  ps.opt_lajmax_edit = false
-  ps.opt_lajch_edit = false
-  ps.opt_lastepch_edit = false
-  ps.opt_lastepsp_edit = false
-  ps.opt_lamaxr_edit = false
-}
-
-// Read a NUL-terminated string out of a raygui textbox byte buffer (pure; no session touch).
-panel_buf_str :: proc(buf: []u8) -> string {
-  n := 0
-  for n < len(buf) && buf[n] != 0 {
-    n += 1
-  }
-  return string(buf[:n])
-}
-
-// Enqueue a deferred command. The string is cloned to the heap so it survives the frame's temp free_all
-// (which runs before the drain); the drain frees it after running it.
-panel_enqueue :: proc(ps: ^Panel_State, cmd: string) {
-  append(&ps.pending, strings.clone(cmd))
-}
-
-// Run SLOW commands (the setup pipeline [+ findpenya]) on a one-shot worker thread instead of the
-// deferred drain: the drain executes on the RENDER thread, which then cannot draw its own progress -
-// the whole window froze for the multi-second pipeline. The worker takes exec_mutex around the run
-// exactly like the REPL does; cli_setup additionally publishes per-step progress and yields the lock
-// between steps (setup_step_mark), so the frame loop redraws a live step counter while it works. One
-// run at a time - cli_setup's own setup_running guard rejects a concurrent invocation (REPL or panel).
-Panel_Async_Job :: struct {
-  session: ^Session,
-  cmds:    [dynamic]string,
-}
-
-panel_run_async :: proc(session: ^Session, cmds: []string) {
-  job := new(Panel_Async_Job)
-  job.session = session
-  job.cmds = make([dynamic]string)
-  for c in cmds {
-    append(&job.cmds, strings.clone(c))
-  }
-  thread.create_and_start_with_data(job, proc(data: rawptr) {
-    j := cast(^Panel_Async_Job)data
-    sync.mutex_lock(&j.session.exec_mutex)
-    for c in j.cmds {
-      if j.session.exec_line != nil {
-        j.session.exec_line(&j.session.eng, c)
-      }
-    }
-    sync.mutex_unlock(&j.session.exec_mutex)
-    for c in j.cmds {
-      delete(c)
-    }
-    delete(j.cmds)
-    free(j)
-  }, nil, .Normal, true) // self_cleanup: fire-and-forget
-}
-
 // sfx [on|off] - master toggle for the radar's sound effects (penya-gain chime + kill zap). Persisted
 // to flyff.cfg (attach-gated save: the pre-attach layout is defaults and must never overwrite a
 // calibrated cfg). The sounds only exist while a radar window is open (the audio device lives with it).
@@ -1559,138 +1375,105 @@ cli_hillshade :: proc(session: ^Session, args: []string) {
   }
 }
 
-// Multi-line hover tooltip (the "?" legend badge + anything else needing more than one line). Shares
-// the visual language of the status-light tooltip; clamps to the given right edge.
-panel_tooltip_lines :: proc(x, y: f32, lines: []cstring, right_edge: f32) {
-  w := i32(0)
-  for l in lines {
-    lw := rl.MeasureText(l, 12)
-    if lw > w {
-      w = lw
+// nowalk [on|off] - toggle the radar's no-walk overlay: the terrain cells the reach oracle treats as
+// walk-blocking (NOWALK / NOMOVE / DIE), painted where they are. This is the SAME attribute grid the
+// targeting reach raycast reads, so it shows you the invisible walls auto is already avoiding. Reads the
+// terrain heightmap, so it needs `worldscan` pinned; the toggle still flips (it activates once terrain
+// resolves). Persisted like hillshade (attach-gated save). Radar key: N.
+cli_nowalk :: proc(session: ^Session, args: []string) {
+  switch {
+  case len(args) == 0:
+    session.layout.nowalk_on = !session.layout.nowalk_on
+  case len(args) == 1 && args[0] == "on":
+    session.layout.nowalk_on = true
+  case len(args) == 1 && args[0] == "off":
+    session.layout.nowalk_on = false
+  case:
+    fmt.eprintln("usage: nowalk [on|off]")
+    return
+  }
+  if session.attached {
+    flyff_save_cfg(session.layout, flyff_cfg_path())
+  }
+  fmt.printfln("no-walk overlay %s.", session.layout.nowalk_on ? "ON" : "OFF")
+  if session.layout.nowalk_on {
+    fmt.println("  legend: orange = NOWALK (fly-only), red = NOMOVE (wall), magenta = DIE.")
+    if !terrain_ready(session) {
+      fmt.println("  note: terrain offsets not pinned yet - run 'worldscan' (in-game) so there is an attribute grid to paint.")
     }
   }
-  h := i32(len(lines)) * 16 + 8
-  tx := x
-  ty := y
-  if tx + f32(w) + 12 > right_edge {
-    tx = right_edge - f32(w) - 12
-  }
-  rl.DrawRectangle(i32(tx - 4), i32(ty - 3), w + 12, h, rl.Color{10, 14, 20, 240})
-  rl.DrawRectangleLines(i32(tx - 4), i32(ty - 3), w + 12, h, rl.Color{80, 90, 102, 255})
-  for l, i in lines {
-    rl.DrawText(l, i32(tx + 1), i32(ty + f32(i * 16)), 12, rl.RAYWHITE)
-  }
 }
 
-// Case-insensitive membership test over a name list (for "already a chip" / dedup checks).
-panel_name_in :: proc(list: []string, name: string) -> bool {
-  for e in list {
-    if strings.equal_fold(e, name) {
-      return true
-    }
-  }
-  return false
-}
-
-// Append <name> to the temp candidate pool if not already present (case-insensitive dedup).
-panel_add_cand :: proc(pool: ^[dynamic]string, name: string) {
-  if !panel_name_in(pool[:], name) {
-    append(pool, name)
-  }
-}
-
-// One status light: a colored dot + label. Returns the row rectangle so the caller can hit-test it for a
-// hover tooltip. Green = pinned; red = required + missing; yellow = optional + missing.
-panel_status_light :: proc(x, y, w: f32, g: Setup_Group) -> rl.Rectangle {
-  col := g.ok ? DOT_OK : (g.required ? DOT_REQ : DOT_OPT)
-  rl.DrawCircle(i32(x + 6), i32(y + 8), 5, col)
-  rl.DrawText(fmt.ctprintf("%s", g.label), i32(x + 18), i32(y + 2), 12, PANEL_TXT)
-  return rl.Rectangle{x, y, w, 16}
-}
-
-// Format an integer with thousands separators (e.g. 1240 -> "1,240"), temp-allocated. For the penya pop.
-commafy :: proc(n: i64) -> string {
-  s := fmt.tprintf("%d", n)
-  neg := len(s) > 0 && s[0] == '-'
-  if neg {
-    s = s[1:]
-  }
-  b := strings.builder_make(context.temp_allocator)
-  if neg {
-    strings.write_byte(&b, '-')
-  }
-  L := len(s)
-  for i in 0 ..< L {
-    if i > 0 && (L - i) % 3 == 0 {
-      strings.write_byte(&b, ',')
-    }
-    strings.write_byte(&b, s[i])
-  }
-  return strings.to_string(b)
-}
 
 // radar [seconds] - open the live radar window. seconds>0 auto-closes after that long (handy for a quick
 // look / headless smoke test); omit to run until you close the window. Press E in-window for the fence
 // editor (see the HUD for controls); draw your fence, close the window, then `fence save <name>`.
 cli_radar :: proc(session: ^Session, args: []string) {
-  if !session.attached || session.ptr_size != 4 {
-    fmt.eprintln("radar: attach a 32-bit Neuz first.")
-    return
-  }
   dur := f64(0)
   if len(args) >= 1 {
     if v, ok := strconv.parse_f64(args[0]); ok && v > 0 {
       dur = v
     }
   }
-  handle := session.proc_info.handle
-  base := session.proc_info.base
   pt := engine.Value_Type.U32
-  L := session.layout
-  view_r := clamp(L.radar_range, RADAR_RANGE_MIN, RADAR_RANGE_MAX) // vision radius; re-read live each frame in the loop
 
-  // Read once and report BEFORE opening a window, so the data pipeline is verifiable headlessly.
-  world := read_ptr_at(handle, base + L.world_rva, pt)
-  ppos, pok := read_player_pos(session)
-  if !pok || world == 0 {
-    // Open ANYWAY with an empty map. The control panel's Setup dialog is how you configure the tool, so
-    // requiring setup to be complete before you can open it is a dead end (this used to hard-return here).
-    // The render loop re-reads world + player every frame and guards all mob/obstacle work on them, so
-    // blips appear live the instant setup resolves them. Fall back to the origin for the initial camera.
-    if !pok {
-      ppos = {0, 0, 0}
+  // NOT attach-gated. The window opens with no process attached and shows the Attach dialog - it is the
+  // way IN, so requiring an attach first would be a dead end (same reasoning that already dropped the
+  // "setup must be complete" gate). Consequently handle/base/layout are NOT captured here: attaching from
+  // inside the window would leave those stale forever. They are re-read per frame, in the locked section.
+  ppos := [3]f32{0, 0, 0}
+  if session.attached && session.ptr_size == 4 {
+    // Read once and report BEFORE opening a window, so the data pipeline stays verifiable headlessly.
+    L0 := session.layout
+    view_r0 := clamp(L0.radar_range, RADAR_RANGE_MIN, RADAR_RANGE_MAX)
+    world0 := read_ptr_at(session.proc_info.handle, session.proc_info.base + L0.world_rva, pt)
+    p0, pok := read_player_pos(session)
+    if pok {
+      ppos = p0
     }
-    fmt.eprintln("radar: world/player not resolved yet - opening the panel so you can run Setup. Be in-game + run setup; blips appear once it resolves.")
-  } else {
-    probe_player := read_ptr_at(handle, base + L.player_rva, pt)
-    probe_pb, probe_pai := radar_prop_ctx(session, probe_player)
-    probe := make([dynamic]Radar_Blip, context.temp_allocator)
-    radar_gather_movers(session, world, probe_player, probe_pb, probe_pai, ppos[0], ppos[2], view_r + 20, &probe, nil, nil, 0)
-    probe_obbs := collect_area_colliders(session, world, ppos[0], ppos[2])
-    nmon, nply, noth := 0, 0, 0
-    for b in probe {
-      switch b.kind {
-      case .Monster:
-        nmon += 1
-      case .Player:
-        nply += 1
-      case .Other, .Unclassified:
-        noth += 1
+    if !pok || world0 == 0 {
+      fmt.eprintln("radar: world/player not resolved yet - opening anyway so you can run Setup. Be in-game; blips appear once it resolves.")
+    } else {
+      probe_player := read_ptr_at(session.proc_info.handle, session.proc_info.base + L0.player_rva, pt)
+      probe_pb, probe_pai := radar_prop_ctx(session, probe_player)
+      probe := make([dynamic]Radar_Blip, context.temp_allocator)
+      radar_gather_movers(session, world0, probe_player, probe_pb, probe_pai, ppos[0], ppos[2], view_r0 + 20, &probe, nil, nil, 0)
+      probe_obbs := collect_area_colliders(session, world0, ppos[0], ppos[2])
+      nmon, nply, noth := 0, 0, 0
+      for b in probe {
+        switch b.kind {
+        case .Monster:
+          nmon += 1
+        case .Player:
+          nply += 1
+        case .Other, .Unclassified:
+          noth += 1
+        }
       }
+      fmt.printfln(
+        "radar: player (%.1f, %.1f), %d movers (%d mob, %d player, %d other), %d obstacles in view. opening window%s...",
+        ppos[0], ppos[2], len(probe), nmon, nply, noth, len(probe_obbs), dur > 0 ? fmt.tprintf(" for %.0fs", dur) : "",
+      )
     }
-    fmt.printfln(
-      "radar: player (%.1f, %.1f), %d movers (%d mob, %d player, %d other), %d obstacles in view. opening window%s...",
-      ppos[0], ppos[2], len(probe), nmon, nply, noth, len(probe_obbs), dur > 0 ? fmt.tprintf(" for %.0fs", dur) : "",
-    )
+  } else {
+    fmt.printfln("radar: not attached - opening the window on the Attach dialog%s...", dur > 0 ? fmt.tprintf(" for %.0fs", dur) : "")
   }
   free_all(context.temp_allocator)
 
   rl.SetConfigFlags({.WINDOW_RESIZABLE})
-  rl.InitWindow(820 + i32(PANEL_W), 820, "memscan radar")
+  rl.InitWindow(1000, 820, "memscan")
   defer rl.CloseWindow() // raylib's own (via /WHOLEARCHIVE:raylib.lib) - see note atop this file
-  rl.SetWindowMinSize(i32(PANEL_W) + 320, 480) // keep the panel + a usable map region visible
+  rl.SetWindowMinSize(520, 420)
   rl.SetTargetFPS(30)
-  radar_apply_theme() // dark, high-contrast raygui theme (raylib's default is unreadable low-contrast grey)
+  // Kill raylib's default ESC-quits-the-window binding. ESC is a dialog/cancel key everywhere else in
+  // this UI, and having it also tear down the whole window (mid-fence-edit, mid-setup) was a trap. The
+  // titlebar X and the `radar <seconds>` timeout are the ways out now.
+  rl.SetExitKey(.KEY_NULL)
+
+  // Dear ImGui owns every widget now (see gui.odin). The font atlas is baked at layout.ui_scale, so the
+  // scale is latched here for the window's life - `set ui_scale <n>` then re-open to change it.
+  gui_init(session.layout.ui_scale)
+  defer gui_shutdown()
 
   // Audio lives with the window: the penya chime + kill zap can only play while the radar is open, which
   // is exactly what we want. Synthesized once (no assets). Guards on IsAudioDeviceReady so a headless /
@@ -1707,7 +1490,10 @@ cli_radar :: proc(session: ^Session, args: []string) {
 
   scale := f32(3.0) // pixels per world unit; mouse wheel zooms
   cam := [2]f32{ppos[0], ppos[2]} // world point at screen center; right-drag pans, C recenters on player
-  cam_lock := false // L / VIEW button: lock the camera on the player so the dot stays centred (pan disabled)
+  // L / the toolbar camera button: lock the view on the player so the dot stays centred (pan disabled).
+  // ON by default - following the player is what you want ~always, and the map-style recenter button only
+  // appears once you unlock and pan away.
+  cam_lock := true
   show_cam := false // F toggles the render-camera eye + frustum overlay
   show_reach := true // R toggles fading of monsters the collision check can't reach (off = less per-frame work)
   start := rl.GetTime()
@@ -1732,15 +1518,11 @@ cli_radar :: proc(session: ^Session, args: []string) {
   defer sweep_wip_free(&paint_wip)
   paint_active := false
 
-  // Control-panel widget state (Phase 3). Local, like poly_wip. Its pending/selected strings are
-  // heap-owned; free any leftovers on close (the per-frame drain frees the rest).
+  // UI widget state (see gui.odin). Local, like poly_wip. Its pending strings + process rows are
+  // heap-owned; freed on close (the per-frame drain frees the commands it runs).
   ps: Panel_State
-  defer {
-    for c in ps.pending {delete(c)}
-    delete(ps.pending)
-    for s in ps.selected {delete(s)}
-    delete(ps.selected)
-  }
+  defer panel_state_free(&ps)
+  recenter_req := false // set by the toolbar's recenter button, consumed at the top of the next frame
 
   // Phase 4 interaction state - radar-local (like poly_wip); the watcher thread never touches these.
   // The "+penya" pops, kill lasers, and move markers, plus the hover-target.
@@ -1754,15 +1536,15 @@ cli_radar :: proc(session: ^Session, args: []string) {
   trail := make([dynamic][3]f32)
   defer delete(trail)
 
-  // Terrain hillshade relief - cached screen-cell list, rebuilt only when the view (cam/scale/size)
-  // changes (terrain is static), so a still view costs only the rect draws. Cells are value-only.
+  // The two terrain layers - hillshade relief and the no-walk overlay. Both are cached screen-cell lists
+  // rebuilt only when the view (cam/scale/size) changes, since terrain is static: a still view costs
+  // only the rect draws. Cells are value-only; the guard struct is what decides "the view moved".
   hill_cells := make([dynamic]Hill_Cell)
   defer delete(hill_cells)
-  hill_cam := [2]f32{}
-  hill_scale := f32(-1)
-  hill_fw := f32(-1)
-  hill_fh := f32(-1)
-  hill_valid := false
+  hill_cache: Terrain_Layer_Cache
+  nowalk_cells := make([dynamic]Nowalk_Cell)
+  defer delete(nowalk_cells)
+  nowalk_cache: Terrain_Layer_Cache
 
   // Filter-coloring name cache + map-wide giant overlay - radar-local, persist across frames (like poly_wip),
   // freed on close. The giant list is refilled by a throttled scan (GIANT_SCAN_NS); giants_at gates it.
@@ -1796,34 +1578,44 @@ cli_radar :: proc(session: ^Session, args: []string) {
       break
     }
 
+    // Open the ImGui frame FIRST: it pumps raylib's input into ImGui and computes WantCaptureMouse /
+    // WantCaptureKeyboard for THIS frame, which is what gates the map input below. The matching
+    // imgui_rl.end() runs inside BeginDrawing/EndDrawing at the bottom of the loop.
+    imgui_rl.begin()
+
     fw := f32(rl.GetScreenWidth())
     fh := f32(rl.GetScreenHeight())
-    center := rl.Vector2{(fw - PANEL_W) / 2, fh / 2} // recentre the world into the left region (panel on the right)
+    center := rl.Vector2{fw / 2, fh / 2} // the map owns the whole window now; the UI floats over it
     mouse := rl.GetMousePosition()
     mw := radar_s2w(cam, scale, center, mouse.x, mouse.y) // world (x,z) under the cursor
-    // Gate world input: panel clicks/scroll must never pan/zoom/edit the map, and typing in a panel
-    // textbox must not trigger the E/F/R/C or fence hotkeys. (Modal open => treat all as panel.) The
-    // fence toolbar rect counts as panel while edit mode is on, so a toolbar click never also lands a
-    // fence draw/erase at that same screen point.
-    mouse_in_panel :=
-      mouse.x >= fw - PANEL_W ||
-      ps.setup_open ||
-      ps.options_open ||
-      ps.leaderboard_open ||
-      rl.CheckCollisionPointRec(mouse, MUTE_BTN_RECT) ||
-      (edit && rl.CheckCollisionPointRec(mouse, FENCE_TB_RECT))
-    typing := ps.search_edit || ps.name_edit || ps.hp_edit || ps.penya_edit || ps.lb_name_edit
+    // Gate world input through ImGui itself: a click on a widget must never also pan/zoom/target/edit,
+    // and typing in a text box must not fire the E/F/R/C/Space or fence hotkeys. This replaced a
+    // hand-maintained list of panel/toolbar/button rectangles - ImGui already knows what it is hovering.
+    io := imgui.GetIO()
+    ui_owns_mouse := io.WantCaptureMouse || gui_modal_up(&ps, session.attached)
+    typing := io.WantCaptureKeyboard
 
-    // Re-snapshot the layout every frame (under the lock): setup/findpenya from the panel and an
-    // external 'set attack_range' all mutate session.layout live, and a frozen copy kept the ring,
-    // the penya watch, and the cold-start blip pipeline stale until the window was reopened.
-    L = session.layout
-    view_r = clamp(L.radar_range, RADAR_RANGE_MIN, RADAR_RANGE_MAX) // live vision radius (Options slider)
+    // Everything below reads the game, so it only runs while a 32-bit process is attached. handle/base/
+    // layout are re-read EVERY frame, never captured before the loop: you can attach (and re-attach) from
+    // inside this window, which would leave a hoisted copy pointing at a closed handle forever.
+    live := session.attached && session.ptr_size == 4
+    handle := session.proc_info.handle
+    base := session.proc_info.base
+    // Re-snapshot the layout every frame (under the lock): setup/findpenya from the UI and an external
+    // 'set attack_range' all mutate session.layout live, and a frozen copy kept the ring, the penya watch
+    // and the cold-start blip pipeline stale until the window was reopened.
+    L := session.layout
+    view_r := clamp(L.radar_range, RADAR_RANGE_MIN, RADAR_RANGE_MAX) // live vision radius
+
+    if recenter_req {
+      cam = {ppos[0], ppos[2]}
+      recenter_req = false
+    }
 
     // --- live player pos + facing (single player resolve) ---
     pangle: f32
     has_angle := false
-    player := read_ptr_at(handle, base + L.player_rva, pt)
+    player := live ? read_ptr_at(handle, base + L.player_rva, pt) : 0
     if player != 0 {
       if p, ok := engine.read_vec3(handle, player + uintptr(L.pos_off)); ok {
         ppos = p
@@ -1869,8 +1661,8 @@ cli_radar :: proc(session: ^Session, args: []string) {
       clear(&trail) // toggle off -> drop history so it can't reappear stale on re-enable
     }
 
-    // --- input: view controls + fence editor (both modes). Gated so the panel owns its region. ---
-    if !mouse_in_panel && !typing {
+    // --- input: view controls + fence editor (both modes). Gated so the UI wins any click it wants. ---
+    if !ui_owns_mouse && !typing {
     scale += rl.GetMouseWheelMove() * 0.5
     if scale < 0.5 {scale = 0.5}
     if scale > 24 {scale = 24}
@@ -1909,8 +1701,10 @@ cli_radar :: proc(session: ^Session, args: []string) {
     if rl.IsKeyPressed(.F) {show_cam = !show_cam}
     if rl.IsKeyPressed(.R) {show_reach = !show_reach}
     if rl.IsKeyPressed(.L) {cam_lock = !cam_lock}
+    if rl.IsKeyPressed(.M) {panel_enqueue(&ps, "collmem")} // remember obstacles you have walked past
     if rl.IsKeyPressed(.C) || rl.IsKeyPressed(.HOME) {cam = {ppos[0], ppos[2]}}
     if rl.IsKeyPressed(.H) {panel_enqueue(&ps, "hillshade")} // toggle terrain relief (deferred like jump)
+    if rl.IsKeyPressed(.N) {panel_enqueue(&ps, "nowalk")} // toggle the no-walk overlay (same, deferred)
     if rl.IsKeyPressed(.SPACE) && !edit {panel_enqueue(&ps, "jump")} // jump (deferred like every UI action)
 
     // --- input: fence editor (edit mode) ---
@@ -1987,7 +1781,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
         }
       }
     }
-    } // end input gate (mouse_in_panel / typing)
+    } // end input gate (the UI has the cursor / keyboard)
 
     // Camera-lock: keep the player centred by pinning the view to its live position every frame (the world
     // scrolls under a stationary dot instead of the dot drifting off-centre). Applied after input so it
@@ -1997,7 +1791,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
     }
 
     // --- live data (snapshot shared state before releasing the lock) ---
-    w := read_ptr_at(handle, base + L.world_rva, pt)
+    w := live ? read_ptr_at(handle, base + L.world_rva, pt) : 0
     mobs := make([dynamic]Radar_Blip, context.temp_allocator)
     obbs: []Obb
     focus: uintptr // currently selected target (m_pObjFocus); 0 = nothing selected
@@ -2015,25 +1809,37 @@ cli_radar :: proc(session: ^Session, args: []string) {
         radar_scan_giants(session, w, player, &giants)
         giants_at = now_frame
       }
-      // collect_area_colliders returns session.collider_cache[:]. allow_async keeps the frame off the
-      // ~200ms rebuild: a stale cache kicks the background collider_scan_worker and serves the current
-      // slice. That worker republishes the cache under exec_mutex, so clone into temp - drawing runs after
-      // we unlock and must not touch a slice being reallocated out from under it.
-      obbs = slice.clone(collect_area_colliders(session, w, ppos[0], ppos[2], allow_async = true), context.temp_allocator)
+      // Keep the collider sets fresh. allow_async keeps the frame off the ~200ms rebuild: a stale cache
+      // kicks the background collider_scan_worker and serves the current one meanwhile. We drop the
+      // returned live-window slice on the floor and DRAW from the persistent memory store instead, so
+      // props stay on the map once seen instead of popping out at COLLIDER_RADIUS (collmem off falls back
+      // to that same live window). Both are republished by the worker under exec_mutex, so the visible
+      // subset is copied out here - drawing runs after we unlock.
+      collect_area_colliders(session, w, ppos[0], ppos[2], allow_async = true)
+      draw_obbs := make([dynamic]Obb, 0, 512, context.temp_allocator)
+      collider_memory_visible(session, cam, scale, fw, fh, &draw_obbs)
+      obbs = draw_obbs[:]
       // Terrain hillshade: rebuild the relief cells only when the view changed (static terrain). Reads
       // game memory, so it must run here (locked). Gated on the toggle + terrain offsets being pinned.
       if L.hillshade_on && terrain_ready(session) {
-        if !hill_valid || hill_cam != cam || hill_scale != scale || hill_fw != fw || hill_fh != fh {
+        if terrain_layer_stale(hill_cache, cam, scale, fw, fh) {
           radar_gather_hillshade(session, w, cam, scale, center, fw, fh, L.hillshade_z, L.hillshade_light, &hill_cells)
-          hill_cam = cam
-          hill_scale = scale
-          hill_fw = fw
-          hill_fh = fh
-          hill_valid = true
+          terrain_layer_mark(&hill_cache, cam, scale, fw, fh)
         }
-      } else if hill_valid {
+      } else if hill_cache.valid {
         clear(&hill_cells)
-        hill_valid = false
+        hill_cache.valid = false
+      }
+      // No-walk overlay: same deal (static terrain, view-keyed rebuild), reading the attribute half of
+      // the very same heightmap cells.
+      if L.nowalk_on && terrain_ready(session) {
+        if terrain_layer_stale(nowalk_cache, cam, scale, fw, fh) {
+          radar_gather_nowalk(session, w, cam, scale, center, fw, fh, &nowalk_cells)
+          terrain_layer_mark(&nowalk_cache, cam, scale, fw, fh)
+        }
+      } else if nowalk_cache.valid {
+        clear(&nowalk_cells)
+        nowalk_cache.valid = false
       }
       // Selected target: read m_pObjFocus + its position so we can ring it (it may sit outside the
       // gathered radius, so we resolve its position directly rather than relying on the mob list).
@@ -2050,15 +1856,16 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // (obbs jumps on the ~16-unit cache miss - the suspected stutter frame).
     tracy.PlotI("Radar_Movers", i64(len(mobs)))
     tracy.PlotI("Radar_Colliders", i64(len(obbs)))
+    tracy.PlotI("Radar_Remembered", i64(len(session.collider_memory)))
 
     // --- Phase 4 click interaction (still locked): plain-click = target the mob under the cursor;
     // Shift+click = walk to the ground point. Only in view mode (edit owns left-click for fences) and
-    // off the panel. focus_set_obj / write_dest_pos need exec_mutex, which we still hold here. ---
+    // not over a widget. focus_set_obj / write_dest_pos need exec_mutex, which we still hold here. ---
     shift_down := rl.IsKeyDown(.LEFT_SHIFT) || rl.IsKeyDown(.RIGHT_SHIFT)
     hover_obj = 0
     insp_pick = -1 // reset per-frame like hover_obj so a stale pick can't linger (obbs indices shift each frame)
     insp_lines = nil
-    if !mouse_in_panel && !typing && !edit && !inspect {
+    if !ui_owns_mouse && !typing && !edit && !inspect {
       best := HIT_R // nearest mob dot under the cursor (hover ring + plain-click target)
       for m in mobs {
         sp := radar_w2s(cam, scale, center, m.pos[0], m.pos[2])
@@ -2087,9 +1894,9 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // --- sweep stroke sampling (still locked): extend the in-progress lane toward the cursor, resampling
     // every SWEEP_SAMPLE units and reach-validating each new node. It lives HERE rather than up with the
     // gesture because validation needs `w` (the CWorld*, read above) and the collider set. The release is
-    // handled UNGATED - a drag that ends over the panel must still arm, or paint_active would stick. ---
+    // handled UNGATED - a drag that ends over a widget must still arm, or paint_active would stick. ---
     if paint_active {
-      if rl.IsMouseButtonDown(.RIGHT) && !mouse_in_panel && !typing {
+      if rl.IsMouseButtonDown(.RIGHT) && !ui_owns_mouse && !typing {
         sweep_wip_extend(session, w, &paint_wip, mw[0], mw[1], ppos[1])
       }
       if !rl.IsMouseButtonDown(.RIGHT) {
@@ -2105,16 +1912,18 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // --- inspect mode (still locked): identify the collider box under the cursor. Read-only - it never
     // touches the reach filter. Pick the box (smallest footprint wins), read its identity live for the
     // tooltip, and on left-click echo the one-liner to the console (a persistent, copyable record). ---
-    if inspect && !mouse_in_panel && !typing {
+    if inspect && !ui_owns_mouse && !typing {
       insp_pick = obb_pick_at(obbs, mw[0], mw[1])
       if insp_pick >= 0 {
         o := obbs[insp_pick]
         insp_lines = collider_inspect_lines(session, o, ppos)
         // Left-click adds this box's KIND (type + m_dwIndex) to the ignore-list - it's dropped from the
         // collider set on the next scan, so every box like it vanishes from reach AND the radar. Persisted.
-        if rl.IsMouseButtonPressed(.LEFT) && o.obj != 0 {
-          ty := u32(read_i32_at(handle, o.obj + uintptr(L.pos_off + 0x10)))
-          idx := u32(read_i32_at(handle, o.obj + uintptr(L.pos_off + 0x14)))
+        // Identity comes off the box (obj_to_obb captured it), not a live re-read: a REMEMBERED box's CObj
+        // may already be streamed out, and clicking one of those has to work exactly the same.
+        if rl.IsMouseButtonPressed(.LEFT) {
+          ty := o.ty
+          idx := o.idx
           if added, ok := collider_ignore_toggle(session, ty, idx); !ok {
             fmt.printfln("[ignore] list full (max %d) - 'collignore clear' to reset", FLYFF_MAX_COLLIDER_IGNORE)
           } else if added {
@@ -2143,8 +1952,10 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // both under this lock, so no double-count). kill_watch_tick records HAND kills (auto off) so the
     // laser/zap fire when farming manually too. Then drain any events newer than when we opened into the
     // "+penya" pops / kill lasers, and fire the chime / zap once per batch of new events.
-    penya_tick(session)
-    kill_watch_tick(session, time.now()._nsec)
+    if live {
+      penya_tick(session)
+      kill_watch_tick(session, time.now()._nsec)
+    }
     now_ev := time.now()._nsec
     play_chime := false
     for ev in session.penya_events {
@@ -2173,144 +1984,9 @@ cli_radar :: proc(session: ^Session, args: []string) {
       ceye, clook, cam_ok = read_camera(session)
     }
 
-    // --- panel snapshot (structured status/auto/range data; drawn after unlock, no text parsing) ---
-    // attack_range slider seed/apply. ONLY write the layout from the slider WHILE the user is dragging it
-    // (ar_dragging), so the green ring tracks the drag; otherwise re-seed the slider FROM the layout each
-    // frame. That (a) reflects an external `set attack_range`/`density` and (b) stops GuiSlider's pixel-
-    // quantisation from drifting the stored value every time the panel opens - that silent creep is what
-    // bloated attack_range to ~17 and made the auto-picker's engage range spread targets. The aligned
-    // 4-byte store is atomic vs the watcher's read; the flyff.cfg persist is deferred to slider release.
-    if !ps.ar_seeded {
-      ps.ar_slider = session.layout.attack_range
-      ps.ar_seeded = true
-    }
-    if ps.ar_dragging {
-      session.layout.attack_range = ps.ar_slider
-    } else {
-      ps.ar_slider = session.layout.attack_range
-    }
-    // radar-range (vision) slider: same discipline as attack_range. While dragging, push the value into
-    // the layout so the gathered/drawn radius grows live; otherwise re-seed from the layout. Persist to
-    // flyff.cfg is deferred to release (the Options slider block below).
-    if !ps.rr_seeded {
-      ps.rr_slider = session.layout.radar_range
-      ps.rr_seeded = true
-    }
-    if ps.rr_dragging {
-      session.layout.radar_range = ps.rr_slider
-    } else {
-      ps.rr_slider = session.layout.radar_range
-    }
-    // player-trail sliders (length + fade): same discipline. Display-only fields the watcher never reads,
-    // so writing them live from the render thread is safe; flyff.cfg persist is deferred to release.
-    if !ps.tr_seeded {
-      ps.tr_slider = session.layout.trail_len
-      ps.tr_seeded = true
-    }
-    if ps.tr_dragging {
-      session.layout.trail_len = ps.tr_slider
-    } else {
-      ps.tr_slider = session.layout.trail_len
-    }
-    if !ps.tf_seeded {
-      ps.tf_slider = session.layout.trail_fade
-      ps.tf_seeded = true
-    }
-    if ps.tf_dragging {
-      session.layout.trail_fade = ps.tf_slider
-    } else {
-      ps.tf_slider = session.layout.trail_fade
-    }
-    groups := setup_groups(session)
-    opins := optional_pins(session)
-    status_hdr := setup_status_line(session)
-    auto_on_s := session.auto_on
-    auto_paused_s := session.auto_paused
-    auto_desc_s := auto_target_desc(session.auto_names[:])
-    auto_line_s := auto_on_s ? auto_stats_panel(session, time.now()._nsec) : ""
-    // Phase 6 panel snapshot: everything the (unlocked) draw phase needs is captured here, under the
-    // lock, like the auto_* lines above - widgets must never read session during the draw.
-    setup_running_s := session.setup_running
-    setup_step_s := session.setup_step
-    density_on_s := session.layout.density_on
-    density_hue_s := session.layout.density_hue_on
-    preselect_on_s := session.preselect_on
-    lookalive_on_s := session.lookalive_on
-    reach_gate_s := session.reach_gate_on
-    hunt_s := session.hunt_on
-    // Sweep lane: the node list is cloned into temp because the watcher's sweep_tick reallocs/mutates the
-    // live one (erase marks + a completion clear), and the draw below runs AFTER we unlock - same reason
-    // as the obbs clone above. The in-progress stroke needs no clone: paint_wip is radar-local.
-    sweep_on_s := session.sweep_on
-    sweep_nodes_s: []Sweep_Node
-    sweep_pct_s, sweep_left_s: f32
-    if sweep_on_s {
-      sweep_nodes_s = slice.clone(session.sweep_path[:], context.temp_allocator)
-      sweep_pct_s, sweep_left_s, _ = sweep_progress(session)
-    }
-    stuck_on_s := session.auto_stuck_on
-    combat_watch_s := session.combat_watch_on
-    combat_grace_s := session.layout.combat_grace
-    // Priority-ladder state for the TARGETING section. aggro_ready_s reports whether rung 1 can actually
-    // read anything (it compares each mob's m_idDest to our OBJID, so it needs both offsets pinned) -
-    // the chip renders INERT rather than a lie when setup hasn't run. preset_cur_s is the index of the
-    // preset the live config matches, or -1 for custom; PRESETS itself is an immutable package table, so
-    // the draw may read it directly.
-    aggro_first_s := session.aggro_first_on
-    melee_first_s := session.melee_first_on
-    pocket_s := session.pocket_on
-    aggro_ready_s := session.layout.objid_off != 0 && session.layout.iddest_off != 0
-    preset_cur_s := preset_current(session)
-    opt_melee_cur := session.layout.melee_range
-    opt_grace_cur := session.layout.combat_grace
-    sfx_on_s := session.layout.sfx_on
-    fx_laser_s := session.layout.fx_laser_on
-    trail_s := session.layout.trail_on
-    hillshade_on_s := session.layout.hillshade_on
-    opt_ar_cur := session.layout.attack_range
-    opt_mg_cur := session.layout.density_min_gain
-    opt_dt_cur := session.layout.density_max_detour
-    opt_lahmin_cur := session.layout.la_hold_min
-    opt_lahmax_cur := session.layout.la_hold_max
-    opt_lajmin_cur := session.layout.la_jump_min
-    opt_lajmax_cur := session.layout.la_jump_max
-    opt_lajch_cur := session.layout.la_jump_chance
-    la_hesitate_s := session.layout.la_hesitate_on
-    la_jump_s := session.layout.la_jump_on
-    la_step_s := session.layout.la_step_on
-    la_maxrange_s := session.layout.la_maxrange_on
-    opt_lastepch_cur := session.layout.la_step_chance
-    opt_lastepsp_cur := session.layout.la_step_spread
-    opt_lamaxr_cur := session.layout.la_max_range
-    prop_ok_s := prop_gate_ready(session)
-    penya_total_s := session.penya_total
-    penya_cur_s := session.penya_last // current gold balance (bottom-left HUD readout + cap warning)
-    penya_show_s := session.layout.penya_off != 0 && session.penya_seeded // pinned + read at least once
-    jump_at_s := session.jump_fired_at // for the player-dot hop animation (set by cli_jump / look-alive)
-    // Leaderboards snapshot: cheap scalars always (the gated button reads lb_configured_s); the board rows +
-    // status are cloned into temp only while the modal is open (a Session.lb_board mutated by the async worker
-    // must never be drawn lock-free). lb_rows_s is temp-lifetime - consumed by this frame's draw, freed after.
-    lb_configured_s := session.layout.leaderboard_url != ""
-    lb_active_s := session.lb_run.active
-    lb_has_run_s := session.lb_run.active || session.lb_run.start_ns != 0
-    lb_elapsed_s := lb_elapsed_sec(session)
-    lb_kills_s := session.lb_run.kills
-    lb_penya_s := lb_penya(session)
-    lb_kpm_s := lb_kpm(session)
-    lb_density_s := session.lb_run.max_density
-    lb_species_s := len(session.lb_run.names)
-    lb_busy_s := session.lb_net_busy
-    lb_submitted_s := session.lb_run.submitted
-    lb_board_sort_s := session.lb_board_sort
-    lb_status_s := ""
-    lb_rows_s: []Lb_Row
-    if ps.leaderboard_open {
-      lb_status_s = strings.clone(lb_status_str(session), context.temp_allocator)
-      lb_rows_s = slice.clone(session.lb_board[:], context.temp_allocator)
-    }
-    // Bag fullness for the bottom-left HUD readout. read_inventory_counts is a ~100KB RPM read, so
-    // throttle it (~2.5/s); the last result persists across frames. No-op/hidden when 'findinv' is unset.
-    if L.inv_off != 0 && L.item_stride != 0 {
+    // Bag fullness for the gauge. read_inventory_counts is a ~100KB RPM read, so throttle it (~2.5/s);
+    // the last result persists across frames. No-op/hidden until 'findinv' has pinned the offsets.
+    if live && L.inv_off != 0 && L.item_stride != 0 {
       if rl.GetTime() >= inv_next_read {
         if used, _, cap, ok := read_inventory_counts(session); ok {
           inv_used, inv_cap, inv_have = used, cap, true
@@ -2322,18 +1998,54 @@ cli_radar :: proc(session: ^Session, args: []string) {
     } else {
       inv_have = false
     }
-    // Distinct nearby monster names for the search suggestions - only read (extra RPM) while the search
-    // box is in use, so an idle panel costs nothing. Temp-lifetime (consumed by this frame's draw).
-    live_names := make([dynamic]string, context.temp_allocator)
-    if ps.search_edit || panel_buf_str(ps.search_buf[:]) != "" {
-      for m in mobs {
-        if m.kind != .Monster {
-          continue
-        }
-        if nm, ok := read_mover_name(session, m.obj); ok && len(nm) > 0 {
-          panel_add_cand(&live_names, nm)
-        }
+
+    // --- UI snapshot: everything gui_frame needs, captured HERE under the lock. The draw phase must
+    // never read `session` (the watcher owns it the moment we unlock), so anything the widgets show has
+    // to land in this struct first. Strings are either static or temp-allocated, which outlives the draw.
+    gf := Gui_Frame {
+      attached      = session.attached,
+      ptr_size      = session.ptr_size,
+      pid           = session.proc_info.pid,
+      proc_name     = session.proc_info.name,
+      groups        = setup_groups(session),
+      opins         = optional_pins(session),
+      setup_running = session.setup_running,
+      setup_step    = session.setup_step,
+      penya_show    = L.penya_off != 0 && session.penya_seeded, // pinned + read at least once
+      penya_cur     = session.penya_last,
+      inv_have      = inv_have,
+      inv_used      = inv_used,
+      inv_cap       = inv_cap,
+      sfx_on        = L.sfx_on,
+      nowalk_on     = L.nowalk_on,
+      attack_range  = L.attack_range,
+      fence_active  = session.fence.active,
+      fence_shapes  = len(session.fence.shapes),
+    }
+    // Behaviour run state. The strings are CLONED into temp: the watcher thread frees and replaces
+    // run.name / run.last_line whenever the program moves on, and the draw phase runs unlocked.
+    if run := &session.script; run.active {
+      gf.script_active = true
+      gf.script_paused = run.paused
+      gf.script_step = run.stepping
+      gf.script_irq = run.irq_depth > 0
+      gf.script_name = strings.clone(run.name, context.temp_allocator)
+      gf.script_pc = min(run.pc + 1, run.main_len)
+      gf.script_len = run.main_len
+      gf.script_line = strings.clone(run.last_line, context.temp_allocator)
+      if run.pc >= 0 && run.pc < len(run.steps) {
+        gf.script_node = run.steps[run.pc].id
       }
+    }
+    jump_at_s := session.jump_fired_at // player-dot hop animation (set by cli_jump / look-alive)
+    prop_ok_s := live ? prop_gate_ready(session) : false
+    // Sweep lane: the node list is CLONED into temp because the watcher's sweep_tick reallocs/mutates the
+    // live one (erase marks + a completion clear) and the draw below runs after we unlock - same reason as
+    // the obbs clone above. The in-progress stroke needs no clone: paint_wip is radar-local.
+    sweep_on_s := session.sweep_on
+    sweep_nodes_s: []Sweep_Node
+    if sweep_on_s {
+      sweep_nodes_s = slice.clone(session.sweep_path[:], context.temp_allocator)
     }
 
     // Release exec_mutex for the draw/present so the watcher thread can run auto_tick this frame. All
@@ -2346,11 +2058,16 @@ cli_radar :: proc(session: ^Session, args: []string) {
     { tracy.ZoneN("Radar_Draw")
     rl.BeginDrawing()
     rl.ClearBackground(rl.Color{12, 16, 22, 255})
-    // Clip all world/HUD drawing to the left region so nothing bleeds under the right-side panel.
-    rl.BeginScissorMode(0, 0, i32(fw - PANEL_W), i32(fh))
     // terrain hillshade relief (bottom layer; colourless, under crosshair/obstacles/fences/dots)
-    if hillshade_on_s {
+    if L.hillshade_on {
       for c in hill_cells {
+        rl.DrawRectangleRec(c.rect, c.col)
+      }
+    }
+    // no-walk overlay: the walk-blocking attribute cells, over the relief (it shades them) and under
+    // everything semantic, so a hazard wash never hides a mob dot or a fence edge.
+    if L.nowalk_on {
+      for c in nowalk_cells {
         rl.DrawRectangleRec(c.rect, c.col)
       }
     }
@@ -2386,10 +2103,10 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // this layer - i.e. UNDER the attack-range ring, the trail and every blip - so a lane never hides a
     // mob. Brush width is the live attack_range, so dragging the slider re-widens the paint immediately.
     if sweep_on_s {
-      radar_draw_sweep(sweep_nodes_s, L.attack_range, cam, scale, center, fw - PANEL_W, fh, now_frame)
+      radar_draw_sweep(sweep_nodes_s, L.attack_range, cam, scale, center, fw, fh, now_frame)
     }
     if len(paint_wip.nodes) > 1 {
-      radar_draw_sweep(paint_wip.nodes[:], L.attack_range, cam, scale, center, fw - PANEL_W, fh, now_frame)
+      radar_draw_sweep(paint_wip.nodes[:], L.attack_range, cam, scale, center, fw, fh, now_frame)
     }
     // eraser hover: highlight the shape a click would delete
     if edit && tool == .Eraser {
@@ -2512,7 +2229,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
       // rather than a recolour so it composes with the density hue / fence dim / reach fade above, and
       // so the one thing you'd want to eyeball ("is it actually detecting aggro?") is visible at a glance.
       if m.aggro {
-        rl.DrawCircleLinesV(p, radius + 4, AGGRO_COL)
+        radar_ring(p, radius + 4, AGGRO_COL)
       }
       if m.kind == .Player && m.has_angle {
         radar_draw_arrow(p, m.angle, 11, 4, col) // other players get a facing arrow too
@@ -2520,18 +2237,17 @@ cli_radar :: proc(session: ^Session, args: []string) {
     }
 
     // Map-wide giant overlay: draw every cached "Giant *" monster (see radar_scan_giants) with a gold ring +
-    // name so it stands out. A giant beyond the visible map region is rim-clamped to the edge with an arrow +
-    // distance, so a far hunt target is always locatable no matter the zoom/pan. Drawn under the scissor, so
-    // clamped markers stay off the side panel.
-    map_rect := rl.Rectangle{0, 0, fw - PANEL_W, fh}
+    // name so it stands out. A giant beyond the visible map region is rim-clamped to the window edge with an
+    // arrow + distance, so a far hunt target is always locatable no matter the zoom/pan.
+    map_rect := rl.Rectangle{0, 0, fw, fh}
     for g in giants {
       gs := radar_w2s(cam, scale, center, g.pos[0], g.pos[2])
       on_screen := gs.x >= map_rect.x && gs.x <= map_rect.x + map_rect.width && gs.y >= 0 && gs.y <= fh
       if on_screen {
         rl.DrawCircleV(gs, 4, GIANT_COL)
-        rl.DrawCircleLinesV(gs, 8, GIANT_COL)
-        rl.DrawCircleLinesV(gs, 10, GIANT_COL)
-        rl.DrawText(fmt.ctprintf("%s", g.name), i32(gs.x + 13), i32(gs.y - 7), 13, GIANT_COL)
+        radar_ring(gs, 8, GIANT_COL)
+        radar_ring(gs, 10, GIANT_COL)
+        radar_label(gs.x + 13, gs.y - 8, fmt.ctprintf("%s", g.name), GIANT_COL)
       } else {
         // Clamp the marker onto the map-region edge along the line from the screen center to the giant.
         mrg := f32(14) // margin so the clamped marker + label stay fully inside the region
@@ -2554,23 +2270,23 @@ cli_radar :: proc(session: ^Session, args: []string) {
         // radar_draw_arrow takes a game-angle in DEGREES; its tip points along screen dir (sin, cos) of a_deg
         // (north-up projection). Solve for the tip to point outward along (ux, uy): a_deg = deg(atan2(ux, uy)).
         radar_draw_arrow(ep, math.to_degrees(math.atan2(ux, uy)), 12, 6, GIANT_COL)
-        rl.DrawCircleLinesV(ep, 6, GIANT_COL)
+        radar_ring(ep, 6, GIANT_COL)
         gd := engine.dist_horizontal(g.pos, ppos)
         label := fmt.ctprintf("%s (%.0fu)", g.name, gd)
-        lw := rl.MeasureText(label, 12)
+        lw := radar_text_w(label)
         // Nudge the label inward so it never spills off the region edge.
-        lx := clamp(ep.x + 10, map_rect.x + 2, map_rect.width - f32(lw) - 2)
-        rl.DrawText(label, i32(lx), i32(clamp(ep.y - 6, 2, fh - 14)), 12, GIANT_COL)
+        lx := clamp(ep.x + 10, map_rect.x + 2, map_rect.width - lw - 2)
+        radar_label(lx, clamp(ep.y - 8, 2, fh - 16), label, GIANT_COL)
       }
     }
 
     // selected target (m_pObjFocus) - a bright yellow ring + its name, so you can see what's locked
     if focus != 0 && focus_pos_ok {
       fp := radar_w2s(cam, scale, center, focus_pos[0], focus_pos[2])
-      rl.DrawCircleLinesV(fp, 9, SEL_COL)
-      rl.DrawCircleLinesV(fp, 11, SEL_COL)
+      radar_ring(fp, 9, SEL_COL)
+      radar_ring(fp, 11, SEL_COL)
       if sel_name != "" {
-        rl.DrawText(fmt.ctprintf("%s", sel_name), i32(fp.x + 13), i32(fp.y - 7), 13, SEL_COL)
+        radar_label(fp.x + 13, fp.y - 8, fmt.ctprintf("%s", sel_name), SEL_COL)
       }
     }
 
@@ -2594,9 +2310,9 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // hover ring: the mob a plain left-click would target (view mode) + its name
     if hover_obj != 0 {
       hpv := radar_w2s(cam, scale, center, hover_pos[0], hover_pos[2])
-      rl.DrawCircleLinesV(hpv, 7, HOVER_COL)
+      radar_ring(hpv, 7, HOVER_COL)
       if hover_name != "" {
-        rl.DrawText(fmt.ctprintf("%s", hover_name), i32(hpv.x + 10), i32(hpv.y - 6), 12, HOVER_COL)
+        radar_label(hpv.x + 10, hpv.y - 8, fmt.ctprintf("%s", hover_name), HOVER_COL)
       }
     }
     // move-destination markers (shift-click) - shrinking cyan crosshair, fades out. Prune expired.
@@ -2627,8 +2343,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
       col := PENYA_COL
       col.a = u8(255 * (1 - frac))
       txt := fmt.ctprintf("+%s penya", commafy(pops[i].amount))
-      tw := rl.MeasureText(txt, 16)
-      rl.DrawText(txt, i32(sp.x) - tw / 2, i32(sp.y - frac * 30) - 22, 16, col)
+      radar_label(sp.x - radar_text_w(txt) * 0.5, sp.y - frac * 30 - 22, txt, col)
     }
     // kill laser beams - a magenta line from the player to where each mob died, thinning + fading out.
     // Prune expired regardless; only draw when the Laser FX toggle is on. Origin is the player's ground
@@ -2650,1191 +2365,25 @@ cli_radar :: proc(session: ^Session, args: []string) {
       rl.DrawLineEx(pg, to, 2.5 * (1 - frac) + 0.5, col)
     }
 
-    // --- fence floating toolbar (edit mode only; lives over the map, not in the sidebar). Its rect is
-    // excluded from map input via mouse_in_panel, so these clicks never double as fence edits.
-    if edit {
-      rl.GuiUnlock()
-      if ps.setup_open || ps.options_open || ps.leaderboard_open {rl.GuiLock()} // modal up -> toolbar renders disabled like the panel
-      rl.DrawRectangleRounded(FENCE_TB_RECT, 0.15, 6, rl.Color{16, 22, 30, 235})
-      rl.DrawRectangleRoundedLines(FENCE_TB_RECT, 0.15, 6, rl.Color{60, 74, 90, 255})
-      tool_i := i32(tool)
-      rl.GuiToggleGroup({20, 40, 55, 24}, "Circle;Rect;Poly;Erase", &tool_i)
-      tool = Radar_Tool(tool_i)
-      _, _, taglabel := radar_fence_tag(tag_i)
-      // the tag button cycles + (include) -> - (exclude) -> ! (avoid / hard no-go)
-      if rl.GuiButton({20, 68, 36, 24}, taglabel) {tag_i = (tag_i + 1) % 3}
-      if rl.GuiButton({60, 68, 62, 24}, session.fence.active ? "On" : "Off") {
-        panel_enqueue(&ps, session.fence.active ? "fence off" : "fence on")
-      }
-      if rl.GuiButton({126, 68, 60, 24}, "Clear") {panel_enqueue(&ps, "fence clear")}
-      if rl.GuiButton({190, 68, 54, 24}, "Undo") {panel_enqueue(&ps, "fence undo")}
-      // compact live state + key hints, only while editing (the always-on HUD text is gone - see badge)
-      toolname: cstring = tool == .Circle ? "circle" : tool == .Rect ? "rect" : tool == .Polygon ? "polygon" : "eraser"
-      tagword: cstring = tag_i == 0 ? "include(+)" : tag_i == 1 ? "exclude(-)" : "AVOID(!)"
-      rl.DrawText(fmt.ctprintf("EDIT  tool:%s  tag:%s  fence %s (%d shapes)", toolname, tagword, session.fence.active ? "ON" : "off", len(session.fence.shapes)), 10, i32(fh) - 46, 14, rl.RAYWHITE)
-      rl.DrawText("1/2/3:draw  4:erase  Tab:+/-/!  Ldrag/click  Enter:close-poly  Bksp:undo  Del:clear  A:on/off  E:done", 10, i32(fh) - 24, 14, rl.Color{150, 160, 172, 255})
-    }
-
-    // Bottom-left penya readout (just above the bag): a coin glyph + your current gold, comma-grouped.
-    // Only shown once 'findpenya' has pinned penya_off and a value has been read. It PULSES RED as you
-    // approach the in-game penya ceiling (max i32 = 2,147,483,647) - past that, farmed penya overflows and
-    // is lost, so this warns you to bank/spend. Hidden while the fence editor owns this corner.
-    if penya_show_s && !edit {
-      PENYA_CAP :: i64(2_147_483_647) // max(i32) - the in-game penya cap
-      PENYA_WARN :: PENYA_CAP - 25_000_000 // start warning 25M short of it
-      py := fh - 42
-      txt := fmt.ctprintf("%s", commafy(penya_cur_s))
-      coin_col := PENYA_COL
-      pfs: i32 = 14
-      if penya_cur_s >= PENYA_WARN {
-        // Near the cap: hammer it. A fast sine throbs a solid RED bar behind the readout, swells the number
-        // hard, and flashes the text yellow->white-hot for contrast. Impossible to miss.
-        p := f32(0.5 + 0.5 * math.sin(rl.GetTime() * 9.0))
-        pfs = 14 + i32(11 * p)
-        radar_alert_bg(6, py, f32(rl.MeasureText(txt, pfs)) + 34, p, {235, 40, 40})
-        coin_col = {255, u8(205 + 50 * p), u8(70 + 185 * p), 255} // yellow -> white
-      }
-      radar_draw_coin(19, py, coin_col)
-      rl.DrawText(txt, 31, i32(py) - pfs / 2, pfs, coin_col)
-    }
-
-    // Bottom-left bag readout: a small pouch glyph + free/total slots. Hidden while the fence editor owns
-    // this corner. Turns orange when the bag is full (0 free). Only shown once 'findinv' has pinned it.
-    if inv_have && !edit {
-      by := fh - 15
-      full := inv_used == inv_cap
-      txt := fmt.ctprintf("%d/%d", inv_used, inv_cap)
-      bag_col := rl.Color{170, 180, 192, 255}
-      fs: i32 = 14
-      if full {
-        // Full bag: hammer it too - a throbbing ORANGE bar behind the readout, a hard size swell, and the
-        // number flashing orange->white. Same loud idiom as the penya cap warning above.
-        p := f32(0.5 + 0.5 * math.sin(rl.GetTime() * 8.0))
-        fs = 14 + i32(10 * p)
-        radar_alert_bg(6, by, f32(rl.MeasureText(txt, fs)) + 34, p, {240, 120, 30})
-        bag_col = {255, u8(210 + 45 * p), u8(80 + 175 * p), 255} // orange -> white
-      }
-      radar_draw_bag(19, by, bag_col)
-      // Anchor the number's left edge + vertical center so the size pulse grows in place, not off-corner.
-      rl.DrawText(txt, 31, i32(by) - fs / 2, fs, bag_col)
-    }
-
-    // Sound mute button (top-left): one-click toggle of the radar SFX. Same state/command path as the
-    // Options "Sound" button, just always reachable. Click is gated out of map input via mouse_in_panel.
-    mute_hov := rl.CheckCollisionPointRec(mouse, MUTE_BTN_RECT) && !ps.setup_open && !ps.options_open && !ps.leaderboard_open
-    rl.DrawRectangleRounded(MUTE_BTN_RECT, 0.5, 6, mute_hov ? rl.Color{54, 72, 94, 235} : rl.Color{26, 34, 44, 210})
-    rl.DrawRectangleRoundedLines(MUTE_BTN_RECT, 0.5, 6, rl.Color{70, 84, 100, 255})
-    mute_glyph := sfx_on_s ? (mute_hov ? rl.RAYWHITE : rl.Color{170, 180, 192, 255}) : rl.Color{110, 118, 130, 255}
-    radar_draw_speaker(MUTE_BTN_RECT.x + 13, MUTE_BTN_RECT.y + 13, !sfx_on_s, mute_glyph)
-    if mute_hov && rl.IsMouseButtonPressed(.LEFT) {
-      panel_enqueue(&ps, sfx_on_s ? "sfx off" : "sfx on")
-    }
-    if mute_hov {
-      panel_tooltip_lines(MUTE_BTN_RECT.x, MUTE_BTN_RECT.y + 30, {sfx_on_s ? "Sound: ON  (click to mute)" : "Sound: muted  (click to unmute)", "chime on penya pickup, zap on kill"}, fw - PANEL_W - 6)
-    }
-
-    // "?" legend badge (replaces the old always-on HUD text): hover for the legend + hotkeys, top-right
-    // of the map region. Tooltip-only, so the map stays clean.
-    badge := rl.Rectangle{fw - PANEL_W - 40, 8, 28, 26}
-    badge_hov := rl.CheckCollisionPointRec(mouse, badge) && !ps.setup_open && !ps.options_open && !ps.leaderboard_open
-    rl.DrawRectangleRounded(badge, 0.5, 6, badge_hov ? rl.Color{54, 72, 94, 235} : rl.Color{26, 34, 44, 210})
-    rl.DrawRectangleRoundedLines(badge, 0.5, 6, rl.Color{70, 84, 100, 255})
-    rl.DrawText("?", i32(badge.x + 10), i32(badge.y + 4), 18, badge_hov ? rl.RAYWHITE : rl.Color{150, 160, 172, 255})
-    if badge_hov {
-      legend0: cstring = prop_ok_s ? "red: mob   blue: player   grey: pet/npc" : "movers: red (run 'findprop' to tell players/pets apart)"
-      lines := []cstring {
-        legend0,
-        "faded: unreachable   dimmed: outside fence",
-        "yellow ring: target   green ring: attack_range",
-        "orange ring: it's attacking YOU (killed first)",
-        "",
-        "click: target        shift+click: move",
-        "RMB-drag the green ring: paint a sweep lane",
-        "  (RMB-click the lane cancels it)",
-        "Space: jump          E: fence editor",
-        "I: inspect obstacle  F: camera overlay",
-        "R: reach fade        L: lock on player",
-        "C/Home: recenter     RMB-drag: pan",
-        "wheel: zoom          ESC: close",
-        "",
-        "edit mode:  1/2/3: draw   4: erase",
-        "  Tab: +include / -exclude / !avoid(no-go)",
-        "  A: fence on/off   Enter: close poly",
-        "  Bksp: undo   Del: clear   E: done",
-        "",
-        "inspect mode (I):  hover a box for its id;",
-        "  click to ignore its kind (hides all like it)",
-      }
-      panel_tooltip_lines(badge.x, badge.y + 32, lines[:], fw - PANEL_W - 6)
-    }
-    // inspect mode: active-mode banner + the identity tooltip near the cursor (inside the map clip so it
-    // never spills onto the panel; panel_tooltip_lines edge-clamps to the map's right).
+    // inspect mode: the active-mode banner. The per-collider identity readout is an ImGui tooltip now
+    // (gui_frame does not own it - it is cursor-anchored map data, so it is drawn here).
     if inspect {
-      rl.DrawText(insp_pick >= 0 ? "INSPECT - click to ignore this kind" : "INSPECT - hover a purple box", 10, 10, 12, rl.Color{90, 220, 255, 255})
+      radar_label(10, fh - 26, insp_pick >= 0 ? "INSPECT - click to ignore this kind" : "INSPECT - hover a purple box", rl.Color{90, 220, 255, 255})
       if insp_lines != nil {
-        panel_tooltip_lines(mouse.x + 14, mouse.y + 10, insp_lines, fw - PANEL_W - 6)
-      }
-    }
-    rl.EndScissorMode() // end the world/HUD clip; the panel draws over the right strip below
-
-    // === PANEL === (raygui control surface; every session-touching action is deferred to ps.pending
-    // and drained under exec_mutex after this frame - see the PANEL section header near the top).
-    px := fw - PANEL_W
-    rl.DrawRectangle(i32(px), 0, i32(PANEL_W), i32(fh), PANEL_BG)
-    rl.DrawLine(i32(px), 0, i32(px), i32(fh), PANEL_SEP)
-    x0 := px + 12
-    pw := PANEL_W - 24
-    y := f32(12)
-    rl.GuiUnlock() // clear any stale lock leaked from a prior frame -> panel never gets stuck in DISABLED
-    if ps.setup_open || ps.options_open || ps.leaderboard_open {rl.GuiLock()} // freeze the background widgets while a modal is up
-
-    // header + setup status lights + optional pins (hover a missing one for the fix)
-    rl.DrawText(fmt.ctprintf("%s", status_hdr), i32(x0), i32(y), 11, PANEL_HDR)
-    y += 20
-    tooltip: cstring = nil
-    for g in groups {
-      row := panel_status_light(x0, y, pw, g)
-      if !ps.setup_open && !g.ok && rl.CheckCollisionPointRec(mouse, row) {
-        tooltip = fmt.ctprintf("%s", g.need)
-      }
-      y += 17
-    }
-    y += 3
-    rl.DrawText("optional pins", i32(x0), i32(y), 11, PANEL_DIM)
-    y += 15
-    for g in opins {
-      row := panel_status_light(x0, y, pw, g)
-      if !ps.setup_open && !g.ok && rl.CheckCollisionPointRec(mouse, row) {
-        tooltip = fmt.ctprintf("run: %s", g.need)
-      }
-      y += 17
-    }
-    y += 6
-
-    // Setup / Options dialog triggers. While an async setup runs, the row swaps to a live step counter
-    // (raygui has no per-widget disable; a label swap sidesteps GuiLock games) - see cli_setup.
-    if setup_running_s {
-      step_lbl := setup_step_s >= 1 && setup_step_s <= 9 ? SETUP_STEP_LABELS[setup_step_s - 1] : "starting..."
-      rl.DrawText(fmt.ctprintf("Setup running... step %d/9", setup_step_s), i32(x0), i32(y), 12, rl.Color{120, 190, 140, 255})
-      rl.DrawText(fmt.ctprintf("%s", step_lbl), i32(x0), i32(y + 15), 11, PANEL_DIM)
-      y += 36
-    } else {
-      half := (pw - 10) / 2
-      if rl.GuiButton({x0, y, half, 28}, "Setup...") {
-        ps.setup_open = true
-        ps.name_edit = true
-      }
-      if rl.GuiButton({x0 + half + 10, y, half, 28}, "Options...") {
-        ps.options_open = true
-        ps.opt_seeded = false
-      }
-      y += 36
-    }
-
-    // --- AUTO-FARM ---
-    rl.DrawLine(i32(x0), i32(y), i32(x0 + pw), i32(y), PANEL_SEP)
-    y += 8
-    rl.DrawText("PLAY", i32(x0), i32(y), 13, PANEL_HDR)
-    y += 18
-    toggle_label: cstring = auto_on_s ? "Stop" : "Start"
-    if rl.GuiButton({x0, y, pw, 30}, toggle_label) {
-      if auto_on_s {
-        panel_enqueue(&ps, "auto off") // explicit off (clearer than re-issuing the same set, which toggles)
-      } else if len(ps.selected) == 0 {
-        panel_enqueue(&ps, "auto any")
-      } else {
-        sb := strings.builder_make(context.temp_allocator)
-        strings.write_string(&sb, "auto ")
-        for s, i in ps.selected {
-          if i > 0 {strings.write_byte(&sb, ',')}
-          strings.write_byte(&sb, '\'')
-          strings.write_string(&sb, s)
-          strings.write_byte(&sb, '\'')
-        }
-        panel_enqueue(&ps, strings.to_string(sb))
-      }
-    }
-    y += 36
-    if auto_on_s {
-      rl.DrawText(fmt.ctprintf("%s: %s", auto_paused_s ? "ARMED" : "ON", auto_desc_s), i32(x0), i32(y), 13, rl.Color{150, 170, 190, 255})
-      y += 18
-      rl.DrawText(fmt.ctprintf("%s", auto_line_s), i32(x0), i32(y), 17, rl.Color{120, 190, 140, 255})
-      y += 23
-    } else {
-      rl.DrawText(fmt.ctprintf("target: %s", len(ps.selected) == 0 ? "any monster" : "the chips below"), i32(x0), i32(y), 11, PANEL_DIM)
-      y += 16
-    }
-    // Painted-lane progress (sweep mode). Shown whether or not auto is running - a lane armed with auto
-    // off is a valid state ("armed", waiting for Start), and the line is how you know it's still there.
-    if sweep_on_s {
-      rl.DrawText(
-        fmt.ctprintf("sweep: %.0f%% (%.0f units left)%s", sweep_pct_s, sweep_left_s, auto_on_s ? "" : " - armed"),
-        i32(x0), i32(y), 13, PAINT_COL,
-      )
-      y += 18
-    }
-    if penya_total_s > 0 {
-      rl.DrawText(fmt.ctprintf("penya: %s", commafy(penya_total_s)), i32(x0), i32(y), 16, PENYA_COL)
-      y += 21
-    }
-
-    // mob search box + live-filtered suggestions
-    rl.DrawText("farm targets (empty = any monster)", i32(x0), i32(y), 11, PANEL_DIM)
-    y += 15
-    if rl.GuiTextBox({x0, y, pw, 26}, cstring(&ps.search_buf[0]), i32(len(ps.search_buf)), ps.search_edit) {
-      ps.search_edit = !ps.search_edit
-    }
-    y += 30
-    search_txt := strings.trim_space(panel_buf_str(ps.search_buf[:]))
-    if !ps.setup_open && len(search_txt) > 0 {
-      // merged, deduped candidate pool: hardcoded corpus + live nearby names
-      pool := make([dynamic]string, context.temp_allocator)
-      for n in AUTO_MOB_SUGGESTIONS {panel_add_cand(&pool, n)}
-      for n in live_names {panel_add_cand(&pool, n)}
-      // "Captain"/"Small" are variant MODIFIERS, not filters: a leading one is stripped so it never
-      // excludes any base monster (the whole list stays visible), and it's prepended onto whatever you
-      // pick - the badge becomes e.g. "Captain Aibatt". Any text after it still narrows the base list.
-      prefix := ""
-      rest := search_txt
-      low := strings.to_lower(search_txt, context.temp_allocator)
-      switch {
-      case low == "captain" || strings.has_prefix(low, "captain "):
-        prefix = "Captain"
-        rest = strings.trim_space(search_txt[len("Captain"):])
-      case low == "small" || strings.has_prefix(low, "small "):
-        prefix = "Small"
-        rest = strings.trim_space(search_txt[len("Small"):])
-      }
-      prefix_lc_space := ""
-      if prefix != "" {prefix_lc_space = fmt.tprintf("%s ", strings.to_lower(prefix, context.temp_allocator))}
-      needle := strings.to_lower(rest, context.temp_allocator)
-      seen := make([dynamic]string, context.temp_allocator) // composed badges already offered this frame
-      shown := 0
-      for cand in pool {
-        if shown >= 6 {break}
-        if len(needle) > 0 && !strings.contains(strings.to_lower(cand, context.temp_allocator), needle) {continue}
-        // compose the badge; don't double up if the candidate already carries the modifier
-        full := cand
-        if prefix != "" && !strings.has_prefix(strings.to_lower(cand, context.temp_allocator), prefix_lc_space) {
-          full = fmt.tprintf("%s %s", prefix, cand)
-        }
-        if panel_name_in(ps.selected[:], full) {continue}
-        if panel_name_in(seen[:], full) {continue} // two bases can compose to the same badge - offer it once
-        append(&seen, full)
-        if rl.GuiButton({x0, y, pw, 22}, fmt.ctprintf("+ %s", full)) {
-          append(&ps.selected, strings.clone(full))
-          ps.search_buf = {} // clear the box after picking
-        }
-        y += 24
-        shown += 1
-      }
-      // add the typed text verbatim as a custom chip
-      if !panel_name_in(ps.selected[:], search_txt) {
-        if rl.GuiButton({x0, y, pw, 22}, fmt.ctprintf("+ add \"%s\"", search_txt)) {
-          append(&ps.selected, strings.clone(search_txt))
-          ps.search_buf = {}
-        }
-        y += 24
-      }
-    }
-
-    // selected chips (wrap across rows; click the x to remove)
-    if len(ps.selected) > 0 {
-      cx := x0
-      chip_h := f32(22)
-      for i := 0; i < len(ps.selected); i += 1 {
-        cname := ps.selected[i]
-        tw := f32(rl.MeasureText(fmt.ctprintf("%s", cname), 12))
-        cw := tw + 30
-        if cx + cw > x0 + pw {
-          cx = x0
-          y += chip_h + 4
-        }
-        rl.DrawRectangleRounded({cx, y, cw, chip_h}, 0.4, 6, CHIP_BG)
-        rl.DrawText(fmt.ctprintf("%s", cname), i32(cx + 8), i32(y + 5), 12, rl.RAYWHITE)
-        xb := rl.Rectangle{cx + cw - 18, y, 18, chip_h}
-        xhov := !ps.setup_open && rl.CheckCollisionPointRec(mouse, xb)
-        rl.DrawText("x", i32(cx + cw - 13), i32(y + 5), 12, xhov ? rl.RED : rl.Color{205, 185, 185, 255})
-        if xhov && rl.IsMouseButtonPressed(.LEFT) {
-          delete(ps.selected[i])
-          ordered_remove(&ps.selected, i)
-          i -= 1
-          continue
-        }
-        cx += cw + 6
-      }
-      y += chip_h + 6
-    }
-
-    // --- attack_range slider (live ring feedback; persists to flyff.cfg on release) ---
-    rl.DrawLine(i32(x0), i32(y), i32(x0 + pw), i32(y), PANEL_SEP)
-    y += 8
-    rl.DrawText(fmt.ctprintf("attack_range: %.2f  (0-30)", ps.ar_slider), i32(x0), i32(y), 12, PANEL_HDR)
-    y += 18
-    sl := rl.Rectangle{x0 + 4, y, pw - 8, 18}
-    // Empty side labels: raygui draws them OUTSIDE the bar, so "0"/"30" spilled past the panel edge.
-    rl.GuiSlider(sl, "", "", &ps.ar_slider, 0, 30)
-    if !ps.setup_open && rl.IsMouseButtonDown(.LEFT) && rl.CheckCollisionPointRec(mouse, sl) {
-      ps.ar_dragging = true
-    }
-    if ps.ar_dragging && rl.IsMouseButtonReleased(.LEFT) {
-      ps.ar_dragging = false
-      panel_enqueue(&ps, fmt.tprintf("set attack_range %.3f", ps.ar_slider))
-    }
-    y += 26
-
-    // --- MODES (deferred toggles; labels read the locked snapshot, never live session state) ---
-    rl.DrawLine(i32(x0), i32(y), i32(x0 + pw), i32(y), PANEL_SEP)
-    y += 8
-    rl.DrawText("MODES", i32(x0), i32(y), 13, PANEL_HDR)
-    y += 18
-    bw := (pw - 10) / 2
-    if rl.GuiButton({x0, y, bw, 26}, density_on_s ? "Density: ON" : "Density: off") {
-      panel_enqueue(&ps, density_on_s ? "density off" : "density on")
-    }
-    if rl.GuiButton({x0 + bw + 10, y, bw, 26}, preselect_on_s ? "Preselect: ON" : "Preselect: off") {
-      panel_enqueue(&ps, preselect_on_s ? "preselect off" : "preselect on")
-    }
-    y += 30
-    if rl.GuiButton({x0, y, bw, 26}, lookalive_on_s ? "Look-alive: ON" : "Look-alive: off") {
-      panel_enqueue(&ps, lookalive_on_s ? "lookalive off" : "lookalive on")
-    }
-    y += 30
-
-    // --- VIEW toolbar (local view state; the fence controls moved to the in-map edit toolbar) ---
-    rl.DrawLine(i32(x0), i32(y), i32(x0 + pw), i32(y), PANEL_SEP)
-    y += 8
-    rl.DrawText("VIEW", i32(x0), i32(y), 13, PANEL_HDR)
-    y += 18
-    if rl.GuiButton({x0, y, bw, 26}, edit ? "Edit: ON" : "Edit: off") {edit = !edit}
-    if rl.GuiButton({x0 + bw + 10, y, bw, 26}, show_cam ? "Camera: ON" : "Camera: off") {show_cam = !show_cam}
-    y += 30
-    if rl.GuiButton({x0, y, bw, 26}, show_reach ? "Reach: ON" : "Reach: off") {show_reach = !show_reach}
-    if rl.GuiButton({x0 + bw + 10, y, bw, 26}, "Recenter") {cam = {ppos[0], ppos[2]}}
-    y += 30
-    if rl.GuiButton({x0, y, pw, 26}, cam_lock ? "Lock on player: ON" : "Lock on player: off") {cam_lock = !cam_lock}
-    y += 30
-    if rl.GuiButton({x0, y, pw, 26}, "Jump (Space)") {panel_enqueue(&ps, "jump")}
-
-    // Leaderboards trigger: bottom-center of the sidebar, absolutely positioned (independent of the flow
-    // `y` cursor, like MUTE_BTN_RECT), shown ONLY when leaderboard_url is set (lb_configured_s snapshot).
-    if lb_configured_s {
-      lbw := f32(160)
-      lbh := f32(30)
-      if rl.GuiButton({px + (PANEL_W - lbw) / 2, fh - lbh - 12, lbw, lbh}, "Leaderboards...") {
-        ps.leaderboard_open = true
-        ps.lb_seeded = false
-      }
-    }
-
-    // hovered status-light tooltip (on top of the panel)
-    if tooltip != nil {
-      tw := rl.MeasureText(tooltip, 12)
-      tx := mouse.x + 14
-      ty := mouse.y + 6
-      if tx + f32(tw) + 10 > fw {tx = fw - f32(tw) - 10}
-      rl.DrawRectangle(i32(tx - 4), i32(ty - 3), tw + 10, 20, rl.Color{10, 14, 20, 240})
-      rl.DrawRectangleLines(i32(tx - 4), i32(ty - 3), tw + 10, 20, rl.Color{80, 90, 102, 255})
-      rl.DrawText(tooltip, i32(tx + 1), i32(ty), 12, rl.RAYWHITE)
-    }
-
-    // --- Setup modal (drawn last, on top; background widgets are GuiLock'd above) ---
-    if ps.setup_open {
-      rl.GuiUnlock()
-      rl.DrawRectangle(0, 0, i32(fw), i32(fh), rl.Color{0, 0, 0, 150})
-      mw2 := f32(360)
-      mh2 := f32(302)
-      mx := (fw - mw2) / 2
-      my := (fh - mh2) / 2
-      rl.GuiPanel({mx, my, mw2, mh2}, "setup <name> [hp]")
-      rl.GuiLabel({mx + 14, my + 34, mw2 - 28, 18}, "character name")
-      if rl.GuiTextBox({mx + 14, my + 54, mw2 - 28, 28}, cstring(&ps.name_buf[0]), i32(len(ps.name_buf)), ps.name_edit) {
-        ps.name_edit = !ps.name_edit
-        ps.hp_edit = false
-        ps.penya_edit = false
-      }
-      rl.GuiLabel({mx + 14, my + 92, mw2 - 28, 18}, "current hp (optional)")
-      if rl.GuiTextBox({mx + 14, my + 112, mw2 - 28, 28}, cstring(&ps.hp_buf[0]), i32(len(ps.hp_buf)), ps.hp_edit) {
-        ps.hp_edit = !ps.hp_edit
-        ps.name_edit = false
-        ps.penya_edit = false
-      }
-      // optional penya: if filled, Run setup also fires `findpenya <penya>` to pin penya_off (radar +penya pop)
-      rl.GuiLabel({mx + 14, my + 150, mw2 - 28, 18}, "current penya (optional -> +penya pop)")
-      if rl.GuiTextBox({mx + 14, my + 170, mw2 - 28, 28}, cstring(&ps.penya_buf[0]), i32(len(ps.penya_buf)), ps.penya_edit) {
-        ps.penya_edit = !ps.penya_edit
-        ps.name_edit = false
-        ps.hp_edit = false
-      }
-      // standalone penya pin: findpenya alone (fast, so the normal deferred drain is fine) - no need to
-      // re-run the whole pipeline just to pin penya_off after a patch.
-      if rl.GuiButton({mx + 14, my + 202, mw2 - 28, 26}, "Find penya only") {
-        py := strings.trim_space(panel_buf_str(ps.penya_buf[:]))
-        py, _ = strings.remove_all(py, ",", context.temp_allocator)
-        if len(py) > 0 {
-          panel_enqueue(&ps, fmt.tprintf("findpenya %s", py))
-          ps.setup_open = false
-          ps.name_edit = false
-          ps.hp_edit = false
-          ps.penya_edit = false
-        }
-      }
-      bw2 := (mw2 - 40) / 2
-      if rl.GuiButton({mx + 14, my + mh2 - 40, bw2, 28}, "Run setup") {
-        nm := strings.trim_space(panel_buf_str(ps.name_buf[:]))
-        if len(nm) > 0 && !setup_running_s {
-          // The pipeline runs on a one-shot worker (panel_run_async), NOT the deferred drain - the
-          // drain executes on this render thread, which then couldn't draw the step progress.
-          cmds := make([dynamic]string, context.temp_allocator)
-          hp := strings.trim_space(panel_buf_str(ps.hp_buf[:]))
-          append(&cmds, len(hp) > 0 ? fmt.tprintf("setup %s %s", nm, hp) : fmt.tprintf("setup %s", nm))
-          // penya isn't derivable from the name anchor (it needs a live value), so it rides as a second
-          // command: findpenya pins penya_off from the number you read off the game UI. Commas tolerated.
-          py := strings.trim_space(panel_buf_str(ps.penya_buf[:]))
-          py, _ = strings.remove_all(py, ",", context.temp_allocator)
-          if len(py) > 0 {
-            append(&cmds, fmt.tprintf("findpenya %s", py))
-          }
-          panel_run_async(session, cmds[:])
-          ps.setup_open = false
-          ps.name_edit = false
-          ps.hp_edit = false
-          ps.penya_edit = false
-        }
-      }
-      if rl.GuiButton({mx + 26 + bw2, my + mh2 - 40, bw2, 28}, "Cancel") {
-        ps.setup_open = false
-        ps.name_edit = false
-        ps.hp_edit = false
-        ps.penya_edit = false
-      }
-    }
-
-    // --- Options modal (tunables only - raw RVAs/offsets stay CLI-only via `status full` / `set`) ---
-    if ps.options_open {
-      rl.GuiUnlock()
-      rl.DrawRectangle(0, 0, i32(fw), i32(fh), rl.Color{0, 0, 0, 150})
-      ow := f32(400)
-      oh := f32(772) // panel height (window is 820); content taller than this scrolls (opt_scroll)
-      ox := (fw - ow) / 2
-      panel_oy := (fh - oh) / 2 // fixed panel top; content is drawn at oy (= panel_oy + scroll)
-      if !ps.opt_seeded {
-        // seed the textboxes once per open from the locked snapshot of the live values
-        panel_buf_set(ps.opt_ar_buf[:], fmt.tprintf("%.2f", opt_ar_cur))
-        panel_buf_set(ps.opt_mg_buf[:], fmt.tprintf("%d", opt_mg_cur))
-        panel_buf_set(ps.opt_dt_buf[:], fmt.tprintf("%.1f", opt_dt_cur))
-        panel_buf_set(ps.opt_melee_buf[:], fmt.tprintf("%.1f", opt_melee_cur))
-        panel_buf_set(ps.opt_grace_buf[:], fmt.tprintf("%.1f", opt_grace_cur))
-        panel_buf_set(ps.opt_lahmin_buf[:], fmt.tprintf("%.1f", opt_lahmin_cur))
-        panel_buf_set(ps.opt_lahmax_buf[:], fmt.tprintf("%.1f", opt_lahmax_cur))
-        panel_buf_set(ps.opt_lajmin_buf[:], fmt.tprintf("%.1f", opt_lajmin_cur))
-        panel_buf_set(ps.opt_lajmax_buf[:], fmt.tprintf("%.1f", opt_lajmax_cur))
-        panel_buf_set(ps.opt_lajch_buf[:], fmt.tprintf("%d", opt_lajch_cur))
-        panel_buf_set(ps.opt_lastepch_buf[:], fmt.tprintf("%d", opt_lastepch_cur))
-        panel_buf_set(ps.opt_lastepsp_buf[:], fmt.tprintf("%.1f", opt_lastepsp_cur))
-        panel_buf_set(ps.opt_lamaxr_buf[:], fmt.tprintf("%.1f", opt_lamaxr_cur))
-        ps.opt_seeded = true
-        ps.opt_scroll = 0 // reopen at the top
-      }
-      rl.GuiPanel({ox, panel_oy, ow, oh}, "options")
-      // Scrollable content: the title bar stays fixed at the top and the Apply/Close bar at the bottom;
-      // everything between scrolls when it's taller than the viewport. Wheel over the modal scrolls; the
-      // content is clipped to the viewport and its input is gated to it (so a scrolled-out widget under the
-      // title/footer can't be clicked). opt_content_h is measured at the end of the content for the clamp.
-      title_h := f32(28)
-      footer_h := f32(44)
-      view_top := panel_oy + title_h
-      view_h := oh - title_h - footer_h
-      max_scroll := max(ps.opt_content_h - view_h, 0)
-      if rl.CheckCollisionPointRec(mouse, {ox, panel_oy, ow, oh}) {
-        ps.opt_scroll += rl.GetMouseWheelMove() * 28
-      }
-      ps.opt_scroll = clamp(ps.opt_scroll, -max_scroll, 0)
-      oy := panel_oy + ps.opt_scroll // content anchor (scrolls); all content below is drawn relative to it
-      content_view := rl.Rectangle{ox, view_top, ow, view_h}
-      in_view := rl.CheckCollisionPointRec(mouse, content_view) // gates the sliders' grab + tooltips to the viewport
-      rl.BeginScissorMode(i32(ox), i32(view_top), i32(ow), i32(view_h))
-      col_w := (ow - 3 * OPT_PAD) / 2
-      // Hover explanation for whichever config value the cursor is over (drawn on top at the end). Each
-      // check uses the label+widget rect; otip holds the last hovered item's lines this frame.
-      otip: []cstring = nil
-      hov :: proc(mouse: rl.Vector2, r: rl.Rectangle, lines: []cstring, otip: ^[]cstring) {
-        if rl.CheckCollisionPointRec(mouse, r) {otip^ = lines}
-      }
-      // Sections run top-to-bottom on one ty0 cursor: PRESET -> TARGETING (the priority ladder) ->
-      // SAFETY -> MOVEMENT -> DISPLAY, i.e. grouped by what a setting DOES. Content height is measured
-      // from this same cursor at the end, so adding/removing rows needs no scroll-math changes.
-      ty0 := oy + 34
-
-      // --- PRESET: one click for a whole playstyle. Individual settings below stay editable after. ---
-      rl.DrawText("PRESET", i32(ox + OPT_PAD), i32(ty0), 13, PANEL_HDR)
-      ty0 += 20
-      {
-        chip_w := (ow - 3 * OPT_PAD) / 2
-        cur_lbl := preset_cur_s < 0 ? "custom" : PRESETS[preset_cur_s].name
-        rl.GuiLabel({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 18}, fmt.ctprintf("current: %s", cur_lbl))
-        ty0 += 20
-        // One chip per preset, wrapped two-up. Applying is a plain deferred command, same as any toggle.
-        for p, i in PRESETS {
-          cx := (i % 2 == 0) ? ox + OPT_PAD : ox + 2 * OPT_PAD + chip_w
-          if rl.GuiButton({cx, ty0, chip_w, 24}, fmt.ctprintf("%s%s", i == preset_cur_s ? "* " : "", p.name)) {
-            panel_enqueue(&ps, fmt.tprintf("preset %s", p.name))
-          }
-          hov(mouse, {cx, ty0, chip_w, 24}, {fmt.ctprintf("%s - %s", p.name, p.blurb), "Applies a whole settings group; everything below stays editable after."}, &otip)
-          if i % 2 == 1 {
-            ty0 += 28
+        imgui.SetNextWindowPos({mouse.x + 16, mouse.y + 12}, .Always)
+        if imgui.Begin("##inspect", nil, {.NoTitleBar, .NoResize, .NoMove, .NoScrollbar, .NoSavedSettings, .AlwaysAutoResize, .NoNavInputs, .NoMouseInputs, .NoDocking}) {
+          for l in insp_lines {
+            imgui.TextUnformatted(l)
           }
         }
-        if len(PRESETS) % 2 == 1 {
-          ty0 += 28
-        }
-      }
-
-      // --- TARGETING: the priority ladder, in the order tc_pick_one actually runs it. ---
-      ty0 += 10
-      rl.DrawLine(i32(ox + OPT_PAD), i32(ty0), i32(ox + ow - OPT_PAD), i32(ty0), PANEL_SEP)
-      ty0 += 8
-      rl.DrawText("TARGETING", i32(ox + OPT_PAD), i32(ty0), 13, PANEL_HDR)
-      ty0 += 18
-      rl.GuiLabel({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 16}, "priority ladder - first rung with a mob wins")
-      ty0 += 20
-      // Rung 1 - aggro. Full width: it's the one that changes behavior most, and it has a warning state.
-      {
-        lbl := aggro_first_s ? "1. Attacking me: ON" : "1. Attacking me: off"
-        if aggro_first_s && !aggro_ready_s {
-          lbl = "1. Attacking me: INERT"
-        }
-        if rl.GuiButton({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 26}, fmt.ctprintf("%s", lbl)) {
-          panel_enqueue(&ps, aggro_first_s ? "priority aggro off" : "priority aggro on")
-        }
-        hov(mouse, {ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 26}, {
-          "Rung 1 - anything that is coming for YOU is killed first, at ANY distance.",
-          "Read from the mob's own destination object, which the server sends to the",
-          "client so it can animate the mob walking at you - so it's the real aggro,",
-          "not a guess. INERT means objid/iddest aren't pinned yet: run Setup.",
-          "Turn off if you'd rather never be pulled off a pack by a far-away add.",
-        }, &otip)
-        ty0 += 30
-      }
-      // Rung 2 - melee, with its radius inline.
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, melee_first_s ? "2. Melee range: ON" : "2. Melee range: off") {
-        panel_enqueue(&ps, melee_first_s ? "priority melee off" : "priority melee on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Rung 2 - a mob standing on top of you is killed before the pack ranking",
-        "below gets a say. This is what stops auto from walking off to a mob near",
-        "your last kill while something chews on you. On by default.",
-        "(It used to be silently disabled whenever you farmed with no name filter.)",
-      }, &otip)
-      rl.GuiLabel({ox + 2 * OPT_PAD + col_w, ty0 - 16, col_w, 16}, "melee range (u)")
-      if rl.GuiTextBox({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, cstring(&ps.opt_melee_buf[0]), i32(len(ps.opt_melee_buf)), ps.opt_melee_edit) {
-        was := ps.opt_melee_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_melee_edit = !was
-      }
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0 - 16, col_w, 42}, {
-        "Melee range - how close counts as 'on top of me' (world units). Default 3.",
-        "Capped to attack_range, so if attack_range is still tiny this has no effect",
-        "until you set your real reach below. Commit with Apply values.",
-      }, &otip)
-      ty0 += 30
-      // Rung 4 - pocket, with attack_range inline (the radius it gates on).
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, pocket_s ? "3. In attack range: ON" : "3. In attack range: off") {
-        panel_enqueue(&ps, pocket_s ? "priority pocket off" : "priority pocket on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Rung 3 - among mobs already within attack_range, prefer the one nearest",
-        "your LAST KILL rather than nearest you: that keeps a ranged character",
-        "eating a pack instead of drifting to whatever wanders closest.",
-        "Off = fall straight through to pack-steering / nearest.",
-      }, &otip)
-      rl.GuiLabel({ox + 2 * OPT_PAD + col_w, ty0 - 16, col_w, 16}, "attack range (u)")
-      if rl.GuiTextBox({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, cstring(&ps.opt_ar_buf[0]), i32(len(ps.opt_ar_buf)), ps.opt_ar_edit) {
-        was := ps.opt_ar_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_ar_edit = !was
-      }
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0 - 16, col_w, 42}, {
-        "attack_range - your character's MAX attack reach, in world units.",
-        "Mobs within it are killed without moving; the picker only walks when",
-        "nothing is inside it. Set your REAL hit range (e.g. 16.1). Too small: it",
-        "walks to mobs it could already hit. Too big: it treats far mobs as in-range.",
-      }, &otip)
-      ty0 += 30
-      // Rungs 5-6 - the density feature, with both its gates inline.
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, density_on_s ? "4. Pack steering: ON" : "4. Pack steering: off") {
-        panel_enqueue(&ps, density_on_s ? "density off" : "density on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Rung 4 - cluster steering. ON: commit to a mob pack until it's wiped, and",
-        "only detour to a denser pack once it clears BOTH gates on the right.",
-        "OFF (default): skip straight to the nearest eligible mob.",
-        "Only consulted when nothing is already in range - it never drags you off",
-        "a mob you can already hit.",
-      }, &otip)
-      rl.GuiLabel({ox + 2 * OPT_PAD + col_w, ty0 - 16, col_w, 16}, "mingain / detour")
-      hw := (col_w - 6) / 2
-      if rl.GuiTextBox({ox + 2 * OPT_PAD + col_w, ty0, hw, 26}, cstring(&ps.opt_mg_buf[0]), i32(len(ps.opt_mg_buf)), ps.opt_mg_edit) {
-        was := ps.opt_mg_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_mg_edit = !was
-      }
-      if rl.GuiTextBox({ox + 2 * OPT_PAD + col_w + hw + 6, ty0, hw, 26}, cstring(&ps.opt_dt_buf[0]), i32(len(ps.opt_dt_buf)), ps.opt_dt_edit) {
-        was := ps.opt_dt_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_dt_edit = !was
-      }
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0 - 16, col_w, 42}, {
-        "mingain - how many MORE members a farther pack needs before the picker",
-        "detours to it. Default 3; higher = more reluctant to switch packs.",
-        "detour - the max EXTRA walk (world units) it will take for that. Default 20.",
-        "Both only apply while Pack steering is ON.",
-      }, &otip)
-      ty0 += 32
-      rl.GuiLabel({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 16}, "5. Nearest mob - always on (the fallback)")
-      ty0 += 22
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, preselect_on_s ? "Preselect: ON" : "Preselect: off") {
-        panel_enqueue(&ps, preselect_on_s ? "preselect off" : "preselect on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Preselect - precompute the NEXT target while you fight the current one,",
-        "so auto advances the instant it dies (removes the ~0.5s post-kill gap).",
-        "On by default. Turn off to go back to scanning after each kill.",
-      }, &otip)
-      if rl.GuiButton({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, reach_gate_s ? "Reach-gate: ON" : "Reach-gate: off") {
-        panel_enqueue(&ps, reach_gate_s ? "reachgate off" : "reachgate on")
-      }
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, {
-        "Reach-gate - before targeting, skip mobs whose straight path to you is",
-        "blocked by terrain or an object. On by default. Turn OFF if it wrongly",
-        "marks reachable mobs as blocked (e.g. it targets nothing in the tower).",
-      }, &otip)
-      ty0 += 40
-
-      // --- SAFETY: the rules that decide when to GIVE UP on a target you already have. ---
-      rl.DrawLine(i32(ox + OPT_PAD), i32(ty0), i32(ox + ow - OPT_PAD), i32(ty0), PANEL_SEP)
-      ty0 += 8
-      rl.DrawText("SAFETY", i32(ox + OPT_PAD), i32(ty0), 13, PANEL_HDR)
-      ty0 += 18
-      rl.GuiLabel({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 16}, "when to drop a target you already have")
-      ty0 += 20
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, stuck_on_s ? "Stuck-detect: ON" : "Stuck-detect: off") {
-        panel_enqueue(&ps, stuck_on_s ? "stuck off" : "stuck on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Stuck-detect - if the character jams on an obstacle (distance to the",
-        "target stops dropping while still far), blacklist that mob and pick",
-        "another. On by default; turn off for ranged/standing playstyles.",
-      }, &otip)
-      if rl.GuiButton({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, hunt_s ? "Hunt: ON" : "Hunt: off") {
-        panel_enqueue(&ps, hunt_s ? "hunt off" : "hunt on")
-      }
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, {
-        "Hunt - commit to ONE target (a giant, a quest mob) and never drop it for",
-        "being far or unreachable: keep walking in, and side-step around obstacles",
-        "instead of skipping. Off by default (farming). Side-step needs 'findmove'.",
-      }, &otip)
-      ty0 += 30
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, combat_watch_s ? "Combat-watch: ON" : "Combat-watch: off") {
-        panel_enqueue(&ps, combat_watch_s ? "combatwatch off" : "combatwatch on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Combat-watch - while the locked mob's HP is falling, Stuck-detect and",
-        "Reach-gate never drop it, so a high-HP mob gets finished instead of",
-        "skipped mid-fight. On by default.",
-      }, &otip)
-      rl.GuiLabel({ox + 2 * OPT_PAD + col_w, ty0 - 16, col_w, 16}, "grace (seconds)")
-      if rl.GuiTextBox({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, cstring(&ps.opt_grace_buf[0]), i32(len(ps.opt_grace_buf)), ps.opt_grace_edit) {
-        was := ps.opt_grace_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_grace_edit = !was
-      }
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0 - 16, col_w, 42}, {
-        "Grace - how long after the last hit LANDED we still count as fighting.",
-        "It must exceed your slowest attack or cast interval, or the drop-rules",
-        "fire between swings. Default 4s; a slow caster wants 6-8.",
-      }, &otip)
-      ty0 += 40
-      rl.DrawLine(i32(ox + OPT_PAD), i32(ty0), i32(ox + ow - OPT_PAD), i32(ty0), PANEL_SEP)
-      ty0 += 8
-      rl.DrawText("DISPLAY", i32(ox + OPT_PAD), i32(ty0), 13, PANEL_HDR)
-      ty0 += 18
-      rl.GuiLabel({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 16}, "radar only - none of this changes targeting")
-      ty0 += 20
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, sfx_on_s ? "Sound: ON" : "Sound: off") {
-        panel_enqueue(&ps, sfx_on_s ? "sfx off" : "sfx on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Sound - radar sound effects: a chime on penya pickup and a zap on kill.",
-        "Only plays while the radar window is open.",
-      }, &otip)
-      if rl.GuiButton({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, fx_laser_s ? "Laser FX: ON" : "Laser FX: off") {
-        panel_enqueue(&ps, fx_laser_s ? "fxlaser off" : "fxlaser on")
-      }
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, {
-        "Laser FX - radar visual: a short beam drawn from you to each mob you kill.",
-      }, &otip)
-      ty0 += 30
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, density_hue_s ? "Density hue: ON" : "Density hue: off") {
-        panel_enqueue(&ps, density_hue_s ? "density hue off" : "density hue on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Density hue - tint each monster dot by how crowded its spot is (local",
-        "pack size within the density radius): lone stays red, denser packs",
-        "shift toward green. Display only - it does not change targeting.",
-      }, &otip)
-      if rl.GuiButton({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, trail_s ? "Trail: ON" : "Trail: off") {
-        panel_enqueue(&ps, trail_s ? "trail off" : "trail on")
-      }
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, {
-        "Trail - a subtle fading breadcrumb behind your dot showing where you've",
-        "walked. Off by default. Tune length + fade with the sliders below. Display",
-        "only, drawn under the mob dots so it never masks a target.",
-      }, &otip)
-      ty0 += 30
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, hillshade_on_s ? "Hillshade: ON" : "Hillshade: off") {
-        panel_enqueue(&ps, hillshade_on_s ? "hillshade off" : "hillshade on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Hillshade - colourless shaded relief of the terrain (lit from the NW), drawn",
-        "under the dots. Shows hills/cliffs/ramps via light + shadow, no added colour.",
-        "Needs 'worldscan'. Depth: 'set hillshade_z'; light dir: 'set hillshade_light'. Key: H.",
-      }, &otip)
-      // vision radius slider (world units): how far the radar gathers/draws mob dots. Same seed/drag/
-      // persist-on-release dance as the sidebar attack_range slider (the locked block seeds ps.rr_slider
-      // and, while dragging, pushes it into the layout so view_r grows live).
-      ty0 += 40
-      // Range folded into the header (not the slider's side labels, which raygui draws OUTSIDE the bar and
-      // would overflow the panel) so the whole widget stays within the uniform padding.
-      rl.GuiLabel({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 18}, fmt.ctprintf("vision radius: %.0f  (mob dots, %.0f-%.0f)", ps.rr_slider, RADAR_RANGE_MIN, RADAR_RANGE_MAX))
-      ty0 += 22
-      rr_sl := rl.Rectangle{ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 18}
-      rl.GuiSlider(rr_sl, "", "", &ps.rr_slider, RADAR_RANGE_MIN, RADAR_RANGE_MAX)
-      if in_view && rl.IsMouseButtonDown(.LEFT) && rl.CheckCollisionPointRec(mouse, rr_sl) {
-        ps.rr_dragging = true
-      }
-      if ps.rr_dragging && rl.IsMouseButtonReleased(.LEFT) {
-        ps.rr_dragging = false
-        panel_enqueue(&ps, fmt.tprintf("set radar_range %.1f", ps.rr_slider))
-      }
-      hov(mouse, rr_sl, {
-        "Vision radius - how far (world units) the radar gathers and draws mob dots.",
-        "Default 80. Bigger = see farther, but you still only see mobs the game has",
-        "loaded around you. Obstacle boxes use a separate fixed radius, unaffected.",
-      }, &otip)
-      // player-trail sliders (length + fade). Same seed/drag/persist-on-release dance as the vision slider
-      // (the locked block seeds ps.tr_slider/ps.tf_slider and pushes them into the layout while dragging).
-      ty0 += 40
-      rl.GuiLabel({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 18}, fmt.ctprintf("trail length: %.0f  (world units, 0-800)", ps.tr_slider))
-      ty0 += 22
-      tr_sl := rl.Rectangle{ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 18}
-      rl.GuiSlider(tr_sl, "", "", &ps.tr_slider, 0, 800)
-      if in_view && rl.IsMouseButtonDown(.LEFT) && rl.CheckCollisionPointRec(mouse, tr_sl) {
-        ps.tr_dragging = true
-      }
-      if ps.tr_dragging && rl.IsMouseButtonReleased(.LEFT) {
-        ps.tr_dragging = false
-        panel_enqueue(&ps, fmt.tprintf("set trail_len %.1f", ps.tr_slider))
-      }
-      hov(mouse, tr_sl, {
-        "Trail length - how far back (world units) the trail extends before it has",
-        "fully faded to nothing. Longer = a longer tail. Only visible while Trail is on.",
-      }, &otip)
-      ty0 += 40
-      rl.GuiLabel({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 18}, fmt.ctprintf("trail fade: %.2f  (1 = even, higher = fades faster)", ps.tf_slider))
-      ty0 += 22
-      tf_sl := rl.Rectangle{ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 18}
-      rl.GuiSlider(tf_sl, "", "", &ps.tf_slider, 0.25, 4.0)
-      if in_view && rl.IsMouseButtonDown(.LEFT) && rl.CheckCollisionPointRec(mouse, tf_sl) {
-        ps.tf_dragging = true
-      }
-      if ps.tf_dragging && rl.IsMouseButtonReleased(.LEFT) {
-        ps.tf_dragging = false
-        panel_enqueue(&ps, fmt.tprintf("set trail_fade %.2f", ps.tf_slider))
-      }
-      hov(mouse, tf_sl, {
-        "Trail fade - how fast the trail fades with distance from you. 1 = even",
-        "falloff; higher = fades faster (visible only near you); lower = stays",
-        "visible further out along the tail.",
-      }, &otip)
-      // --- MOVEMENT: look-alive master + its sub-behaviors (tunables committed by Apply) ---
-      rl.DrawLine(i32(ox + OPT_PAD), i32(ty0), i32(ox + ow - OPT_PAD), i32(ty0), PANEL_SEP)
-      ty0 += 8
-      rl.DrawText("MOVEMENT", i32(ox + OPT_PAD), i32(ty0), 13, PANEL_HDR)
-      ty0 += 18
-      rl.GuiLabel({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 16}, fmt.ctprintf("look-alive%s", lookalive_on_s ? " - human-like pacing" : "  (mode is off - sub-settings inert)"))
-      ty0 += 20
-      if rl.GuiButton({ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 26}, lookalive_on_s ? "Look-alive: ON" : "Look-alive: off") {
-        panel_enqueue(&ps, lookalive_on_s ? "lookalive off" : "lookalive on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, ow - 2 * OPT_PAD, 26}, {
-        "Look-alive - human-like farming for low-spawn quests: a random delay",
-        "before locking each new target + occasional jumps while traveling.",
-        "Deliberately less efficient - off by default. Walk behaviors need 'findmove'.",
-        "The four sub-behaviors below each toggle independently under this master.",
-      }, &otip)
-      ty0 += 32
-      // Per-feature enables (each sub-behavior toggles independently under the master mode). Same
-      // deferred-command pattern as the MODES toggles above; step + max-range need 'findmove' to walk.
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, la_hesitate_s ? "Hesitation: ON" : "Hesitation: off") {
-        panel_enqueue(&ps, la_hesitate_s ? "lookalive hesitate off" : "lookalive hesitate on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Hesitation - a random pause before locking each new target after a kill.",
-        "Off = lock the next target immediately (no reaction delay).",
-      }, &otip)
-      if rl.GuiButton({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, la_jump_s ? "Jump: ON" : "Jump: off") {
-        panel_enqueue(&ps, la_jump_s ? "lookalive jump off" : "lookalive jump on")
-      }
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, {
-        "Jump - sporadic jumps while travelling to a target. Needs 'findmove'.",
-        "Off = never jump.",
-      }, &otip)
-      ty0 += 30
-      if rl.GuiButton({ox + OPT_PAD, ty0, col_w, 26}, la_step_s ? "Int. step: ON" : "Int. step: off") {
-        panel_enqueue(&ps, la_step_s ? "lookalive step off" : "lookalive step on")
-      }
-      hov(mouse, {ox + OPT_PAD, ty0, col_w, 26}, {
-        "Intermediate step - sometimes walk to an offset waypoint partway to the mob",
-        "before locking on, instead of beelining. Chance-gated (step chance). Needs",
-        "'findmove'. Off = walk straight in.",
-      }, &otip)
-      if rl.GuiButton({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, la_maxrange_s ? "Max-range: ON" : "Max-range: off") {
-        panel_enqueue(&ps, la_maxrange_s ? "lookalive maxrange off" : "lookalive maxrange on")
-      }
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, {
-        "Max-range - for far spawns, approach in shrinking, slightly zig-zagged hops",
-        "until inside 'max range', then lock (instead of a long straight beeline).",
-        "Needs 'findmove'. Off = beeline any distance.",
-      }, &otip)
-      ty0 += 34
-      // Row 1 - hesitation window (delayed lock-on before each new target), seconds.
-      rl.GuiLabel({ox + OPT_PAD, ty0, col_w, 18}, "hesitate min (s)")
-      rl.GuiLabel({ox + 2 * OPT_PAD + col_w, ty0, col_w, 18}, "hesitate max (s)")
-      ty0 += 18
-      if rl.GuiTextBox({ox + OPT_PAD, ty0, col_w, 26}, cstring(&ps.opt_lahmin_buf[0]), i32(len(ps.opt_lahmin_buf)), ps.opt_lahmin_edit) {
-        was := ps.opt_lahmin_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_lahmin_edit = !was
-      }
-      if rl.GuiTextBox({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, cstring(&ps.opt_lahmax_buf[0]), i32(len(ps.opt_lahmax_buf)), ps.opt_lahmax_edit) {
-        was := ps.opt_lahmax_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_lahmax_edit = !was
-      }
-      hov(mouse, {ox + OPT_PAD, ty0 - 18, ow - 2 * OPT_PAD, 44}, {
-        "Hesitation - a random pause in this range before the picker locks onto each",
-        "NEW target after a kill (a human-like reaction delay, not an instant snap).",
-        "Seconds. e.g. 0.8 to 3.0. Bigger = lazier / more AFK-looking farming.",
-      }, &otip)
-      ty0 += 34
-      // Row 2 - travel-jump interval, seconds.
-      rl.GuiLabel({ox + OPT_PAD, ty0, col_w, 18}, "jump every min (s)")
-      rl.GuiLabel({ox + 2 * OPT_PAD + col_w, ty0, col_w, 18}, "jump every max (s)")
-      ty0 += 18
-      if rl.GuiTextBox({ox + OPT_PAD, ty0, col_w, 26}, cstring(&ps.opt_lajmin_buf[0]), i32(len(ps.opt_lajmin_buf)), ps.opt_lajmin_edit) {
-        was := ps.opt_lajmin_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_lajmin_edit = !was
-      }
-      if rl.GuiTextBox({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, cstring(&ps.opt_lajmax_buf[0]), i32(len(ps.opt_lajmax_buf)), ps.opt_lajmax_edit) {
-        was := ps.opt_lajmax_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_lajmax_edit = !was
-      }
-      hov(mouse, {ox + OPT_PAD, ty0 - 18, ow - 2 * OPT_PAD, 44}, {
-        "Jump interval - the random gap between travel-jump attempts while walking to",
-        "a target (jumps only happen far from the mob, not in melee). Seconds, e.g.",
-        "4 to 12. Needs 'findmove'; without it jumps are skipped.",
-      }, &otip)
-      ty0 += 34
-      // Row 3 - jump chance (left) + step chance (right), percent.
-      rl.GuiLabel({ox + OPT_PAD, ty0, col_w, 18}, "jump chance (%)")
-      rl.GuiLabel({ox + 2 * OPT_PAD + col_w, ty0, col_w, 18}, "step chance (%)")
-      ty0 += 18
-      if rl.GuiTextBox({ox + OPT_PAD, ty0, col_w, 26}, cstring(&ps.opt_lajch_buf[0]), i32(len(ps.opt_lajch_buf)), ps.opt_lajch_edit) {
-        was := ps.opt_lajch_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_lajch_edit = !was
-      }
-      if rl.GuiTextBox({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, cstring(&ps.opt_lastepch_buf[0]), i32(len(ps.opt_lastepch_buf)), ps.opt_lastepch_edit) {
-        was := ps.opt_lastepch_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_lastepch_edit = !was
-      }
-      hov(mouse, {ox + OPT_PAD, ty0 - 18, col_w, 44}, {
-        "Jump chance - the odds (0-100%) that any scheduled jump window actually fires.",
-        "Below 100 makes jumping sporadic instead of a steady metronome. Default 65.",
-        "0 = never jump; 100 = jump on every window.",
-      }, &otip)
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0 - 18, col_w, 44}, {
-        "Step chance - the odds (0-100%) that an advance takes a single intermediate",
-        "detour step (Int. step must be ON). Default 40. 0 = never; 100 = every time.",
-      }, &otip)
-      ty0 += 34
-      // Row 4 - step spread (left) + max range (right), world units.
-      rl.GuiLabel({ox + OPT_PAD, ty0, col_w, 18}, "step spread (u)")
-      rl.GuiLabel({ox + 2 * OPT_PAD + col_w, ty0, col_w, 18}, "max range (u)")
-      ty0 += 18
-      if rl.GuiTextBox({ox + OPT_PAD, ty0, col_w, 26}, cstring(&ps.opt_lastepsp_buf[0]), i32(len(ps.opt_lastepsp_buf)), ps.opt_lastepsp_edit) {
-        was := ps.opt_lastepsp_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_lastepsp_edit = !was
-      }
-      if rl.GuiTextBox({ox + 2 * OPT_PAD + col_w, ty0, col_w, 26}, cstring(&ps.opt_lamaxr_buf[0]), i32(len(ps.opt_lamaxr_buf)), ps.opt_lamaxr_edit) {
-        was := ps.opt_lamaxr_edit
-        panel_opt_clear_edits(&ps)
-        ps.opt_lamaxr_edit = !was
-      }
-      hov(mouse, {ox + OPT_PAD, ty0 - 18, col_w, 44}, {
-        "Step spread - max sideways offset (world units) of an approach waypoint from the",
-        "straight line to the mob. Bigger = wider, more wandering detours. Default 8.",
-      }, &otip)
-      hov(mouse, {ox + 2 * OPT_PAD + col_w, ty0 - 18, col_w, 44}, {
-        "Max range - the 'too far to beeline' distance (world units). Beyond it, Max-range",
-        "approaches in shrinking hops until inside this, then locks. Default 40.",
-      }, &otip)
-      ty0 += 34
-      // End scrollable content: measure its intrinsic height (scroll-independent - ty0 flows from oy) for
-      // next frame's scroll clamp, close the clip + input gate, then draw the fixed footer + scrollbar hint.
-      ps.opt_content_h = (ty0 - oy) + OPT_PAD
-      rl.EndScissorMode()
-      if max_scroll > 0 { // scrollbar thumb on the right edge (only when content overflows)
-        thumb_h := view_h * (view_h / ps.opt_content_h)
-        thumb_y := view_top + (-ps.opt_scroll / max_scroll) * (view_h - thumb_h)
-        rl.DrawRectangleRounded({ox + ow - 6, thumb_y, 4, thumb_h}, 0.5, 4, rl.Color{140, 150, 165, 200})
-      }
-      // Apply + Close (fixed footer, anchored to the panel not the scrolled content)
-      bw3 := (ow - 3 * OPT_PAD) / 2
-      if rl.GuiButton({ox + OPT_PAD, panel_oy + oh - OPT_PAD - 28, bw3, 28}, "Apply values") {
-        ar_txt := strings.trim_space(panel_buf_str(ps.opt_ar_buf[:]))
-        if v, vok := strconv.parse_f64(ar_txt); vok && v >= 0 && f32(v) != opt_ar_cur {
-          panel_enqueue(&ps, fmt.tprintf("set attack_range %.3f", v))
-        }
-        mg_txt := strings.trim_space(panel_buf_str(ps.opt_mg_buf[:]))
-        if n, nok := strconv.parse_int(mg_txt); nok && n >= 0 && n != opt_mg_cur {
-          panel_enqueue(&ps, fmt.tprintf("density mingain %d", n))
-        }
-        dt_txt := strings.trim_space(panel_buf_str(ps.opt_dt_buf[:]))
-        if v, vok := strconv.parse_f64(dt_txt); vok && v >= 0 && f32(v) != opt_dt_cur {
-          panel_enqueue(&ps, fmt.tprintf("density detour %v", f32(v)))
-        }
-        // priority-ladder rung 2 radius. 'priority melee <r>' also ENABLES the rung, which is what you
-        // want from typing a radius into the box next to it.
-        me_txt := strings.trim_space(panel_buf_str(ps.opt_melee_buf[:]))
-        if v, vok := strconv.parse_f64(me_txt); vok && v > 0 && f32(v) != opt_melee_cur {
-          panel_enqueue(&ps, fmt.tprintf("priority melee %v", f32(v)))
-        }
-        // combat-watch grace (seconds). Same deal: the numeric form of 'combatwatch' enables the watch.
-        gr_txt := strings.trim_space(panel_buf_str(ps.opt_grace_buf[:]))
-        if v, vok := strconv.parse_f64(gr_txt); vok && v > 0 && f32(v) != opt_grace_cur {
-          panel_enqueue(&ps, fmt.tprintf("combatwatch %v", f32(v)))
-        }
-        // look-alive hesitation window (one command sets both ends; enqueue if either changed)
-        hmin_txt := strings.trim_space(panel_buf_str(ps.opt_lahmin_buf[:]))
-        hmax_txt := strings.trim_space(panel_buf_str(ps.opt_lahmax_buf[:]))
-        if lo, lok := strconv.parse_f64(hmin_txt); lok && lo >= 0 {
-          if hi, hik := strconv.parse_f64(hmax_txt); hik && hi >= 0 {
-            if f32(lo) != opt_lahmin_cur || f32(hi) != opt_lahmax_cur {
-              panel_enqueue(&ps, fmt.tprintf("lookalive hold %v %v", f32(lo), f32(hi)))
-            }
-          }
-        }
-        // look-alive travel-jump interval
-        jmin_txt := strings.trim_space(panel_buf_str(ps.opt_lajmin_buf[:]))
-        jmax_txt := strings.trim_space(panel_buf_str(ps.opt_lajmax_buf[:]))
-        if lo, lok := strconv.parse_f64(jmin_txt); lok && lo >= 0 {
-          if hi, hik := strconv.parse_f64(jmax_txt); hik && hi >= 0 {
-            if f32(lo) != opt_lajmin_cur || f32(hi) != opt_lajmax_cur {
-              panel_enqueue(&ps, fmt.tprintf("lookalive jump %v %v", f32(lo), f32(hi)))
-            }
-          }
-        }
-        // look-alive jump chance (percent, clamped 0-100)
-        ch_txt := strings.trim_space(panel_buf_str(ps.opt_lajch_buf[:]))
-        if n, nok := strconv.parse_int(ch_txt); nok && n >= 0 && n <= 100 && n != opt_lajch_cur {
-          panel_enqueue(&ps, fmt.tprintf("lookalive chance %d", n))
-        }
-        // look-alive step chance (percent, clamped 0-100)
-        stepch_txt := strings.trim_space(panel_buf_str(ps.opt_lastepch_buf[:]))
-        if n, nok := strconv.parse_int(stepch_txt); nok && n >= 0 && n <= 100 && n != opt_lastepch_cur {
-          panel_enqueue(&ps, fmt.tprintf("lookalive step chance %d", n))
-        }
-        // look-alive step spread (world units)
-        stepsp_txt := strings.trim_space(panel_buf_str(ps.opt_lastepsp_buf[:]))
-        if v, vok := strconv.parse_f64(stepsp_txt); vok && v >= 0 && f32(v) != opt_lastepsp_cur {
-          panel_enqueue(&ps, fmt.tprintf("lookalive step spread %v", f32(v)))
-        }
-        // look-alive max-range approach distance (world units)
-        maxr_txt := strings.trim_space(panel_buf_str(ps.opt_lamaxr_buf[:]))
-        if v, vok := strconv.parse_f64(maxr_txt); vok && v >= 0 && f32(v) != opt_lamaxr_cur {
-          panel_enqueue(&ps, fmt.tprintf("lookalive maxrange %v", f32(v)))
-        }
-        ps.opt_seeded = false // re-seed next frame so the boxes reflect what actually applied
-      }
-      if rl.GuiButton({ox + 2 * OPT_PAD + bw3, panel_oy + oh - OPT_PAD - 28, bw3, 28}, "Close") {
-        ps.options_open = false
-        panel_opt_clear_edits(&ps)
-      }
-      // Hovered-value explanation, drawn last so it sits on top of the modal. Positioned below the
-      // cursor, or above it near the screen bottom, and clamped to the screen width. Suppressed when the
-      // cursor is outside the scrollable viewport (a scrolled-out widget under the title/footer must not
-      // pop its tooltip).
-      if otip != nil && in_view {
-        ty := mouse.y + 18
-        if ty + f32(len(otip) * 16 + 8) > fh {
-          ty = mouse.y - f32(len(otip) * 16 + 8) - 6
-        }
-        panel_tooltip_lines(mouse.x + 14, ty, otip, fw)
+        imgui.End()
       }
     }
 
-    // --- Leaderboards modal (submit a timed run + browse the board; trigger gated on leaderboard_url) ---
-    if ps.leaderboard_open {
-      rl.GuiUnlock()
-      rl.DrawRectangle(0, 0, i32(fw), i32(fh), rl.Color{0, 0, 0, 150})
-      lw := f32(474)
-      lh := f32(590)
-      lx := (fw - lw) / 2
-      ly := (fh - lh) / 2
-      rl.GuiPanel({lx, ly, lw, lh}, "leaderboards")
-      ix := lx + 14
-      iw := lw - 28
-      yy := ly + 34
-      if !ps.lb_seeded {
-        ps.lb_seeded = true
-        ps.lb_sort = i32(lb_board_sort_s) // reflect whatever sort the board currently holds
-        ps.lb_name_edit = false
-        // Pull the standings once per open, so the dialog shows live data instead of whatever was
-        // cached from an earlier open (or an empty board on the first one). Same silent command the
-        // Refresh button enqueues - lb_cli_fetch spawns a worker, so this never blocks the frame.
-        // Skipped when a request is already in flight: lb_cli_fetch would only reject it and print
-        // "a request is already in flight" to the console for something the user never asked for.
-        if !lb_busy_s {
-          panel_enqueue(&ps, fmt.tprintf("leaderboard refresh %s", LB_SORTS[clamp(int(ps.lb_sort), 0, len(LB_SORTS) - 1)]))
-        }
-      }
-
-      // RECORDING group: name box + Start/Stop + Submit + live stats.
-      rl.DrawText("RECORDING", i32(ix), i32(yy), 13, PANEL_HDR)
-      yy += 20
-      if rl.GuiTextBox({ix, yy, iw, 28}, cstring(&ps.lb_name_buf[0]), i32(len(ps.lb_name_buf)), ps.lb_name_edit) {
-        ps.lb_name_edit = !ps.lb_name_edit
-      }
-      rl.DrawText("name shown on the board", i32(ix), i32(yy + 30), 10, PANEL_DIM)
-      yy += 48
-      lbhalf := (iw - 10) / 2
-      start_lbl: cstring = lb_active_s ? "Stop recording" : "Start recording"
-      if rl.GuiButton({ix, yy, lbhalf, 28}, start_lbl) {
-        panel_enqueue(&ps, lb_active_s ? "leaderboard stop" : "leaderboard start")
-      }
-      nm_typed := strings.trim_space(panel_buf_str(ps.lb_name_buf[:]))
-      submit_ready := lb_has_run_s && lb_elapsed_s >= LB_MIN_SEC && !lb_busy_s && !lb_submitted_s && nm_typed != ""
-      submit_rect := rl.Rectangle{ix + lbhalf + 10, yy, lbhalf, 28}
-      if !submit_ready {rl.GuiDisable()}
-      if rl.GuiButton(submit_rect, "Submit run") {
-        clean, _ := strings.remove_all(nm_typed, ";", context.temp_allocator) // guard the ';' command splitter
-        panel_enqueue(&ps, fmt.tprintf("leaderboard submit %s", clean))
-      }
-      if !submit_ready {rl.GuiEnable()}
-      // Explain WHY submit is greyed out (drawn on top at the end of the modal so nothing covers it).
-      submit_tip: cstring = nil
-      if !submit_ready && rl.CheckCollisionPointRec(mouse, submit_rect) {
-        if !lb_has_run_s {
-          submit_tip = "Press \"Start recording\" first."
-        } else if lb_submitted_s {
-          submit_tip = "This run is already on the board - Start a new run to submit again."
-        } else if nm_typed == "" {
-          submit_tip = "Enter a name to appear on the board."
-        } else if lb_busy_s {
-          submit_tip = "A submission is already in flight..."
-        } else {
-          rem := LB_MIN_SEC - lb_elapsed_s
-          submit_tip = fmt.ctprintf("Record at least %d min to submit - %d:%02d more to go.", LB_MIN_SEC / 60, rem / 60, rem % 60)
-        }
-      }
-      yy += 34
-      run_state := lb_active_s ? "RECORDING" : (lb_has_run_s ? "stopped" : "idle")
-      rl.DrawText(fmt.ctprintf("%s   %s   %d kills   %d penya", run_state, fmt_elapsed(i64(lb_elapsed_s) * 1_000_000_000), lb_kills_s, lb_penya_s), i32(ix), i32(yy), 11, rl.RAYWHITE)
-      yy += 16
-      if lb_elapsed_s >= LB_MIN_SEC {
-        rl.DrawText(fmt.ctprintf("%.1f kpm   peak-density %d   %d species   -   READY to submit", lb_kpm_s, lb_density_s, lb_species_s), i32(ix), i32(yy), 11, PANEL_DIM)
-      } else {
-        rem := LB_MIN_SEC - lb_elapsed_s
-        rl.DrawText(fmt.ctprintf("%.1f kpm   peak-density %d   %d species   -   %d:%02d until submit", lb_kpm_s, lb_density_s, lb_species_s, rem / 60, rem % 60), i32(ix), i32(yy), 11, PANEL_DIM)
-      }
-      yy += 22
-      rl.DrawLine(i32(ix), i32(yy), i32(ix + iw), i32(yy), PANEL_SEP)
-      yy += 8
-
-      // BOARD group: sort toggle (re-fetches on change) + Refresh + rows with a per-row "cfg" download.
-      rl.DrawText("BOARD", i32(ix), i32(yy), 13, PANEL_HDR)
-      if rl.GuiButton({ix + iw - 80, yy - 4, 80, 22}, "Refresh") {
-        panel_enqueue(&ps, fmt.tprintf("leaderboard refresh %s", LB_SORTS[clamp(int(ps.lb_sort), 0, len(LB_SORTS) - 1)]))
-      }
-      yy += 20
-      prev_sort := ps.lb_sort
-      rl.GuiToggleGroup({ix, yy, (iw - 8) / 5, 22}, "penya;kpm;kills;mobs;dens", &ps.lb_sort)
-      if ps.lb_sort != prev_sort {
-        panel_enqueue(&ps, fmt.tprintf("leaderboard refresh %s", LB_SORTS[clamp(int(ps.lb_sort), 0, len(LB_SORTS) - 1)]))
-      }
-      yy += 28
-      cx_rank := ix
-      cx_name := ix + 24
-      cx_kills := ix + 166
-      cx_penya := ix + 212
-      cx_kpm := ix + 296
-      cx_dens := ix + 342
-      cx_cfg := ix + iw - 42
-      rl.DrawText("#", i32(cx_rank), i32(yy), 10, PANEL_DIM)
-      rl.DrawText("name", i32(cx_name), i32(yy), 10, PANEL_DIM)
-      rl.DrawText("kills", i32(cx_kills), i32(yy), 10, PANEL_DIM)
-      rl.DrawText("penya", i32(cx_penya), i32(yy), 10, PANEL_DIM)
-      rl.DrawText("kpm", i32(cx_kpm), i32(yy), 10, PANEL_DIM)
-      rl.DrawText("dns", i32(cx_dens), i32(yy), 10, PANEL_DIM)
-      yy += 14
-      rl.DrawLine(i32(ix), i32(yy), i32(ix + iw), i32(yy), PANEL_SEP)
-      yy += 4
-      max_rows := 13
-      if len(lb_rows_s) == 0 {
-        rl.DrawText("(no entries yet - press Refresh)", i32(ix), i32(yy + 4), 11, PANEL_DIM)
-      }
-      shown := min(len(lb_rows_s), max_rows)
-      for ri in 0 ..< shown {
-        r := &lb_rows_s[ri]
-        ry := yy + f32(ri) * 20
-        nm := panel_buf_str(r.name[:])
-        if len(nm) > 18 {nm = nm[:18]}
-        rl.DrawText(fmt.ctprintf("%d", ri + 1), i32(cx_rank), i32(ry + 3), 11, rl.RAYWHITE)
-        rl.DrawText(fmt.ctprintf("%s", nm), i32(cx_name), i32(ry + 3), 11, rl.RAYWHITE)
-        rl.DrawText(fmt.ctprintf("%d", r.kills), i32(cx_kills), i32(ry + 3), 11, rl.RAYWHITE)
-        rl.DrawText(fmt.ctprintf("%d", r.penya), i32(cx_penya), i32(ry + 3), 11, rl.RAYWHITE)
-        rl.DrawText(fmt.ctprintf("%.1f", r.kpm), i32(cx_kpm), i32(ry + 3), 11, rl.RAYWHITE)
-        rl.DrawText(fmt.ctprintf("%d", r.max_density), i32(cx_dens), i32(ry + 3), 11, rl.RAYWHITE)
-        if rl.GuiButton({cx_cfg, ry, 40, 18}, "cfg") {
-          panel_enqueue(&ps, fmt.tprintf("leaderboard getcfg %d", r.id))
-        }
-      }
-
-      // status line + Close (anchored to the modal bottom, independent of the row count above)
-      if lb_status_s != "" {
-        rl.DrawText(fmt.ctprintf("%s", lb_status_s), i32(ix), i32(ly + lh - 62), 11, rl.Color{150, 200, 160, 255})
-      }
-      if rl.GuiButton({ix, ly + lh - 40, iw, 28}, "Close") {
-        ps.leaderboard_open = false
-        ps.lb_name_edit = false
-      }
-      // disabled-Submit explanation, drawn last so it sits above the whole modal
-      if submit_tip != nil {
-        tw := rl.MeasureText(submit_tip, 12)
-        tx := mouse.x + 14
-        ty := mouse.y + 18
-        if tx + f32(tw) + 10 > fw {tx = fw - f32(tw) - 10}
-        rl.DrawRectangle(i32(tx - 4), i32(ty - 3), tw + 10, 20, rl.Color{12, 16, 22, 250})
-        rl.DrawRectangleLines(i32(tx - 4), i32(ty - 3), tw + 10, 20, rl.Color{90, 100, 115, 255})
-        rl.DrawText(submit_tip, i32(tx + 1), i32(ty), 12, rl.RAYWHITE)
-      }
-    }
+    // === UI === (see gui.odin). Built here in the UNLOCKED phase from the gf snapshot; every action it
+    // wants lands in ps.pending and is drained under exec_mutex below, exactly like a typed REPL line.
+    gui_frame(session, &ps, &gf, Gui_View{edit = &edit, cam_lock = &cam_lock, recenter = &recenter_req, tool = &tool, tag = &tag_i})
+    imgui_rl.end() // renders the ImGui draw data through rlgl - must be inside Begin/EndDrawing
 
     rl.EndDrawing()
     } // end Radar_Draw zone scope (free_all / relock / drain below run outside the draw zone)

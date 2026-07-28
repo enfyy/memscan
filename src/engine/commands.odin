@@ -3,6 +3,7 @@ package engine
 import "core:fmt"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import win "core:sys/windows"
 
 // ===========================================================================
@@ -14,6 +15,30 @@ import win "core:sys/windows"
 // the Win32 work themselves and route the module's per-process setup/teardown
 // through the on_attach / on_detach hooks (the engine never imports flyff).
 // ===========================================================================
+
+// Pause the command stream for N milliseconds. Exists so a piped script can let TIME PASS - the
+// behaviour walker, auto's advance and every watchdog only move on the 20ms background tick, so
+// "run something, then look at what it did" is otherwise impossible headlessly: stdin is consumed as
+// fast as it can be read and every command lands in the same tick.
+//
+// RELEASES exec_mutex for the duration, and that is the entire point. run_cli holds the lock around
+// every command, so sleeping under it would freeze the very tick we are waiting for. Same yield
+// discipline as cli_setup and the radar's frame loop.
+cmd_sleep :: proc(session: ^Session, args: []string) {
+  if len(args) == 0 {
+    fmt.eprintln("usage: sleep <milliseconds>")
+    return
+  }
+  ms, ok := strconv.parse_int(args[0])
+  if !ok || ms < 0 {
+    fmt.eprintfln("sleep: '%s' is not a millisecond count", args[0])
+    return
+  }
+  ms = min(ms, 10 * 60 * 1000) // a typo must not wedge the REPL forever
+  sync.mutex_unlock(&session.exec_mutex)
+  win.Sleep(u32(ms))
+  sync.mutex_lock(&session.exec_mutex)
+}
 
 cmd_ps :: proc(args: []string) {
   filter := ""
@@ -38,6 +63,14 @@ cmd_attach :: proc(session: ^Session, args: []string) {
   if is_all_digits(args[0]) {
     v, _ := strconv.parse_u64(args[0])
     pid = u32(v)
+    // Resolve the name too. Attaching by pid is what the radar's Attach dialog does (it lists processes
+    // and sends the pid), and without this every UI/`info` readout of the attached process would be blank.
+    for r in find_process_id_by_name("", context.temp_allocator) {
+      if r.process_id == pid {
+        name = r.process_name
+        break
+      }
+    }
   } else {
     results := find_process_id_by_name(args[0], context.temp_allocator)
     if len(results) == 0 {

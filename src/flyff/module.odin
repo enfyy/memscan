@@ -88,6 +88,8 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_trail(s, args)
   case "hillshade":
     cli_hillshade(s, args)
+  case "nowalk":
+    cli_nowalk(s, args)
   case "collwatch":
     cli_collwatch(s, args)
   case "pause":
@@ -162,6 +164,8 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_collscan(s, args)
   case "collignore":
     cli_collignore(s, args)
+  case "collmem":
+    cli_collmem(s, args)
   case "linkscan":
     cli_linkscan(s, args)
   case "reach":
@@ -249,6 +253,7 @@ on_attach :: proc(es: ^engine.Session) {
   s.tc_recent = nil
   s.collider_cache_valid = false
   s.collider_job.gen += 1 // orphan any in-flight collider rebuild from the previous process
+  collider_memory_reset(s) // remembered obstacles belong to one process's world, never carry them over
   // A painted lane belongs to the world it was drawn in - never carry one across processes. The walk flag
   // is dropped FIRST so sweep_clear's halt-the-hop write can't fire into the new process with the old
   // (about to be reloaded) layout; the previous process is gone, so there is no walk left to stop.
@@ -325,6 +330,7 @@ on_detach :: proc(es: ^engine.Session) {
   remote_free_dplay_page(s)
   s.collider_cache_valid = false // stale across processes
   s.collider_job.gen += 1 // discard a collider rebuild still running against the detached process
+  collider_memory_reset(s) // the remembered map goes with the process it was scanned from
   // Stop a running script BEFORE the baselines are reset: it goes through the state machine, so the
   // in-flight action's Exit still runs against the process it was issued in (halting a walk while
   // there is still something to halt). Same reasoning as sweep_walking being dropped on attach.
@@ -359,6 +365,8 @@ on_close :: proc(es: ^engine.Session) {
   delete(s.tc_recent)
   delete(s.auto_blocked)
   delete(s.world_cal)
+  delete(s.collider_cache)
+  delete(s.collider_memory)
 }
 
 module_help :: proc() {
@@ -410,6 +418,8 @@ farming (day to day)
   hunt [on|off]              hunt mode: commit to one target (giant/quest), never drop it for being far/unreachable; side-step around blocks (needs findmove)
   sfx [on|off]               radar sound effects (penya chime + kill zap); persisted to flyff.cfg
   fxlaser [on|off]           radar kill laser-beam effect; persisted to flyff.cfg
+  set ui_scale <n>           UI scale (0.6..3.0, default 1). The font atlas is baked when the window
+                             opens, so re-open the radar for it to take effect.
   meshreach [on|off]         confirm OBB-blocked mobs with the client's IntersectObjLine (opt-in; injects, crash-prone)
                              inert until 'findobjline' pins intersectobjline_rva (re-run it after a game patch)
   findobjline                re-pin intersectobjline_rva by signature so meshreach / objline / reachcmp work again
@@ -418,14 +428,26 @@ farming (day to day)
                              (tc_map[_label].html) + a console factor table; diagnoses target order.
                              label tags the file ('tdbg cloakia' vs 'tdbg tower'); a trailing number is
                              the view radius in world units ('tdbg tower 30' to zoom in)
-  radar [seconds]            open a LIVE top-down radar window (player + mobs + obstacles); wheel=zoom,
-                             ESC=close. raylib is statically linked (no dll). seconds>0 auto-closes.
+  radar [seconds]            open the WINDOW (live top-down map + the Dear ImGui control surface);
+                             wheel=zoom, titlebar X closes it (ESC no longer does). raylib+imgui are
+                             statically linked (no dll). seconds>0 auto-closes. Does NOT need an attached
+                             process: with none it opens on the Attach dialog (defaults to 'neuz').
                              LEFT-CLICK a mob to target it; SHIFT+LEFT-CLICK the ground to walk there
                              (needs 'findmove'); a '+penya' pops on each pickup (needs 'findpenya').
-                             press E in-window to draw a geo-fence (see 'fence').
-  module flyff               open the radar with the CONTROL PANEL: setup status lights (hover for the
-                             fix), a Setup dialog, the auto-farm toggle, a mob search + chip picker, the
-                             attack_range slider, and fence/view buttons. same window as 'radar'.
+                             toolbar (top-left): setup traffic light -> the Setup dialog (checklist +
+                             attack_range), the BEHAVIOUR BROWSER (every chart, Odin and saved; left-click
+                             runs, right-click duplicates/renames/deletes), zone/fence editor (E), camera
+                             follow (L, ON by default), no-walk overlay (N), mute. While a chart runs, a
+                             transport strip (play/pause, rewind, step, stop + the current block) sits
+                             top-centre. Unlock the camera and a recenter button appears bottom-right (C
+                             also works); penya + bag gauges sit bottom-left. auto, the targeting options
+                             and leaderboards are CLI-only for now.
+  hillshade [on|off]         radar display only: colourless terrain shaded-relief backdrop (key H).
+                             needs 'worldscan'; depth/light are 'set hillshade_z' / 'set hillshade_light'
+  nowalk [on|off]            radar display only: paint the walk-blocking terrain cells the reach oracle
+                             tests - orange NOWALK (fly-only), red NOMOVE (wall), magenta DIE (key N).
+                             needs 'worldscan'. This is how you SEE an invisible wall before auto hits it
+  module flyff               same window as 'radar'.
   fence [sub]                geo-fence: never target mobs outside a drawn area. no arg = status. subs:
                              add circle <r>|<x,z> <r> [-|!] / add rect <halfx,halfz>|<min> <max> [-|!] /
                              poly start|point|end / undo / erase <x,z> / clear / on / off / test <x,z> /
@@ -474,20 +496,26 @@ live verification (run these once after a build, with the game running)
 behaviour scripts (build your own farming behaviour out of blocks; 'auto' becomes one script among many)
   script blocks              THE CATALOG: every action + event, with [OK] / [--] and what a missing
                              one still needs. this is both the reference and the roadmap
-  script new <name>          start a buffer; 'script add <block...>' appends one block at a time
-  script show [name]         print the script back from its PARSED form - if it differs from what you
-                             typed, the parse lost something
-  script save <name>         write scripts/<name>.ms      script load <name>   read one back
-  script list                what's saved
-  script run [name] [once|loop]   validate every block, then run it. no name = the buffer.
-                             '#! loop' as the script's first line makes looping the default
+  script list                every behaviour: the ones written in Odin (flyff/behaviours.odin) and the
+                             ones saved as files. A SAVED one wins over an Odin one of the same name
+  script show <name>         print the blocks it builds, without running it
+  script run <name> [once|loop]   validate every block, then run it
   script                     status: which step, how long, which interrupts are armed
+  script pause | resume      freeze the whole machine / let it go again. PAUSED means nothing runs at
+                             all, not even interrupts, so you come back to exactly what you left
+  script reset               rewind to the start node without rebuilding: loop stack, kill tally,
+                             interrupt latches and clocks all reset, and the in-flight step is torn down
   script step [off]          debug: freeze the run and execute ONE block at a time ('off' resumes).
                              interrupts keep running while stepping, so you can still break out
   script stop                end the run - whatever was in flight gets torn down (a walk halts)
-  syntax: one block per line, '#' comments.  if <event> / else / end,  repeat <n> / end,
-          while <event> / end,  wait_for <event>,  <action> until <event>,  on <event> -> <action>
-          'on' is an INTERRUPT: checked before every step, first match wins. @vars interpolate.
+  script export <b> [as <n>]  build an Odin behaviour and write it out as an editable file - this is how
+                             a built-in becomes something you can open and change
+  script save <name>         snapshot the RUNNING program to a file
+  script delete <name>       /  script rename <old> <new>
+  behaviours are DATA: <exe-dir>/behaviours/<name>.bhv, written by 'export'/'save' and by the editor.
+  there is no text language to learn and no 'script load' - 'show' and 'run' take a saved name directly.
+  authoring is either plain Odin (builder.odin - Odin's own control flow runs at BUILD time and
+  disappears, so only real runtime decisions cost a node) or the visual editor.
 
 behaviour machine (the declared state machine that will replace the hardcoded 'auto' - see behaviour.odin)
   sense                      one-shot: what the machine can SEE right now (target, kills, penya, HP, bag).
@@ -526,6 +554,11 @@ terrain / obstacle reach oracle ('setup' pins these; commands below are for stan
   collscan [radius]          per nearby prop: model .o3d filename + collision-mesh type (NORMAL vs ERROR)
   collwatch [secs] [radius] [all]  catch a TRANSIENT collider (respawn VFX): polls + logs each SOLID
                              box the instant it appears (mobs/items hidden unless 'all'). [COLLIDER] = culprit
+  collmem [on|off|map|clear]  persistent obstacle memory (on by default; radar key M): props STAY on the
+                             radar once seen instead of popping out past 120 units. 'map' remembers the
+                             whole current map for the session; otherwise boxes evict past
+                             collider_memory_range (default 1200, 'set collider_memory_range <n>').
+                             DRAW-ONLY - reach / target selection / sweep still use the live 120-unit set.
   reach [x,z]                is the straight path player->point (or ->selected target) walkable?
   attackable          (canhit)  is the SELECTED mob reachable to attack? (terrain + object obstacles,
                              within attack_range). select a mob, stand behind cover, run it.
@@ -561,4 +594,4 @@ leaderboards (submit a timed farm run to a self-hosted backend)
                              cheat-proofing is layered + honest: build-hash gate + HMAC signing + server-side
                              plausibility (>=5 min, rate caps) + rate limiting. A memory tool's self-reported
                              stats are still spoofable by a determined attacker - this raises the bar, not anti-cheat.
-  the "Leaderboards..." button appears at the bottom of the radar sidebar once leaderboard_url is set.`
+  leaderboards are CLI-only since the ImGui redesign (the old sidebar button went with the raygui panel).`

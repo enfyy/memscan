@@ -174,6 +174,25 @@ FLYFF_HILLSHADE_ON :: false
 FLYFF_HILLSHADE_Z :: f32(4.0)
 FLYFF_HILLSHADE_LIGHT :: f32(315.0)
 
+// Radar no-walk overlay (display-only; paints the walk-blocking terrain attribute cells the reach oracle
+// already tests). Off by default - it is a diagnostic wash, not the normal farming view. See radar.odin
+// NOWALK_* + radar_gather_nowalk.
+FLYFF_NOWALK_ON :: false
+
+// Persistent radar obstacle memory (display-only; see the section after collider_scan_worker in
+// terrain.odin). ON by default - it is the fix for props popping in and out of the radar as the live
+// 120-unit collider window slides with you. collider_memory_map keeps the WHOLE current map for as long
+// as the app runs (opt-in); otherwise boxes evict past collider_memory_range world units.
+FLYFF_COLLIDER_MEMORY_ON :: true
+FLYFF_COLLIDER_MEMORY_MAP :: false
+
+// Dear ImGui UI scale (see gui.odin). Applied ONCE when the radar window opens - the font atlas is
+// rasterized at font_size*ui_scale, so changing it mid-window would mean rebuilding + re-uploading the
+// atlas for no real gain. `set ui_scale 1.25` then re-open the window.
+FLYFF_UI_SCALE :: f32(1.0)
+UI_SCALE_MIN :: f32(0.6)
+UI_SCALE_MAX :: f32(3.0)
+
 // Look-alive tuning (see autofarm.odin lookalive_* + the "look-alive" section in the radar Options
 // panel). All persisted to flyff.cfg and editable live via 'lookalive hold|jump|chance' or 'set'.
 // Durations are in SECONDS (converted to ns per event by la_secs_ns); jump_chance is a 0-100 percent.
@@ -404,6 +423,11 @@ Flyff_Layout :: struct {
   hillshade_on:      bool, // radar display: colourless terrain shaded-relief backdrop
   hillshade_z:       f32,  // hillshade vertical exaggeration (relief depth)
   hillshade_light:   f32,  // hillshade light azimuth (degrees CW from north; 315 = NW)
+  nowalk_on:         bool, // radar display: paint walk-blocking terrain cells (NOWALK/NOMOVE/DIE)
+  collider_memory_on:    bool, // radar display: remember obstacles once seen (DRAW-ONLY; never gates reach)
+  collider_memory_map:   bool, // remember the WHOLE current map for the session instead of evicting by distance
+  collider_memory_range: f32,  // eviction radius in world units when collider_memory_map is off
+  ui_scale:          f32,  // Dear ImGui UI scale; read when the radar window opens (see gui.odin)
   aobjcull_rva:      uintptr,
   camera_rva:        uintptr,
   coll_obj3d_off:    i64,
@@ -505,6 +529,11 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     hillshade_on      = FLYFF_HILLSHADE_ON,
     hillshade_z       = FLYFF_HILLSHADE_Z,
     hillshade_light   = FLYFF_HILLSHADE_LIGHT,
+    nowalk_on         = FLYFF_NOWALK_ON,
+    collider_memory_on = FLYFF_COLLIDER_MEMORY_ON,
+    collider_memory_map = FLYFF_COLLIDER_MEMORY_MAP,
+    collider_memory_range = COLLIDER_MEM_RANGE,
+    ui_scale          = FLYFF_UI_SCALE,
     aobjcull_rva      = FLYFF_AOBJCULL_RVA,
     camera_rva        = FLYFF_CAMERA_RVA,
     coll_obj3d_off    = FLYFF_COLL_OBJ3D_OFF,

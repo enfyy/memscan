@@ -40,6 +40,14 @@ BEHAVIOURS := [?]Behaviour_Def {
     build = bh_test_nesting,
   },
   {
+    name = "t_graph", blurb = "graph ops: a back-edge loop and a two-armed branch (g_spins>0, g_done=1)", test = true,
+    build = bh_test_graph,
+  },
+  {
+    name = "t_irq", blurb = "an interrupt region runs a timed body then resumes (irq_a=1, irq_b=1)", test = true,
+    build = bh_test_irq,
+  },
+  {
     name = "clockworks", blurb = "example dungeon run (needs the game + findmove + hotkeys)",
     build = bh_clockworks,
   },
@@ -113,6 +121,35 @@ bh_test_nesting :: proc(b: ^Builder) {
     }
   }
   add_var(&s, "after", 1)
+}
+
+// The graph half of the model, built with no structured block at all: the loop is a BACK-EDGE from a
+// branch, not a `while`, which is the only way a canvas can express one. g_spins counts the passes and
+// g_done proves the true arm was taken; if the branch re-armed its clock each pass (see the walker) the
+// exit would never fire and this would spin forever.
+bh_test_graph :: proc(b: ^Builder) {
+  s := seq(b)
+  set_var(&s, "g_done", "0")
+
+  add_var(&s, "g_spins", 1)
+  top := here(b) // `here` is always "the node I just emitted" - this one is the loop head
+  wait(&s, 0.02) // yield, or the 64-steps-per-tick budget just burns
+  out := branch_node(&s, after_minutes(0.004)) // ~0.24s
+  wire(b, out, .False, top) // not yet -> go round again
+
+  add_var(&s, "g_done", 1)
+  wire(b, out, .True, here(b)) // done -> the node just emitted
+}
+
+// An interrupt whose body TAKES TIME. `always` is true on the first tick, so the region fires at once,
+// runs a 0.25s wait to completion, and returns - after which the main program must continue from where
+// it was suspended. Both vars ending at 1 is the proof: a lost pc would leave irq_b unset.
+bh_test_irq :: proc(b: ^Builder) {
+  s := seq(b)
+  on(&s, always(), do_wait(0.25))
+  add_var(&s, "irq_a", 1)
+  wait(&s, 0.05)
+  add_var(&s, "irq_b", 1)
 }
 
 // Clones, because `on` stores the action as-is and script_step_free will delete its strings - a

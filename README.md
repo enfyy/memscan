@@ -11,6 +11,10 @@ Do not ask for a binary. if you cant figure out how to build it by yourself by r
 
 - [Odin] (no other dependencies)
 
+raylib comes from Odin's own `vendor:raylib`; Dear ImGui is vendored in `lib/odin-imgui` with a
+prebuilt static lib and a raylib backend in `lib/imgui_impl_raylib`. Both link statically, and the two
+UI fonts are embedded in the exe - there is nothing to install and no dll to ship.
+
 ## Build
 
 On Windows:
@@ -42,6 +46,50 @@ Type `help` for the command list and `quit` to exit. Chain commands on one line 
   repeat until the match set collapses to the address you want.
 - **Flyff farming:** `attach Neuz`, then `calibrate <x,y,z> <name>` once (offsets persist in
   `flyff.cfg` next to the exe), then `auto` and hold your attack key. `status` health-checks the setup.
+
+## The window
+
+`radar` opens the UI (Dear ImGui over a raylib-drawn map). It does **not** need an attached process:
+with none it opens on the Attach dialog, which searches for `neuz` by default - clear the box to list
+everything, then click a tile to attach.
+
+Once attached the map fills the window and the chrome floats over it:
+
+- **top-left toolbar** - a setup traffic light (green = every pin resolved, yellow = only optional
+  ones missing, red = a required one missing) that opens the Setup dialog; the behaviour browser
+  (highlighted while a chart is running); the zone editor toggle (`E`); camera follow (`L`, on by
+  default); the no-walk overlay (`N`); mute.
+- **behaviour browser** - every chart in one grid: the ones written in Odin
+  (`src/flyff/behaviours.odin`) and the ones saved as `behaviours/*.bhv` files. Left-click runs one,
+  right-click gives Duplicate / Rename / Delete. A saved chart wins over an Odin one of the same
+  name, so duplicating a built-in is how you get an editable copy; delete it to get the original back.
+- **transport strip** (top-centre, only while a chart is running) - play/pause, rewind, single-step,
+  stop, plus the current step and the block executing right now. Pause freezes the whole machine,
+  interrupts included; single-step keeps servicing them so a kill-switch can still break you out.
+- **Setup dialog** - the pipeline (character name, HP, penya), an `attack_range` slider, and the pin
+  checklist. `attack_range` lives here rather than in an options panel because it is your character's
+  physical reach, i.e. calibration and not preference: it is both the picker's engage range and the
+  sweep brush width, so the green circle on the map is the live readout while you drag it.
+- **bottom-right** - a recenter puck, which only exists while the camera is free: turn following off,
+  pan somewhere, and it appears to take you back (`C` does the same). Nothing to recenter, no button.
+- **bottom-left gauges** - penya and bag slots, value printed inside the bar. The penya bar runs
+  linearly over the full `0 .. max(i32)` range, because the only thing it can usefully warn you about
+  is the cap (past it, farmed penya is lost) - a normal balance really is a sliver. Both flash when
+  they matter: penya near the cap, bag when it is full.
+- **map** - left-click a mob to target it, shift+left-click the ground to walk there, right-drag to
+  pan, wheel to zoom. `N` paints the terrain you cannot walk through (orange = fly-only, red = wall,
+  magenta = instant death) - the same attribute grid targeting uses to skip unreachable mobs, so it
+  shows you the invisible walls before auto finds them the hard way. `H` adds shaded relief. Both
+  need `worldscan` pinned.
+
+Windows close with the X in their own titlebar - there are no in-body Close buttons, and `ESC` is not
+a close key anywhere (it used to quit the whole window out from under you).
+
+Every widget runs the same commands you would type, so nothing in the UI is a private code path.
+`set ui_scale <n>` scales the whole thing (re-open the window to apply).
+
+Auto-farm, the targeting options and leaderboards are CLI-only right now - they were deliberately left
+out of the redesigned shell and return as the behaviour surface grows.
 
 ## Commands
 

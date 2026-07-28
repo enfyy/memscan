@@ -640,6 +640,7 @@ LB_SHAREABLE_KEYS := [?]string {
 	"hillshade_on",
 	"hillshade_z",
 	"hillshade_light",
+	"nowalk_on",
 	"lb_penya_cap",
 }
 

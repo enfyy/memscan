@@ -3,6 +3,7 @@ import "../engine"
 
 import "core:fmt"
 import "core:math"
+import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
@@ -878,6 +879,9 @@ Obb :: struct {
   ext:        [3]f32, // HALF-extents
   axis:       [3][3]f32, // orthonormal box axes
   ty:         u32, // m_dwType: OT_OBJ / OT_CTRL (the only two collected). See the note above.
+  idx:        u32, // m_dwIndex: which prop of that type (the "kind" half of the collignore key). Kept on the
+  // box rather than re-read through obj, because a REMEMBERED box (collider_memory) can outlive the client's
+  // residency for its CObj - the inspector and collider_ignore_toggle still need its identity then.
   decorative: bool, // OT_OBJ with no dedicated collision mesh (GMT_ERROR) - walk-through, not a real blocker
   obj:        uintptr, // the live CObj* this box came from (0 = unknown). Set by obj_to_obb so the radar's
   // inspect mode can trace a clicked box back to its object and re-read identity. Reach math never uses it.
@@ -1248,6 +1252,14 @@ collect_nearby_obbs :: proc(session: ^Session, cx, cz, radius: f32) -> [dynamic]
 COLLIDER_CACHE_MOVE :: f32(16) // refresh the cache once the player moves this far from its center
 COLLIDER_RADIUS :: f32(120) // gather colliders within this of the player (must cover reach segments)
 
+// Persistent draw-only obstacle memory (see the section after collider_scan_worker). COLLIDER_RADIUS above
+// doubles as the AUTHORITATIVE radius: within it the client always has every prop resident, so a box the
+// fresh scan did not report really is gone (a respawn VFX that ended, a kind that just went on the ignore
+// list) and leaves the store. Past it, absence only means the client unloaded the object - we keep it.
+COLLIDER_MEM_RANGE :: f32(1200) // default eviction radius - 3x the 400-unit max radar view
+COLLIDER_MEM_MAX :: 40000 // hard cap on remembered boxes (~3 MB) even in keep-the-whole-map mode
+COLLIDER_MEM_QUANT :: f32(8) // box identity is its centre quantised to 1/8 world unit (see obb_key)
+
 // Ground drops + skill/effect zones are OT_CTRL objects (this server renders ground loot as CCtrl, one
 // per item, with a small ~1x0.5x1 box) that pile up exactly where you farm. The game never blocks
 // movement on them, but the full-scan collider set would treat them as solid - drawing phantom purple
@@ -1282,7 +1294,8 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
   if ty != 0 && ty != 3 {
     return // OT_OBJ (trees/rocks/buildings) or OT_CTRL (walls/housing) only - the collidable props
   }
-  if collider_denied(session, ty, rd_u32le(buf[:], po + 0x14)) {
+  idx := rd_u32le(buf[:], po + 0x14)
+  if collider_denied(session, ty, idx) {
     return // this kind (m_dwType + m_dwIndex) is on the radar-inspect ignore-list - drop it entirely
   }
   rf :: proc(b: []byte, k: int) -> f32 {return transmute(f32)rd_u32le(b, k)}
@@ -1299,6 +1312,7 @@ obj_to_obb :: proc(session: ^Session, obj: uintptr) -> (o: Obb, pos: [3]f32, ok:
   o.axis[1] = {rf(buf[:], oo + 0x24), rf(buf[:], oo + 0x28), rf(buf[:], oo + 0x2C)}
   o.axis[2] = {rf(buf[:], oo + 0x30), rf(buf[:], oo + 0x34), rf(buf[:], oo + 0x38)}
   o.ty = ty
+  o.idx = idx
   o.decorative = obj_is_decorative(session, obj, ty)
   o.obj = obj // keep the object handle so the radar inspect mode can trace this box back to its CObj
   ok = true
@@ -1318,6 +1332,13 @@ collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32, a
   if world == 0 || session.ptr_size != 4 {
     return nil
   }
+  // Zoning / re-log hands us a different CWorld: the remembered set belongs to the map it was scanned on,
+  // so re-bind (which resets it on a change) BEFORE anything can draw the old map's geometry over this one.
+  if session.layout.collider_memory_on {
+    collider_memory_bind(session, world)
+  } else if session.collider_memory_bound {
+    collider_memory_reset(session) // toggled off - drop the store rather than let it go stale
+  }
   if session.collider_cache_valid {
     dx := px - session.collider_cache_center[0]
     dz := pz - session.collider_cache_center[2]
@@ -1334,19 +1355,55 @@ collect_area_colliders :: proc(session: ^Session, world: uintptr, px, pz: f32, a
     collider_refresh_async(session, world, px, pz)
     return session.collider_cache[:]
   }
+  batch := make([dynamic]Obb, context.temp_allocator) // scratch: collider_publish copies out of it
+  collider_collect_into(session, world, px, pz, collider_collect_radius(session), &batch)
+  collider_publish(session, batch[:], world, px, pz)
+  return session.collider_cache[:]
+}
+
+// How wide one scan gathers. The scan itself is radius-INDEPENDENT - it enumerates every CObj in the
+// process and reads each one regardless (see collider_collect_into), and the radius only decides whether
+// the box is appended - so widening this costs a few appends and nothing else. That is what lets ONE scan
+// feed both the 120-unit reach window and the far-reaching draw memory.
+collider_collect_radius :: proc(session: ^Session) -> f32 {
+  L := session.layout
+  if !L.collider_memory_on {
+    return COLLIDER_RADIUS
+  }
+  if L.collider_memory_map {
+    return math.F32_MAX // keep-the-whole-map: take everything the client currently has resident
+  }
+  return math.max(COLLIDER_RADIUS, L.collider_memory_range)
+}
+
+// Publish one fresh scan batch: the live COLLIDER_RADIUS window that reach / targeting run on, and (when
+// enabled) the persistent draw-only memory. Shared by the synchronous rebuild above and the background
+// worker below so the two can never tell different stories. Caller holds exec_mutex.
+collider_publish :: proc(session: ^Session, batch: []Obb, world: uintptr, px, pz: f32) {
+  r2 := COLLIDER_RADIUS * COLLIDER_RADIUS
   clear(&session.collider_cache)
-  collider_collect_into(session, world, px, pz, &session.collider_cache)
+  for o in batch {
+    dx := o.center[0] - px
+    dz := o.center[2] - pz
+    if dx * dx + dz * dz > r2 {
+      continue // outside the live window: the memory store may keep it, reach must never see it
+    }
+    append(&session.collider_cache, o)
+  }
   session.collider_cache_center = {px, 0, pz}
   session.collider_cache_valid = true
-  return session.collider_cache[:]
+  if session.layout.collider_memory_on {
+    collider_memory_bind(session, world)
+    collider_memory_merge(session, batch, px, pz)
+  }
 }
 
 // The rebuild body shared by the synchronous path above and the background worker below: a full writable-
 // memory scan for the world pointer (each CObj holds m_pWorld at field_off), keeping OT_OBJ/OT_CTRL props
-// that carry a live OBB within COLLIDER_RADIUS. Appends to `out` (caller clears + owns it). Reads only
-// proc_info / ptr_size / layout (through obj_to_obb), so it runs identically against the live session or a
-// Session snapshot. Scratch comes from context.temp_allocator - the caller reclaims it.
-collider_collect_into :: proc(session: ^Session, world: uintptr, px, pz: f32, out: ^[dynamic]Obb) {
+// that carry a live OBB within `radius` of the player. Appends to `out` (caller clears + owns it). Reads
+// only proc_info / ptr_size / layout (through obj_to_obb), so it runs identically against the live session
+// or a Session snapshot. Scratch comes from context.temp_allocator - the caller reclaims it.
+collider_collect_into :: proc(session: ^Session, world: uintptr, px, pz: f32, radius: f32, out: ^[dynamic]Obb) {
   L := session.layout
   handle := session.proc_info.handle
   pt := engine.Value_Type.U32
@@ -1354,7 +1411,7 @@ collider_collect_into :: proc(session: ^Session, world: uintptr, px, pz: f32, ou
   regions := engine.collect_regions(handle, true)
   defer delete(regions)
   set := engine.scan_exact_parallel(handle, pt, wval, regions[:], context.temp_allocator)
-  r2 := COLLIDER_RADIUS * COLLIDER_RADIUS
+  r2 := radius * radius // +Inf in keep-the-whole-map mode, which keeps every box (nothing is > +Inf)
   seen := make(map[uintptr]bool, 2048, context.temp_allocator) // an object holds m_pWorld once, but guard anyway
   for m in set.matches {
     obj := uintptr(i64(m.addr) - L.field_off)
@@ -1394,6 +1451,7 @@ Collider_Job_Req :: struct {
   snap:    Session,
   world:   uintptr,
   px, pz:  f32,
+  radius:  f32, // collider_collect_radius at kick time (the toggles can move while the worker runs)
   gen:     int,
 }
 
@@ -1425,6 +1483,7 @@ collider_ignore_toggle :: proc(session: ^Session, ty, idx: u32) -> (added: bool,
   L.collider_ignore[L.collider_ignore_n] = {ty, idx}
   L.collider_ignore_n += 1
   collider_cache_invalidate(session)
+  collider_memory_purge_kind(session, ty, idx) // remembered boxes of this kind go too, not just live ones
   if session.attached {flyff_save_cfg(session.layout, flyff_cfg_path())}
   return true, true
 }
@@ -1476,6 +1535,68 @@ cli_collignore :: proc(session: ^Session, args: []string) {
   fmt.println("  edit: 'collignore rm <ty> <idx>'  |  'collignore clear'")
 }
 
+// collmem [on|off | map [on|off] | clear] - the persistent draw-only obstacle memory (see the section
+// after collider_scan_worker). No args toggles it, like `trail` / `hillshade`. Radar shortcut: M.
+cli_collmem :: proc(session: ^Session, args: []string) {
+  L := &session.layout
+  was_on := L.collider_memory_on
+  was_map := L.collider_memory_map
+  switch {
+  case len(args) == 0:
+    L.collider_memory_on = !L.collider_memory_on
+  case args[0] == "on":
+    L.collider_memory_on = true
+  case args[0] == "off":
+    L.collider_memory_on = false
+  case args[0] == "clear":
+    collider_memory_reset(session)
+    fmt.println("collmem: remembered obstacles cleared (they re-learn as you walk).")
+    return
+  case args[0] == "map":
+    switch {
+    case len(args) == 1:
+      L.collider_memory_map = !L.collider_memory_map
+    case args[1] == "on":
+      L.collider_memory_map = true
+    case args[1] == "off":
+      L.collider_memory_map = false
+    case:
+      fmt.eprintln("usage: collmem map [on|off]")
+      return
+    }
+    if L.collider_memory_map {
+      L.collider_memory_on = true // the whole-map mode is meaningless with the store switched off
+    }
+  case:
+    fmt.eprintln("usage: collmem [on|off | map [on|off] | clear]")
+    return
+  }
+  if !L.collider_memory_on {
+    collider_memory_reset(session)
+  }
+  if L.collider_memory_on != was_on || L.collider_memory_map != was_map {
+    collider_cache_invalidate(session) // the mode changes how WIDE a scan gathers - re-scan, don't wait
+  }
+  if session.attached {
+    flyff_save_cfg(session.layout, flyff_cfg_path())
+  }
+  fmt.println(collmem_status_line(session))
+}
+
+// One-line state of the obstacle memory, shared by `collmem` and `status full` so they can't drift.
+collmem_status_line :: proc(session: ^Session) -> string {
+  L := session.layout
+  if !L.collider_memory_on {
+    return fmt.tprintf("obstacle memory: OFF - the radar draws only the live %.0f-unit window ('collmem on').", COLLIDER_RADIUS)
+  }
+  mode := L.collider_memory_map ? fmt.tprintf("whole map, cap %d", COLLIDER_MEM_MAX) : fmt.tprintf("evict past %.0f units", math.max(COLLIDER_RADIUS, L.collider_memory_range))
+  where_s := "no map bound yet"
+  if session.collider_memory_bound {
+    where_s = session.collider_memory_map_ok ? fmt.tprintf("map %d", session.collider_memory_map) : fmt.tprintf("world 0x%X", session.collider_memory_world)
+  }
+  return fmt.tprintf("obstacle memory: ON (%s) - %d box(es) remembered on %s.", mode, len(session.collider_memory), where_s)
+}
+
 // Kick a background collider-cache rebuild if none is already in flight. Caller holds exec_mutex (the
 // radar frame / reach pass). No-op while a worker runs - the stale cache is served until it publishes.
 collider_refresh_async :: proc(session: ^Session, world: uintptr, px, pz: f32) {
@@ -1492,6 +1613,7 @@ collider_refresh_async :: proc(session: ^Session, world: uintptr, px, pz: f32) {
   req.world = world
   req.px = px
   req.pz = pz
+  req.radius = collider_collect_radius(session)
   req.gen = session.collider_job.gen
   thread.create_and_start_with_data(req, collider_scan_worker, nil, .Normal, true) // self_cleanup: fire-and-forget
 }
@@ -1504,22 +1626,223 @@ collider_scan_worker :: proc(data: rawptr) {
   defer free(req)
   defer free_all(context.temp_allocator) // reclaim the worker's scan scratch (Obbs below are value copies)
   tmp := make([dynamic]Obb) // context.allocator: survives the temp free, copied into the cache under the lock
-  collider_collect_into(&req.snap, req.world, req.px, req.pz, &tmp)
+  defer delete(tmp)
+  collider_collect_into(&req.snap, req.world, req.px, req.pz, req.radius, &tmp)
   session := req.session
   sync.mutex_lock(&session.exec_mutex)
   defer sync.mutex_unlock(&session.exec_mutex)
   session.collider_job.active = false
   if !session.attached || req.gen != session.collider_job.gen {
-    delete(tmp) // superseded - throw the batch away
+    return // superseded - throw the batch away
+  }
+  // Zoning mid-scan would publish the PREVIOUS map's props - into the reach cache as well as the draw
+  // memory - and gen only tracks attach/detach and newer requests, not a zone. The CWorld pointer changes
+  // across one, so re-read it under the lock and drop the batch if we are no longer in the world we scanned.
+  L := session.layout
+  if read_ptr_at(session.proc_info.handle, session.proc_info.base + L.world_rva, .U32) != req.world {
     return
   }
-  clear(&session.collider_cache)
-  for o in tmp {
-    append(&session.collider_cache, o)
+  collider_publish(session, tmp[:], req.world, req.px, req.pz)
+}
+
+// ---------------------------------------------------------------------------
+// Persistent obstacle memory - DRAW ONLY.
+//
+// collider_cache is a 120-unit window that is thrown away wholesale every ~16 units of walking, so props
+// popped in and out of the radar as you moved even though they never actually move. This store keeps every
+// collider we have already scanned on the current map, so the radar accumulates a picture of the ground
+// you have walked instead of re-forgetting it.
+//
+// It NEVER feeds reach / target gating / sweep validation. Those stay on collider_cache, because the store
+// can hold a box the client has since unloaded, and a stale blocker that marks ground unreachable would
+// silently make the bot skip mobs - a far worse failure than a box drawn a few seconds too long.
+//
+// Bound to one map (see collider_memory_bind): zoning drops it. Eviction is by distance from the last scan
+// centre (collider_memory_range), unless collider_memory_map is set, which keeps the whole map for as long
+// as the app runs - capped at COLLIDER_MEM_MAX boxes so it can't grow without bound.
+// ---------------------------------------------------------------------------
+
+// Identity of a remembered box: its quantised world centre + type. Position-keyed rather than CObj*-keyed
+// because the client frees and reallocates objects as it streams the map - the same tree comes back at a
+// different address but at the exact same (static) centre, so a pointer key would duplicate it forever.
+// Static props re-read bit-identical centres, so the quantisation never straddles a bucket boundary.
+Obb_Key :: struct {
+  qx, qy, qz: i32,
+  ty:         u32,
+}
+
+obb_key :: proc(o: Obb) -> Obb_Key {
+  q :: proc(v: f32) -> i32 {
+    if !(v > -1e7 && v < 1e7) {
+      return 0 // NaN / absurd centre (a half-initialised object): bucket it together, it draws as junk anyway
+    }
+    return i32(math.round(v * COLLIDER_MEM_QUANT))
   }
-  delete(tmp)
-  session.collider_cache_center = {req.px, 0, req.pz}
-  session.collider_cache_valid = true
+  return {q(o.center[0]), q(o.center[1]), q(o.center[2]), o.ty}
+}
+
+// Drop the remembered set and its map binding. Caller holds exec_mutex.
+collider_memory_reset :: proc(session: ^Session) {
+  clear(&session.collider_memory)
+  session.collider_memory_bound = false
+  session.collider_memory_map = 0
+  session.collider_memory_map_ok = false
+  session.collider_memory_world = 0
+}
+
+// The map a CWorld belongs to. CWorld::m_dwWorldID is declared immediately before m_nLandWidth (client
+// World.h), so `worldscan`'s landwidth_off pins it for free - there is no finder here and nothing for
+// `setup` to run. ok=false when the terrain offsets aren't pinned; callers fall back to the CWorld* value,
+// which also changes across a zone (it is re-resolved every poll for exactly that reason).
+world_map_id :: proc(session: ^Session, world: uintptr) -> (id: u32, ok: bool) {
+  L := session.layout
+  if world == 0 || L.landwidth_off < 4 {
+    return 0, false
+  }
+  return u32(read_i32_at(session.proc_info.handle, world + uintptr(L.landwidth_off - 4))), true
+}
+
+// Point the store at the world we are in now, resetting it first if that is a different map than the one
+// it was built from. Caller holds exec_mutex.
+collider_memory_bind :: proc(session: ^Session, world: uintptr) {
+  id, id_ok := world_map_id(session, world)
+  if session.collider_memory_bound {
+    same :=
+      id_ok == session.collider_memory_map_ok &&
+      (id_ok ? id == session.collider_memory_map : world == session.collider_memory_world)
+    if same {
+      return
+    }
+    collider_memory_reset(session)
+  }
+  session.collider_memory_bound = true
+  session.collider_memory_map = id
+  session.collider_memory_map_ok = id_ok
+  session.collider_memory_world = world
+}
+
+// Fold one fresh scan batch into the remembered set. Caller holds exec_mutex.
+//
+// Rebuilt into a scratch array rather than patched in place: there is no persistent index to keep in sync
+// with, and the whole pass is one map build plus one walk of the store, at the ~16-unit rebuild cadence.
+// Three rules, in order:
+//   1. the batch always wins - it is the freshest read of everything the client has resident
+//   2. inside COLLIDER_RADIUS of the scan centre, a remembered box the batch did NOT report is GONE (a
+//      respawn VFX that ended, a kind that just went on the ignore-list) - the scan is complete there
+//   3. past it, keep the box - absence only means the client unloaded it - subject to distance eviction
+collider_memory_merge :: proc(session: ^Session, batch: []Obb, px, pz: f32) {
+  L := session.layout
+  ev := math.max(COLLIDER_RADIUS, L.collider_memory_range) // never evict inside the live window
+  ev2 := ev * ev
+  fresh2 := COLLIDER_RADIUS * COLLIDER_RADIUS
+  keys := make(map[Obb_Key]bool, 2 * len(batch) + 64, context.temp_allocator)
+  out := make([dynamic]Obb, 0, len(batch) + len(session.collider_memory), context.temp_allocator)
+  for o in batch {
+    k := obb_key(o)
+    if k in keys {
+      continue // two props sharing a centre + type: one box is all there is to draw
+    }
+    keys[k] = true
+    append(&out, o)
+  }
+  for o in session.collider_memory {
+    if obb_key(o) in keys {
+      continue // rule 1
+    }
+    dx := o.center[0] - px
+    dz := o.center[2] - pz
+    d2 := dx * dx + dz * dz
+    if d2 <= fresh2 {
+      continue // rule 2
+    }
+    if !L.collider_memory_map && d2 > ev2 {
+      continue // rule 3
+    }
+    append(&out, o)
+  }
+  clear(&session.collider_memory)
+  if len(out) <= COLLIDER_MEM_MAX {
+    for o in out {
+      append(&session.collider_memory, o)
+    }
+    return
+  }
+  // Over the cap (only reachable in keep-the-whole-map mode): keep the CLOSEST boxes. The far ones are the
+  // least likely to be looked at again, and walking back over that ground re-learns them. Ranked through a
+  // side array because an Odin proc literal can't capture the player position the comparison needs.
+  Mem_Rank :: struct {
+    d2: f32,
+    i:  i32,
+  }
+  ranks := make([dynamic]Mem_Rank, 0, len(out), context.temp_allocator)
+  for o, i in out {
+    dx := o.center[0] - px
+    dz := o.center[2] - pz
+    append(&ranks, Mem_Rank{dx * dx + dz * dz, i32(i)})
+  }
+  slice.sort_by(ranks[:], proc(a, b: Mem_Rank) -> bool {return a.d2 < b.d2})
+  for r in ranks[:COLLIDER_MEM_MAX] {
+    append(&session.collider_memory, out[r.i])
+  }
+}
+
+// Drop every remembered box of one kind. Called when that kind goes on the ignore-list, so the radar loses
+// it everywhere at once instead of only where the next scan happens to reach. Caller holds exec_mutex.
+collider_memory_purge_kind :: proc(session: ^Session, ty, idx: u32) {
+  n := 0
+  for o in session.collider_memory {
+    if o.ty == ty && o.idx == idx {
+      continue
+    }
+    session.collider_memory[n] = o // compact in place: n <= the read index, so this never clobbers
+    n += 1
+  }
+  resize(&session.collider_memory, n)
+}
+
+// Apply the current eviction radius to the store right now, so `set collider_memory_range` to a smaller
+// value is visible immediately instead of at the next ~16-unit rebuild. Caller holds exec_mutex. No-op in
+// keep-the-whole-map mode (nothing evicts there) or before the first scan (there is no centre to measure).
+collider_memory_trim :: proc(session: ^Session) {
+  L := session.layout
+  if !L.collider_memory_on || L.collider_memory_map || !session.collider_cache_valid {
+    return
+  }
+  ev := math.max(COLLIDER_RADIUS, L.collider_memory_range)
+  ev2 := ev * ev
+  c := session.collider_cache_center
+  n := 0
+  for o in session.collider_memory {
+    dx := o.center[0] - c[0]
+    dz := o.center[2] - c[2]
+    if dx * dx + dz * dz > ev2 {
+      continue
+    }
+    session.collider_memory[n] = o // compact in place: n <= the read index
+    n += 1
+  }
+  resize(&session.collider_memory, n)
+}
+
+// The boxes to DRAW this frame: everything remembered (or, with memory off, the live cache) that overlaps
+// the visible world rect, appended to `out`. Culling here rather than at draw time keeps the per-frame copy
+// proportional to the screen instead of to the store, which can hold tens of thousands of boxes. Caller
+// holds exec_mutex - the store is republished from the background worker, so the copy has to happen here.
+collider_memory_visible :: proc(session: ^Session, cam: [2]f32, scale, fw, fh: f32, out: ^[dynamic]Obb) {
+  src := session.layout.collider_memory_on ? session.collider_memory[:] : session.collider_cache[:]
+  if scale <= 0 {
+    return
+  }
+  hw := fw / (2 * scale)
+  hh := fh / (2 * scale)
+  for o in src {
+    // slack: a yawed OBB's footprint never reaches further than ext[0]+ext[2] from its centre
+    s := o.ext[0] + o.ext[2]
+    if abs(o.center[0] - cam[0]) > hw + s || abs(o.center[2] - cam[1]) > hh + s {
+      continue
+    }
+    append(out, o)
+  }
 }
 
 Reach_Status :: enum {
@@ -2099,25 +2422,26 @@ collwatch_identify :: proc(session: ^Session, obj: uintptr, ppos: [3]f32, radius
 // props are walk-through). Returns temp-allocated cstrings for the caller to draw this frame. Read-only;
 // mirrors collwatch_identify's fields. `o` is a cached Obb (its .obj is the live CObj*, 0 if unknown).
 collider_inspect_lines :: proc(session: ^Session, o: Obb, ppos: [3]f32) -> []cstring {
-  lines := make([dynamic]cstring, 0, 5, context.temp_allocator)
+  lines := make([dynamic]cstring, 0, 6, context.temp_allocator)
   dx := o.center[0] - ppos[0]
   dz := o.center[2] - ppos[2]
   d := math.sqrt(dx * dx + dz * dz)
-  append(&lines, fmt.ctprintf("INSPECT  0x%08X", o.obj))
-  ty := u32(0xFFFFFFFF)
-  idx := u32(0)
-  if o.obj != 0 {
-    ty = u32(read_i32_at(session.proc_info.handle, o.obj + uintptr(session.layout.pos_off + 0x10)))
-    idx = u32(read_i32_at(session.proc_info.handle, o.obj + uintptr(session.layout.pos_off + 0x14)))
-  }
-  if ty == 0 || ty == 3 {
-    append(&lines, fmt.ctprintf("%s(%d) idx=%d   d=%.1f", ot_name(ty), ty, idx, d))
-  } else {
-    append(&lines, fmt.ctprintf("type ? idx=%d   d=%.1f", idx, d)) // object freed / read failed
-  }
-  model_s := "unknown"
+  // A REMEMBERED box outlives its CObj (the client streams objects out as you walk away), so identity comes
+  // off the box itself - obj_to_obb captured it - and the live object is consulted only for the model/mesh
+  // detail. `live` asks whether that CObj still holds THIS box, so a recycled address can't be printed as
+  // if it were the thing under the cursor.
+  po := uintptr(session.layout.pos_off)
+  h := session.proc_info.handle
+  live :=
+    o.obj != 0 &&
+    u32(read_i32_at(h, o.obj + po + 0x10)) == o.ty &&
+    u32(read_i32_at(h, o.obj + po + 0x14)) == o.idx
+  append(&lines, fmt.ctprintf("INSPECT  0x%08X%s", o.obj, live ? "" : "   (remembered)"))
+  append(&lines, fmt.ctprintf("%s(%d) idx=%d   d=%.1f", ot_name(o.ty), o.ty, o.idx, d))
+  model_s := "not loaded (client streamed it out)"
   mesh_s := "?"
-  if o.obj != 0 {
+  if live {
+    model_s = "unknown"
     if fname, _, _, coll, cok := probe_model_coll(session, o.obj); cok {
       model_s = fname // temp-allocated by probe_model_coll - survives the frame
       mesh_s = gmt_name(coll)
@@ -2126,8 +2450,8 @@ collider_inspect_lines :: proc(session: ^Session, o: Obb, ppos: [3]f32) -> []cst
   append(&lines, fmt.ctprintf("model: %s", model_s))
   append(&lines, fmt.ctprintf("mesh: %s   box=(%.1f,%.1f,%.1f)", mesh_s, o.ext[0], o.ext[1], o.ext[2]))
   append(&lines, fmt.ctprintf("BLOCKS REACH: %s", o.decorative ? "no (walk-through)" : "yes"))
-  if (ty == 0 || ty == 3) && collider_denied(session, ty, idx) {
-    append(&lines, fmt.ctprintf("IGNORED  (collignore rm %d %d to restore)", ty, idx))
+  if collider_denied(session, o.ty, o.idx) {
+    append(&lines, fmt.ctprintf("IGNORED  (collignore rm %d %d to restore)", o.ty, o.idx))
   } else {
     append(&lines, "click: ignore this kind (hides all like it)")
   }
