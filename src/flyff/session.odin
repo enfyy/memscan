@@ -264,6 +264,12 @@ Session :: struct {
   // happens in Odin (builder.odin) or in the editor, and a saved behaviour is a file (behaviour_io.odin).
   script: Script_Run,
 
+  // Global interrupts, RUNTIME half - derived from layout.interrupts (the persisted enabled-set) by
+  // irq_reload, which is the only thing that writes it. Holds each one's trigger and its edge latch;
+  // the latch is why this cannot just be re-derived per tick. Freed in on_close.
+  irq:    [FLYFF_MAX_INTERRUPTS]Global_Irq,
+  irq_n:  int,
+
   // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
   world_cal:     [dynamic]World_Cal_Cand,

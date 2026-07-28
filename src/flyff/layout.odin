@@ -248,6 +248,17 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
     fmt.sbprintf(&b, "%d:%d", layout.collider_ignore[i].ty, layout.collider_ignore[i].idx)
   }
   fmt.sbprintln(&b, "")
+  // Enabled global interrupts as one comma list of behaviour names (see cli_interrupt). Names cannot
+  // contain a comma or a space - bhv_name_ok - so no quoting is needed here.
+  fmt.sbprint(&b, "interrupts=")
+  L := layout // a local: Odin procedure parameters are not addressable, and the reader wants a ^
+  for i in 0 ..< int(L.interrupts_n) {
+    if i > 0 {
+      fmt.sbprint(&b, ",")
+    }
+    fmt.sbprint(&b, irq_layout_name(&L, i))
+  }
+  fmt.sbprintln(&b, "")
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
   return err == nil
 }
@@ -298,6 +309,24 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
             layout.collider_ignore[layout.collider_ignore_n] = {u32(tv), u32(iv)}
             layout.collider_ignore_n += 1
           }
+        }
+      }
+      continue
+    }
+    if key == "interrupts" {
+      // Comma list of behaviour names. Rebuilt from scratch; the runtime half (triggers + latches) is
+      // derived by irq_reload, which the caller runs once the whole file is in.
+      layout.interrupts_n = 0
+      if val != "" {
+        for p in strings.split(val, ",", context.temp_allocator) {
+          nm := strings.trim_space(p)
+          if nm == "" || !bhv_name_ok(nm) || int(layout.interrupts_n) >= FLYFF_MAX_INTERRUPTS {
+            continue
+          }
+          slot := &layout.interrupts[layout.interrupts_n]
+          slot^ = {}
+          copy(slot[:], nm[:min(len(nm), FLYFF_IRQ_NAME_MAX - 1)])
+          layout.interrupts_n += 1
         }
       }
       continue

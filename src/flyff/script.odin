@@ -164,6 +164,9 @@ Script_Watcher :: struct {
   src:      string, // owned
   fires:    int, // how many times it has fired this run (shown by `script`)
   entry:    int, // first step of this watcher's REGION (see Script_Run.main_len). -1 = nothing to run.
+  global:   string, // owned; "" for a watcher the chart declared with `on`. Non-empty names the
+  // GLOBAL interrupt this was hoisted from, which is how the edge latch is handed back to the
+  // Session-level watcher when the run ends - see the two-sites note in interrupt.odin.
 }
 
 // The main program's position, saved while an interrupt region runs so it can be resumed exactly.
@@ -238,6 +241,7 @@ script_run_free :: proc(run: ^Script_Run) {
   script_steps_free(&run.steps)
   for &w in run.watchers {
     delete(w.src)
+    delete(w.global)
     delete(w.action.strs[0])
     delete(w.action.strs[1])
     delete(w.cond.strs[0])
@@ -349,8 +353,12 @@ script_write_params :: proc(b: ^strings.Builder, spec: []Param_Spec, nums: [4]f6
       ni += 2
     case .Str, .Names:
       strings.write_string(b, " ")
-      // Re-quote anything with whitespace or a comma so the round-trip re-parses identically.
-      if strings.contains_any(strs[si], " \t,") {
+      // Quote anything with whitespace or a comma so the round-trip re-parses identically - and an
+      // EMPTY string too, which is the case that actually bit. Written bare it is not a short
+      // argument, it is no argument at all: `var  ` re-reads as `var` and the parser rejects the
+      // line for a missing required 'name'. That made every chart the node editor saved with a
+      // string field still blank unloadable, which is exactly the state a half-authored chart is in.
+      if strs[si] == "" || strings.contains_any(strs[si], " \t,") {
         fmt.sbprintf(b, "'%s'", strs[si])
       } else {
         strings.write_string(b, strs[si])

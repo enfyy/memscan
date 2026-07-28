@@ -358,6 +358,12 @@ Collider_Kind :: struct {
 
 FLYFF_MAX_COLLIDER_IGNORE :: 32 // hand-curated list; fixed size so Flyff_Layout copies cleanly into snapshots
 
+// Global interrupts. Capped well under SCRIPT_MAX_WATCHERS (16) because a running chart's own `on`
+// lines are hoisted into the SAME watcher array - leaving headroom is what stops enabling interrupts
+// from silently dropping a chart's own watchers.
+FLYFF_MAX_INTERRUPTS :: 8
+FLYFF_IRQ_NAME_MAX :: 64 // matches bhv_name_ok's length limit
+
 Flyff_Layout :: struct {
   world_rva:         uintptr,
   player_rva:        uintptr,
@@ -461,6 +467,30 @@ Flyff_Layout :: struct {
   // into the collider worker's Session snapshot without aliasing. collider_ignore_n = live count.
   collider_ignore:   [FLYFF_MAX_COLLIDER_IGNORE]Collider_Kind,
   collider_ignore_n: i32,
+
+  // Enabled GLOBAL interrupts, by behaviour name (see cli_interrupt / irq_reload in script_run.odin).
+  // These are armed whatever the machine is doing - idle, farming under `auto`, or running a chart -
+  // which is the whole point: an escape hatch you have to remember to paste into every chart is not
+  // an escape hatch. Fixed NUL-padded name buffers rather than strings for the same reason
+  // collider_ignore is a fixed array: Flyff_Layout is copied BY VALUE into worker snapshots, so it
+  // has to stay POD - a heap string here would be aliased across threads.
+  interrupts:        [FLYFF_MAX_INTERRUPTS][FLYFF_IRQ_NAME_MAX]u8,
+  interrupts_n:      i32,
+}
+
+// Read one enabled-interrupt name back out of its NUL-padded buffer. BORROWED - it points into the
+// layout, so clone it if it has to outlive the caller.
+irq_layout_name :: proc(L: ^Flyff_Layout, i: int) -> string {
+  if i < 0 || i >= int(L.interrupts_n) {
+    return ""
+  }
+  buf := L.interrupts[i][:]
+  for b, k in buf {
+    if b == 0 {
+      return string(buf[:k])
+    }
+  }
+  return string(buf)
 }
 
 flyff_layout_default :: proc() -> Flyff_Layout {

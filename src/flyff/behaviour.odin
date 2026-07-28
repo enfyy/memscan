@@ -463,10 +463,13 @@ behaviour_sense_pass :: proc(ctx: ^Behaviour_Context) {
 // of auto_tick. Inert unless sensing is engaged, so an idle session pays nothing (and nothing
 // starts the watcher thread just for this).
 behaviour_tick :: proc(session: ^Session) {
-  // Engaged by explicit sensing OR by a running script. Deliberately NOT gated on `attached`: a
-  // script built from pure-VM blocks (wait/repeat/if/var) is meant to run with no game at all, which
-  // is also how the whole walker gets tested headlessly. The sense pass does its own attach check.
-  if !session.bh_sense_on && !session.script.active {
+  // Engaged by explicit sensing, by a running script, OR by an armed global interrupt. That third one
+  // matters: a peace-out escape has to be watching while you farm under `auto` with no chart running
+  // and `sense off`, which is the state most sessions are actually in.
+  // Deliberately NOT gated on `attached`: a script built from pure-VM blocks (wait/repeat/if/var) is
+  // meant to run with no game at all, which is also how the whole walker gets tested headlessly. The
+  // sense pass does its own attach check.
+  if !session.bh_sense_on && !session.script.active && !irq_any_armed(session) {
     return
   }
   // Point temp at the machine's own arena for this whole tick, and reset it here. Everything below -
@@ -480,6 +483,11 @@ behaviour_tick :: proc(session: ^Session) {
     board   = &session.bh_board,
   }
   behaviour_sense_pass(&ctx)
+  // Global interrupts, AFTER the senses (so a trigger reads this tick's board, not last tick's) and
+  // BEFORE the state machine (so an interrupt that fires takes effect on the tick it fired rather
+  // than after one more step of whatever was happening). It is a no-op while a chart is running -
+  // that run's hoisted watchers are the evaluator then. See interrupt.odin.
+  irq_tick(&ctx)
   // First engagement: run the initial state's Enter, once. The per-tick rebuild below constructs the
   // machine literally instead of via state_machine_create precisely so Enter does NOT re-run every
   // tick - but that means nothing would ever enter the STARTING state (a state returning itself is

@@ -204,6 +204,8 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_sense(s, args)
   case "script", "sc":
     cli_script(s, args)
+  case "interrupt", "irq":
+    cli_interrupt(s, args)
   case "key":
     cli_key(s, args)
   case "test":
@@ -268,6 +270,14 @@ on_attach :: proc(es: ^engine.Session) {
     fmt.printfln("layout: loaded %s", cfg)
   } else {
     fmt.println("layout: built-in defaults (run 'setup <name>' if the game was patched).")
+  }
+  // Derive the global-interrupt runtime half from the names the cfg just restored: read each file's
+  // trigger and arm it. Has to happen after the whole cfg is in, and after layout defaults, because
+  // it is a function of layout.interrupts.
+  irq_reload(s)
+  if s.irq_n > 0 {
+    fmt.printfln("interrupt: %d armed - 'interrupt list'.", s.irq_n)
+    engine.ensure_hotkey_thread(&s.eng) // they are evaluated on the watcher tick
   }
 
   // Runtime-toggle mirrors: the session bools stay authoritative at runtime; the layout copies exist
@@ -349,6 +359,7 @@ on_close :: proc(es: ^engine.Session) {
     remote_free_dplay_page(s)
   }
   script_run_free(&s.script) // owned steps + watchers
+  irq_free(s) // global interrupts: each holds an owned trigger + name
   behaviour_scratch_free(s)
   fence_destroy(&s.fence)
   delete(s.sweep_path)

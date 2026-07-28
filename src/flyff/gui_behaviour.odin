@@ -27,17 +27,20 @@ TILE_H :: f32(76)
 // One row in the browser. Both kinds of behaviour appear here: the ones compiled into the exe and the
 // ones saved as files, because "which behaviours exist" is a single question with a single answer.
 Gui_Bhv_Row :: struct {
-  name:     string, // owned
-  blurb:    string, // owned ("" for a saved chart - a file carries no description)
-  builtin:  bool, // defined in Odin: read-only, duplicate it to edit
-  shadowed: bool, // a saved file of the same name wins over this built-in
-  test:     bool, // runs with nothing attached (the verification set)
+  name:      string, // owned
+  blurb:     string, // owned ("" for a saved chart - a file carries no description)
+  builtin:   bool, // defined in Odin: read-only, duplicate it to edit
+  shadowed:  bool, // a saved file of the same name wins over this built-in
+  test:      bool, // runs with nothing attached (the verification set)
+  interrupt: bool, // `kind interrupt`: armed, not run - it belongs in the other section
+  trigger:   string, // owned; the interrupt's trigger as one line ("" for a chart)
 }
 
 gui_free_bhv_rows :: proc(ps: ^Panel_State) {
   for r in ps.browser_rows {
     delete(r.name)
     delete(r.blurb)
+    delete(r.trigger)
   }
   clear(&ps.browser_rows)
 }
@@ -67,7 +70,26 @@ gui_scan_behaviours :: proc(ps: ^Panel_State) {
     )
   }
   for s in saved {
-    append(&ps.browser_rows, Gui_Bhv_Row{name = strings.clone(s), blurb = strings.clone("")})
+    row := Gui_Bhv_Row {
+      name  = strings.clone(s),
+      blurb = strings.clone(""),
+    }
+    // Read the header to find out which section it belongs in. This is a file parse per saved chart
+    // per scan, which is why the scan is throttled to BROWSER_SCAN_INTERVAL - the same reasoning as
+    // the directory listing itself (see the note at the top of this file).
+    if doc, ok := bhv_open(s); ok {
+      row.interrupt = doc.kind == .Interrupt
+      if row.interrupt {
+        b := strings.builder_make(context.temp_allocator)
+        script_write_event(&b, doc.trigger)
+        row.trigger = strings.clone(strings.to_string(b))
+      }
+      behaviour_doc_free(&doc)
+    }
+    if row.trigger == "" {
+      row.trigger = strings.clone("")
+    }
+    append(&ps.browser_rows, row)
   }
   ps.browser_scan_at = rl.GetTime()
   ps.browser_rescan = false
@@ -156,7 +178,9 @@ gui_behaviour_browser :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
 
 @(private = "file")
 gui_browser_window :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
-  if !gui_begin_dialog("Behaviours", 620, 520, &ps.browser_open) {
+  // Taller than the tile grid needs: the interrupt checklist lives under it in the same scroll region,
+  // and a section you have to scroll to find is a section nobody knows exists.
+  if !gui_begin_dialog("Behaviours", 640, 660, &ps.browser_open) {
     imgui.End()
     return
   }
@@ -178,7 +202,15 @@ gui_browser_window :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
     avail := imgui.GetContentRegionAvail().x
     per_row := max(1, int(avail / px(TILE_W + 8)))
     shown := 0
+    // The New tile is first and is never filtered out: it is the way IN to the editor, and hiding it
+    // behind a search that happens to match nothing is the moment you most want to make one.
+    gui_bhv_new_tile(ps)
+    shown += 1
+    matched := 0 // grid position vs "did the filter find anything" - the New tile counts for one, not the other
     for &r in ps.browser_rows {
+      if r.interrupt {
+        continue // its own section below - it is armed, not run, so a Run tile would be a lie
+      }
       if filter != "" && !strings.contains(strings.to_lower(r.name, context.temp_allocator), filter) {
         continue
       }
@@ -186,13 +218,15 @@ gui_browser_window :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
         imgui.SameLine(0, px(8))
       }
       shown += 1
+      matched += 1
       gui_bhv_tile(ps, f, &r)
     }
-    if shown == 0 {
+    if matched == 0 {
       imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
-      imgui.TextUnformatted(filter == "" ? "No behaviours." : "Nothing matches that.")
+      imgui.TextUnformatted(filter == "" ? "No behaviours yet - the + tile starts one." : "Nothing matches that.")
       imgui.PopStyleColor(1)
     }
+    gui_bhv_irq_section(ps, f, filter)
   }
   imgui.EndChild()
 
@@ -216,6 +250,135 @@ gui_fit_right :: proc(s: string, avail: f32) -> cstring {
     }
   }
   return "..."
+}
+
+// Interrupts, as a checklist rather than a tile grid. A tile invites a click that runs the thing, and
+// running an interrupt is not what you want from it - you want it ARMED, which is a state, and a
+// checkbox is the control for a state. Each row is one `interrupt on|off` away from the console.
+@(private = "file")
+gui_bhv_irq_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string) {
+  any := false
+  for r in ps.browser_rows {
+    if r.interrupt {
+      any = true
+      break
+    }
+  }
+  if !any && f.irq_n == 0 {
+    return
+  }
+  imgui.Dummy({0, px(8)})
+  imgui.SeparatorText("Interrupts - armed, not run")
+  imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
+  imgui.TextUnformatted("An armed interrupt watches its trigger whatever else is happening, and takes over when it fires.")
+  imgui.PopStyleColor(1)
+
+  for &r in ps.browser_rows {
+    if !r.interrupt {
+      continue
+    }
+    if filter != "" && !strings.contains(strings.to_lower(r.name, context.temp_allocator), filter) {
+      continue
+    }
+    on := false
+    bad := ""
+    for i in 0 ..< f.irq_n {
+      if f.irq[i].name == r.name {
+        on = true
+        if !f.irq[i].ok {
+          bad = f.irq[i].why
+        }
+        break
+      }
+    }
+    imgui.PushID(fmt.ctprintf("irq%s", r.name))
+    want := on
+    if imgui.Checkbox(fmt.ctprintf("%s", r.name), &want) {
+      panel_enqueue(ps, fmt.tprintf("interrupt %s %s", want ? "on" : "off", r.name))
+    }
+    // The WHOLE row is the right-click target, not just whichever half happens to be the last item.
+    // BeginPopupContextItem would bind to the trigger text alone, so right-clicking the name - which
+    // is the obvious thing to aim at - would do nothing.
+    row_hovered := imgui.IsItemHovered()
+    imgui.SameLine(0, px(10))
+    imgui.PushStyleColorImVec4(.Text, bad != "" ? COL_BAD : (on ? COL_WARN : COL_TEXT_DIM))
+    imgui.TextUnformatted(fmt.ctprintf("%s", bad != "" ? bad : fmt.tprintf("fires when %s", r.trigger)))
+    imgui.PopStyleColor(1)
+    row_hovered ||= imgui.IsItemHovered()
+    if row_hovered && imgui.IsMouseClicked(.Right) {
+      imgui.OpenPopup("##irqctx")
+    }
+    if imgui.BeginPopup("##irqctx") {
+      if imgui.Selectable("Open in editor") {
+        name := strings.clone(r.name, context.temp_allocator)
+        ps.browser_open = false
+        gui_editor_open(ps, name)
+      }
+      if imgui.Selectable("Test it now (ignores the trigger)") {
+        panel_enqueue(ps, fmt.tprintf("interrupt test %s", r.name))
+        ps.browser_open = false
+      }
+      if imgui.Selectable("Delete") {
+        panel_enqueue(ps, fmt.tprintf("interrupt off %s", r.name))
+        panel_enqueue(ps, fmt.tprintf("script delete %s", r.name))
+        ps.browser_rescan = true
+      }
+      imgui.EndPopup()
+    }
+    imgui.PopID()
+  }
+
+  // An enabled name whose file is gone still occupies a slot and still says so in `status`, so it has
+  // to be visible here too - otherwise the only way to clear it is the console.
+  for i in 0 ..< f.irq_n {
+    seen := false
+    for r in ps.browser_rows {
+      if r.name == f.irq[i].name {
+        seen = true
+        break
+      }
+    }
+    if seen {
+      continue
+    }
+    imgui.PushID(fmt.ctprintf("irqm%s", f.irq[i].name))
+    want := true
+    if imgui.Checkbox(fmt.ctprintf("%s", f.irq[i].name), &want) {
+      panel_enqueue(ps, fmt.tprintf("interrupt off %s", f.irq[i].name))
+    }
+    imgui.SameLine(0, px(10))
+    imgui.PushStyleColorImVec4(.Text, COL_BAD)
+    imgui.TextUnformatted("its file is gone - untick to forget it")
+    imgui.PopStyleColor(1)
+    imgui.PopID()
+  }
+}
+
+// The first tile: start a blank chart in the node editor. Drawn as an outline rather than a filled
+// button so it reads as "the empty slot", not as another behaviour that happens to be called New.
+@(private = "file")
+gui_bhv_new_tile :: proc(ps: ^Panel_State) {
+  imgui.PushID("##newtile")
+  defer imgui.PopID()
+  imgui.PushStyleColorImVec4(.Button, tint(COL_ACCENT, 0.10))
+  imgui.PushStyleColorImVec4(.ButtonHovered, tint(COL_ACCENT, 0.22))
+  imgui.PushStyleColorImVec4(.ButtonActive, tint(COL_ACCENT, 0.32))
+  imgui.PushStyleColorImVec4(.Border, tint(COL_ACCENT, 0.55))
+  clicked := imgui.Button("##new", {px(TILE_W), px(TILE_H)})
+  imgui.PopStyleColor(4)
+
+  rmin := imgui.GetItemRectMin()
+  dl := imgui.GetWindowDrawList()
+  gui_draw_icon(dl, rmin.x + px(20), rmin.y + px(22), ICON_ADD, COL_ACCENT)
+  imgui.DrawList_AddText(dl, {rmin.x + px(38), rmin.y + px(13)}, u32_of(COL_TEXT), "New chart")
+  imgui.DrawList_AddText(dl, {rmin.x + px(38), rmin.y + px(34)}, u32_of(COL_TEXT_DIM), "open the node editor")
+  if imgui.IsItemHovered() {
+    imgui.SetTooltip("Draw a behaviour as a node graph. It is saved to a .bhv file when you hit Save.")
+  }
+  if clicked {
+    ps.browser_open = false
+    gui_editor_new(ps)
+  }
 }
 
 // One chart, as a tile. Left-click runs it (the thing you want 95% of the time); right-click is the
@@ -297,6 +460,14 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
       if imgui.Selectable("Stop") {
         panel_enqueue(ps, "script stop")
       }
+    }
+    // Opening a built-in is allowed and is how you make one editable: the editor loads the built
+    // program and saving it writes a file that shadows the Odin original (which the editor says out
+    // loud). Deleting that file gets the original back - the same deal `script export` documents.
+    if imgui.Selectable("Open in editor") {
+      name := strings.clone(r.name, context.temp_allocator)
+      ps.browser_open = false
+      gui_editor_open(ps, name)
     }
     imgui.Separator()
     if imgui.Selectable("Duplicate...") {

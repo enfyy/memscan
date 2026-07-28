@@ -293,10 +293,12 @@ killed :: proc(n: int) -> Script_Event {
   return c
 }
 
+// NB the slot: nums and strs are counted separately, so `<name> <n>` is strs[0] + nums[0]. See the
+// param_slot note in script_blocks.odin - this used to say nums[1] and the number was lost on save.
 killed_of :: proc(name: string, n: int) -> Script_Event {
   c := ev(.Kills_Of)
   c.strs[0] = name
-  c.nums[1] = f64(n)
+  c.nums[0] = f64(n)
   return c
 }
 
@@ -323,14 +325,14 @@ player_within :: proc(radius: f32) -> Script_Event {
 player_named_within :: proc(name: string, radius: f32) -> Script_Event {
   c := ev(.Player_Named_Near)
   c.strs[0] = name
-  c.nums[1] = f64(radius)
+  c.nums[0] = f64(radius)
   return c
 }
 
 mob_within :: proc(names: string, radius: f32 = 0) -> Script_Event {
   c := ev(.Mob_In_Range)
   c.strs[0] = names
-  c.nums[1] = f64(radius)
+  c.nums[0] = f64(radius)
   return c
 }
 

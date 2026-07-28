@@ -69,6 +69,9 @@ ICON_COPY :: rune(0xe14d) // content_copy - duplicate a chart
 ICON_EDIT :: rune(0xe3c9) // edit         - rename
 ICON_FILE :: rune(0xe873) // description  - a saved chart
 ICON_CODE :: rune(0xe86f) // code         - a chart defined in Odin (read-only)
+// node editor (gui_nodes.odin)
+ICON_ADD :: rune(0xe145) // add          - the add-node palette / the browser's New tile
+ICON_SAVE :: rune(0xe161) // save         - write the edited chart to its .bhv
 
 // The single source of truth for what gets baked: icon_ranges is DERIVED from this at init, so adding an
 // icon above is the entire change - a glyph can never be referenced but missing from the atlas. gui_init
@@ -96,6 +99,8 @@ ICON_ALL := [?]rune {
   ICON_EDIT,
   ICON_FILE,
   ICON_CODE,
+  ICON_ADD,
+  ICON_SAVE,
 }
 
 // Glyph ranges for the merge: inclusive pairs, zero-terminated (one degenerate pair per icon). MUST
@@ -150,6 +155,12 @@ px :: #force_inline proc(v: f32) -> f32 {
   return math.round(v * gui_scale)
 }
 
+// The raw factor behind px(), for the one place that needs it UNROUNDED: the node canvas composes it
+// with its own zoom, and rounding the two separately makes a node's box and its text drift apart.
+gui_ui_scale :: #force_inline proc() -> f32 {
+  return gui_scale
+}
+
 PENYA_CAP :: i64(2_147_483_647) // max(i32) - the in-game penya ceiling; farmed penya past it is LOST
 PENYA_WARN :: PENYA_CAP - 25_000_000 // start screaming 25M short of it
 
@@ -194,6 +205,35 @@ Gui_Frame :: struct {
   script_len:    int, // main program length (regions are not part of the count)
   script_line:   string,
   script_node:   Node_Id, // the current step's identity - what the editor highlights
+
+  // Block availability, evaluated under the lock because def.avail reads the session. The node
+  // editor's palette and inspector gate on this - same source as `script blocks`, so a block the
+  // catalog lists as [--] is the same block the palette draws as unusable. The `why` strings are
+  // rodata literals from the avail procs, so holding them past the frame is safe.
+  // Enabled global interrupts (interrupt.odin), snapshotted so the browser's checkboxes and the
+  // editor's arm/disarm button can read "is this one armed" without touching the session.
+  irq:           [FLYFF_MAX_INTERRUPTS]Gui_Irq_Row,
+  irq_n:         int,
+
+  // Where the character is standing, for the node editor's "Here" button on a Coord argument -
+  // typing a waypoint by hand is exactly the thing you have the game open to avoid.
+  player_have:   bool,
+  player_pos:    [3]f32,
+
+  act_ok:        [Script_Action_Kind]bool,
+  act_why:       [Script_Action_Kind]string,
+  ev_ok:         [Script_Event_Kind]bool,
+  ev_why:        [Script_Event_Kind]string,
+}
+
+// One armed global interrupt, as the draw phase sees it. Strings are temp-allocated clones taken
+// under the lock: the watcher owns the real ones and irq_reload frees them.
+Gui_Irq_Row :: struct {
+  name:    string,
+  trigger: string,
+  fires:   int,
+  ok:      bool,
+  why:     string,
 }
 
 // Radar-local view state the toolbar drives directly (these are cli_radar stack locals, not session
@@ -237,6 +277,9 @@ Panel_State :: struct {
   rename_buf:       [64]u8,
   dup_from:         string, // heap-owned; "" = the duplicate prompt is closed
   dup_buf:          [64]u8,
+
+  // node editor (gui_nodes.odin) - owns a Behaviour_Doc while it is open
+  ed:               Gui_Editor,
 }
 
 // One row in the attach dialog. Owned copies: find_process_id_by_name hands back a window_title that is
@@ -616,6 +659,12 @@ gui_frame :: proc(session: ^Session, ps: ^Panel_State, f: ^Gui_Frame, view: Gui_
     gui_setup_dialog(session, ps, f)
     return
   }
+  // The editor is checked BEFORE the browser: it is opened from the browser and covers it, and the
+  // browser's throttled directory scan has no business running underneath a full-screen canvas.
+  if ps.ed.open {
+    gui_node_editor(ps, f)
+    return
+  }
   if ps.browser_open {
     gui_behaviour_browser(ps, f)
     return
@@ -633,7 +682,7 @@ gui_frame :: proc(session: ^Session, ps: ^Panel_State, f: ^Gui_Frame, view: Gui_
 // Is a dialog swallowing input this frame? cli_radar ORs this with io.WantCaptureMouse to gate map
 // input, so a click that lands NEXT TO (not on) an open dialog can't also target a mob behind it.
 gui_modal_up :: proc(ps: ^Panel_State, attached: bool) -> bool {
-  return !attached || ps.setup_open || ps.browser_open
+  return !attached || ps.setup_open || ps.browser_open || ps.ed.open
 }
 
 // ===========================================================================
@@ -1138,6 +1187,7 @@ panel_state_free :: proc(ps: ^Panel_State) {
   delete(ps.browser_rows)
   delete(ps.rename_from)
   delete(ps.dup_from)
+  gui_editor_free(&ps.ed)
 }
 
 // Format an integer with thousands separators (e.g. 1240 -> "1,240"), temp-allocated.

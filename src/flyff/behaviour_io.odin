@@ -41,17 +41,29 @@ BHV_EXT :: ".bhv"
 // Spelled as bytes, not as the character: Odin's lexer rejects a literal BOM in a source file.
 BHV_BOM :: "\xef\xbb\xbf"
 
+// A chart is something you RUN; an interrupt is something that is armed and runs itself when its
+// trigger fires. The distinction is one line in the file rather than a separate format, because the
+// body is identical - an interrupt IS a chart, it just has a condition attached and no start button.
+Behaviour_Kind :: enum {
+  Chart,
+  Interrupt,
+}
+
 // An authored behaviour. This is what an editor edits and what a file holds; `steps` is the same
 // []Script_Step the VM walks, so handing one to script_begin needs no conversion.
 Behaviour_Doc :: struct {
-  name:  string, // owned; the file's basename
-  mode:  Script_Mode,
-  entry: Node_Id, // node the run starts at. 0 = "the first step", which is what a linear program wants.
-  steps: [dynamic]Script_Step,
+  name:    string, // owned; the file's basename
+  kind:    Behaviour_Kind,
+  trigger: Script_Event, // .Interrupt only - the condition that fires it. Owned strings.
+  mode:    Script_Mode,
+  entry:   Node_Id, // node the run starts at. 0 = "the first step", which is what a linear program wants.
+  steps:   [dynamic]Script_Step,
 }
 
 behaviour_doc_free :: proc(doc: ^Behaviour_Doc) {
   script_steps_free(&doc.steps)
+  delete(doc.trigger.strs[0])
+  delete(doc.trigger.strs[1])
   delete(doc.name)
   doc^ = {}
 }
@@ -121,6 +133,14 @@ bhv_op_from_name :: proc(s: string) -> (op: Script_Op, ok: bool) {
 
 bhv_serialize :: proc(doc: ^Behaviour_Doc, b: ^strings.Builder) {
   fmt.sbprintln(b, "# memscan behaviour")
+  // Written only for an interrupt, so a plain chart's file is byte-identical to what earlier builds
+  // produced and an older memscan can still read it. Absent `kind` means Chart.
+  if doc.kind == .Interrupt {
+    fmt.sbprintln(b, "kind interrupt")
+    strings.write_string(b, "trigger ")
+    script_write_event(b, doc.trigger)
+    fmt.sbprintln(b)
+  }
   fmt.sbprintfln(b, "mode %s", doc.mode == .Loop ? "loop" : "once")
   fmt.sbprintfln(b, "entry %d", u32(doc.entry))
   for step in doc.steps {
@@ -313,6 +333,28 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
       continue
     }
     switch toks[0] {
+    case "kind":
+      if len(toks) < 2 {
+        report(&problems, lineno, "kind: expected 'chart' or 'interrupt'")
+        continue
+      }
+      switch toks[1] {
+      case "chart":
+        doc.kind = .Chart
+      case "interrupt":
+        doc.kind = .Interrupt
+      case:
+        report(&problems, lineno, fmt.tprintf("kind: expected 'chart' or 'interrupt', got '%s'", toks[1]))
+      }
+
+    case "trigger":
+      ev, eok, eerr := bhv_parse_event(toks[1:])
+      if !eok {
+        report(&problems, lineno, fmt.tprintf("trigger: %s", eerr))
+        continue
+      }
+      doc.trigger = ev
+
     case "mode":
       if len(toks) < 2 {
         report(&problems, lineno, "mode: expected 'once' or 'loop'")
@@ -464,6 +506,13 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
     s.src = step_label(s)
   }
 
+  // An interrupt with no trigger would be armed on nothing and could never fire - it is not a chart
+  // with a missing field, it is a file that means nothing. Rejected here rather than at arm time so
+  // the complaint lands next to the file that caused it.
+  if problems == 0 && doc.kind == .Interrupt && doc.trigger.kind == .None {
+    fmt.eprintln("  kind is 'interrupt' but there is no 'trigger <event>' line - it could never fire")
+    problems += 1
+  }
   if problems == 0 {
     if rok, dangling := script_resolve_ids(doc.steps[:]); !rok {
       fmt.eprintfln("  an edge points at node %d, which no node in this file declares", u32(dangling))

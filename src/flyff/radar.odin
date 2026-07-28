@@ -2021,6 +2021,8 @@ cli_radar :: proc(session: ^Session, args: []string) {
       attack_range  = L.attack_range,
       fence_active  = session.fence.active,
       fence_shapes  = len(session.fence.shapes),
+      player_have   = live && player != 0,
+      player_pos    = ppos,
     }
     // Behaviour run state. The strings are CLONED into temp: the watcher thread frees and replaces
     // run.name / run.last_line whenever the program moves on, and the draw phase runs unlocked.
@@ -2035,6 +2037,35 @@ cli_radar :: proc(session: ^Session, args: []string) {
       gf.script_line = strings.clone(run.last_line, context.temp_allocator)
       if run.pc >= 0 && run.pc < len(run.steps) {
         gf.script_node = run.steps[run.pc].id
+      }
+    }
+    // Armed global interrupts. Cloned into temp for the same reason script_name is: irq_reload frees
+    // and replaces these whenever the enabled set changes, and the draw runs unlocked.
+    gf.irq_n = session.irq_n
+    for i in 0 ..< session.irq_n {
+      g := &session.irq[i]
+      gf.irq[i] = Gui_Irq_Row {
+        name    = strings.clone(g.name, context.temp_allocator),
+        trigger = strings.clone(irq_trigger_text(g^, context.temp_allocator), context.temp_allocator),
+        fires   = g.fires,
+        ok      = g.ok,
+        why     = strings.clone(g.why, context.temp_allocator),
+      }
+    }
+    // Block availability for the node editor's palette + inspector. Evaluated HERE because every
+    // def.avail reads the session (attached? which offsets are pinned?), and the draw phase may not.
+    // Cheap - a few dozen field comparisons - and it keeps the palette's [--] marks in lockstep with
+    // what `script blocks` prints and what `script run` refuses to start.
+    for def in ACTIONS {
+      gf.act_ok[def.kind] = true
+      if def.avail != nil {
+        gf.act_ok[def.kind], gf.act_why[def.kind] = def.avail(session)
+      }
+    }
+    for def in EVENTS {
+      gf.ev_ok[def.kind] = true
+      if def.avail != nil {
+        gf.ev_ok[def.kind], gf.ev_why[def.kind] = def.avail(session)
       }
     }
     jump_at_s := session.jump_fired_at // player-dot hop animation (set by cli_jump / look-alive)

@@ -49,6 +49,38 @@ Param_Spec :: struct {
   def:      f64, // default when optional and omitted (numeric kinds only)
 }
 
+// WHICH SLOT A PARAMETER LIVES IN. The two storage classes are counted SEPARATELY: the n'th numeric
+// parameter is nums[n] and the m'th string parameter is strs[m], regardless of how they interleave.
+// So `kills_of <name> <n>` is strs[0] + nums[0], NOT strs[0] + nums[1].
+//
+// Every generic consumer already derives this - bhv_parse_params, script_write_params, and the node
+// editor's inspector all walk the spec with two cursors - but a block's own start/fired proc indexes
+// the payload BY HAND, and that is where the two can silently disagree. They did: kills_of and
+// player_named_near read nums[1] while the file format wrote nums[0], so a saved .bhv came back with
+// the number zeroed, and mob_within's builder stored a radius the block never read. Nothing crashes
+// and `script show` looks right, because the renderer and the reader agreed with each other.
+//
+// param_slot is the one derivation; script_selftest_payload proves every row round-trips through it.
+// If you hand-index a payload in a block proc, index it the way this says.
+param_slot :: proc(spec: []Param_Spec, i: int) -> int {
+  ni, si := 0, 0
+  for p, k in spec {
+    is_str := p.kind == .Str || p.kind == .Names
+    if k == i {
+      return is_str ? si : ni
+    }
+    switch p.kind {
+    case .Num, .Duration, .Percent:
+      ni += 1
+    case .Coord:
+      ni += 2
+    case .Str, .Names:
+      si += 1
+    }
+  }
+  return 0
+}
+
 // A parsed block instance. Deliberately a flat fixed payload rather than a per-kind union: it
 // keeps the table generic, makes the whole step POD (no ownership beyond `strs`), and gives a node
 // editor a fixed port layout to bind to.
@@ -866,7 +898,7 @@ ev_kills_of_arm :: proc(ctx: ^Behaviour_Context, ev: Script_Event, st: ^Event_St
 }
 
 ev_kills_of :: proc(ctx: ^Behaviour_Context, ev: Script_Event, st: ^Event_State) -> bool {
-  return i64(script_kills_of(&ctx.session.script, ev.strs[0])) - st.base_i64 >= i64(ev.nums[1])
+  return i64(script_kills_of(&ctx.session.script, ev.strs[0])) - st.base_i64 >= i64(ev.nums[0])
 }
 
 ev_elapsed :: proc(ctx: ^Behaviour_Context, ev: Script_Event, st: ^Event_State) -> bool {
@@ -1004,7 +1036,7 @@ ev_player_named_near :: proc(ctx: ^Behaviour_Context, ev: Script_Event, st: ^Eve
   }
   want := ev.strs[0]
   hit := false
-  for b in script_gather_movers(ctx, f32(ev.nums[1]), nil) {
+  for b in script_gather_movers(ctx, f32(ev.nums[0]), nil) {
     if b.kind != .Player {
       continue
     }

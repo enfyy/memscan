@@ -74,7 +74,20 @@ script_exit_current :: proc(ctx: ^Behaviour_Context) {
 // path without any of them having to remember.
 script_teardown :: proc(ctx: ^Behaviour_Context) {
   script_exit_current(ctx)
-  ctx.session.script.active = false
+  // Latch handover, half two: give the edge state back to the Session-level watchers before this run
+  // stops being the evaluator. Without it, a trigger that is still true when the chart ends would look
+  // like a fresh rising edge to irq_tick a moment later and fire again. See interrupt.odin.
+  run := &ctx.session.script
+  for &w in run.watchers {
+    if w.global == "" {
+      continue
+    }
+    if g := irq_find(ctx.session, w.global); g != nil {
+      g.ev_state.latched = w.ev_state.latched
+      g.fires += w.fires
+    }
+  }
+  run.active = false
 }
 
 // --- interrupts ------------------------------------------------------------------------------------
@@ -496,7 +509,14 @@ script_check_avail :: proc(session: ^Session, steps: []Script_Step) -> [dynamic]
 // <entry> is the node to start at, BY IDENTITY - 0 means "the first step", which is what a program
 // built by builder.odin wants (it emits in execution order). A saved graph names its start node
 // instead, because on a canvas the topmost array slot is not necessarily where control begins.
-script_begin :: proc(session: ^Session, name: string, steps: [dynamic]Script_Step, mode: Script_Mode, entry: Node_Id = 0) {
+script_begin :: proc(
+  session: ^Session,
+  name: string,
+  steps: [dynamic]Script_Step,
+  mode: Script_Mode,
+  entry: Node_Id = 0,
+  kind: Behaviour_Kind = .Chart,
+) {
   script_run_free(&session.script)
   run := &session.script
   run.steps = steps
@@ -505,6 +525,12 @@ script_begin :: proc(session: ^Session, name: string, steps: [dynamic]Script_Ste
   run.main_len = len(run.steps)
   run.watchers = make([dynamic]Script_Watcher)
   script_build_irq_regions(run)
+  // Then the GLOBAL interrupts, after the chart's own `on` lines so the chart's win a tie (first
+  // match wins). Skipped when the thing being run IS an interrupt: you do not want your escape
+  // interrupted by the same escape, and irq_depth only caps nesting within a single run.
+  if kind != .Interrupt {
+    script_attach_global_irqs(session, run)
+  }
   // Identity -> position, once, here, AFTER the regions exist so their ids are in the map too.
   // Everything downstream (the walker) reads the derived jump index; nothing downstream knows ids
   // exist. Re-run this after any structural edit.
@@ -546,9 +572,108 @@ script_begin :: proc(session: ^Session, name: string, steps: [dynamic]Script_Ste
   }
   for &w in run.watchers {
     script_arm_event(&ctx, w.cond, &w.ev_state)
+    // Latch handover, half one. A hoisted global interrupt has been watching since it was enabled; if
+    // its condition is currently true AND it has already been serviced, arming it fresh here would
+    // fire it again the moment this chart starts. Carrying the latch makes the Session-level watcher
+    // and this one behave as a single watcher that never stopped watching. (irq_tick's own pass does
+    // nothing while a run is active, so there is exactly one evaluator at a time.)
+    if w.global != "" {
+      if g := irq_find(session, w.global); g != nil {
+        w.ev_state.latched = g.ev_state.latched
+      }
+    }
   }
   engine.ensure_hotkey_thread(&session.eng) // the walker only advances on the watcher tick
   behaviour_goto(session, .Script)
+}
+
+// Hoist every ENABLED global interrupt into <run> as a watcher with its whole chart as a region. The
+// result is indistinguishable from an `on` line the chart wrote itself, which is the point: there is
+// one interrupt mechanism, and "global" only describes where the definition came from.
+@(private = "file")
+script_attach_global_irqs :: proc(session: ^Session, run: ^Script_Run) {
+  for i in 0 ..< session.irq_n {
+    g := &session.irq[i]
+    if !g.ok {
+      continue
+    }
+    if len(run.watchers) >= SCRIPT_MAX_WATCHERS {
+      fmt.eprintfln("script: no room for global interrupt '%s' (%d watchers is the cap).", g.name, SCRIPT_MAX_WATCHERS)
+      break
+    }
+    doc, dok := bhv_open(g.name)
+    if !dok {
+      continue // irq_reload already reported it; do not spam once per run
+    }
+    defer behaviour_doc_free(&doc)
+    // A gated block in the interrupt would die mid-region and take the chart down with it. Refuse the
+    // hoist and say so once - the chart itself is still fine to run.
+    if problems := script_check_avail(session, doc.steps[:]); len(problems) > 0 {
+      fmt.eprintfln("script: global interrupt '%s' is not armed for this run - %s", g.name, problems[0])
+      continue
+    }
+    entry := script_append_irq_region(run, &doc)
+    if entry < 0 {
+      continue
+    }
+    w := Script_Watcher {
+      cond   = script_event_clone(g.cond),
+      src    = strings.clone(fmt.tprintf("interrupt %s", g.name)),
+      global = strings.clone(g.name),
+      entry  = entry,
+    }
+    append(&run.watchers, w)
+  }
+}
+
+// Append <doc>'s program to <run> as an interrupt region and return the index control enters at.
+//
+// The ids have to be REMAPPED. Two independently authored charts both start numbering at 1, so
+// pasting one into the other verbatim would give duplicate ids - and script_resolve_ids maps id ->
+// index, so the second copy's edges would silently retarget onto the first's nodes. Offsetting every
+// id (and every edge that names one) by the host's high-water mark keeps each region's edges pointing
+// inside itself.
+@(private = "file")
+script_append_irq_region :: proc(run: ^Script_Run, doc: ^Behaviour_Doc) -> int {
+  if len(doc.steps) == 0 {
+    return -1
+  }
+  base := Node_Id(0)
+  for s in run.steps {
+    base = max(base, s.id)
+  }
+  start := len(run.steps)
+  enter := start
+  for s in doc.steps {
+    c := s
+    c.id = s.id + base
+    c.goto_id = s.goto_id != 0 ? s.goto_id + base : 0
+    c.else_id = s.else_id != 0 ? s.else_id + base : 0
+    c.action = script_action_clone(s.action)
+    c.cond = script_event_clone(s.cond)
+    c.until = script_event_clone(s.until)
+    c.src = strings.clone(s.src)
+    c.scratch = {}
+    c.ev_state = {}
+    append(&run.steps, c)
+  }
+  // A chart may name a start node that is not its first slot (a canvas has no natural top).
+  if doc.entry != 0 {
+    for s, i in run.steps[start:] {
+      if s.id == doc.entry + base {
+        enter = start + i
+        break
+      }
+    }
+  }
+  // The terminator is not optional. Without it a region that runs off its own end would fall into
+  // whatever was appended next - which is the NEXT interrupt's region.
+  base2 := Node_Id(0)
+  for s in run.steps {
+    base2 = max(base2, s.id)
+  }
+  append(&run.steps, Script_Step{id = base2 + 1, op = .Return, src = strings.clone("return")})
+  return enter
 }
 
 // Hoist every `on <event> -> <action>` out of the instruction stream and give it a REGION: a copy of its
@@ -762,6 +887,7 @@ cli_status_behaviour :: proc(session: ^Session) {
     "  behaviours: %d in Odin (flyff/behaviours.odin) + %d saved in %s - 'script list'",
     len(BEHAVIOURS), len(saved), bhv_dir_path(),
   )
+  cli_status_interrupts(session)
   gated := 0
   for def in ACTIONS {
     if def.avail == nil {
@@ -1039,6 +1165,132 @@ script_selftest_roundtrip :: proc() {
     fmt.printfln("  PASS: all %d behaviours survive serialize -> parse -> render unchanged", len(BEHAVIOURS))
   } else {
     fmt.eprintfln("  %d behaviour(s) did not round-trip", fails)
+  }
+  script_selftest_payload()
+}
+
+// Prove that the three things which decide WHERE an argument lives agree, for every row in the
+// catalog: the writer (script_write_params), the reader (bhv_parse_params) and param_slot - which is
+// what the node editor's inspector binds its widgets through.
+//
+// The round-trip test above cannot see this. It compares RENDERED programs, and the renderer reads
+// the same slot it wrote, so a value stored in the wrong slot renders as its default on both sides
+// and compares equal while the number is silently gone. This test puts a DISTINCT probe in every
+// parameter and checks each one comes back where param_slot says it should, which is exactly the
+// failure kills_of and player_named_near had.
+// Distinct, exactly-representable probes: whole numbers (so script_write_num round-trips without a
+// decimal tail) and bare words (so no quoting is involved).
+@(private = "file")
+probe_num :: proc(i: int) -> f64 {return f64(3 + i * 7)}
+
+@(private = "file")
+probe_str :: proc(i: int) -> string {return fmt.tprintf("p%d", i)}
+
+// <blank> fills every STRING argument with "" instead. That is not a contrived case: it is exactly
+// what the node editor saves while a chart is half-authored, and writing an empty argument bare made
+// the line re-read as if the argument were absent, so the file would not load back.
+@(private = "file")
+probe_fill :: proc(spec: []Param_Spec, nums: ^[4]f64, strs: ^[2]string, blank: bool) {
+  for p, i in spec {
+    slot := param_slot(spec, i)
+    switch p.kind {
+    case .Num, .Duration, .Percent:
+      nums[slot] = probe_num(i)
+    case .Coord:
+      nums[slot] = probe_num(i)
+      nums[slot + 1] = probe_num(i) + 1
+    case .Str, .Names:
+      strs[slot] = blank ? "" : probe_str(i)
+    }
+  }
+}
+
+// Compare only the slots the spec actually claims - the rest of the flat payload is untouched.
+@(private = "file")
+probe_check :: proc(what: string, spec: []Param_Spec, want_n, got_n: [4]f64, want_s, got_s: [2]string, fails: ^int) {
+  for p, i in spec {
+    slot := param_slot(spec, i)
+    bad := false
+    switch p.kind {
+    case .Num, .Duration, .Percent:
+      bad = want_n[slot] != got_n[slot]
+    case .Coord:
+      bad = want_n[slot] != got_n[slot] || want_n[slot + 1] != got_n[slot + 1]
+    case .Str, .Names:
+      bad = want_s[slot] != got_s[slot]
+    }
+    if bad {
+      fmt.eprintfln("  FAIL: %s: argument '%s' (%v) did not survive slot %d", what, p.name, p.kind, slot)
+      fails^ += 1
+    }
+  }
+}
+
+@(private = "file")
+probe_action :: proc(def: Action_Def, blank: bool, fails: ^int) {
+  a := Script_Action {
+    kind = def.kind,
+  }
+  probe_fill(def.params, &a.nums, &a.strs, blank)
+  b := strings.builder_make(context.temp_allocator)
+  script_write_action(&b, a)
+  back, ok, err := bhv_parse_action(bhv_tokens(strings.to_string(b)))
+  if !ok {
+    fmt.eprintfln("  FAIL: action '%s' rendered as '%s' but would not parse back: %s", def.name, strings.to_string(b), err)
+    fails^ += 1
+    return
+  }
+  defer {delete(back.strs[0]);delete(back.strs[1])}
+  if back.kind != a.kind {
+    fmt.eprintfln("  FAIL: action '%s' came back as a different block", def.name)
+    fails^ += 1
+    return
+  }
+  probe_check(def.name, def.params, a.nums, back.nums, a.strs, back.strs, fails)
+}
+
+@(private = "file")
+probe_event :: proc(def: Event_Def, blank: bool, fails: ^int) {
+  e := Script_Event {
+    kind = def.kind,
+  }
+  probe_fill(def.params, &e.nums, &e.strs, blank)
+  b := strings.builder_make(context.temp_allocator)
+  script_write_event(&b, e)
+  back, ok, err := bhv_parse_event(bhv_tokens(strings.to_string(b)))
+  if !ok {
+    fmt.eprintfln("  FAIL: event '%s' rendered as '%s' but would not parse back: %s", def.name, strings.to_string(b), err)
+    fails^ += 1
+    return
+  }
+  defer {delete(back.strs[0]);delete(back.strs[1])}
+  if back.kind != e.kind {
+    fmt.eprintfln("  FAIL: event '%s' came back as a different block", def.name)
+    fails^ += 1
+    return
+  }
+  probe_check(def.name, def.params, e.nums, back.nums, e.strs, back.strs, fails)
+}
+
+@(private = "file")
+script_selftest_payload :: proc() {
+  fmt.println("  --- parameter slots ---")
+  fails := 0
+  // Twice over: once with a distinct value in every argument, once with every STRING blank. The
+  // second pass is the half-authored chart, and it is the one that found a real bug.
+  for pass in 0 ..< 2 {
+    blank := pass == 1
+    for def in ACTIONS {
+      probe_action(def, blank, &fails)
+    }
+    for def in EVENTS {
+      probe_event(def, blank, &fails)
+    }
+  }
+  if fails == 0 {
+    fmt.printfln("  PASS: all %d blocks round-trip every argument, filled and blank", len(ACTIONS) + len(EVENTS))
+  } else {
+    fmt.eprintfln("  %d argument(s) did not survive", fails)
   }
 }
 
