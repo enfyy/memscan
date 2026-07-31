@@ -2211,6 +2211,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
       fence_shapes  = len(session.fence.shapes),
       player_have   = live && player != 0,
       player_pos    = ppos,
+      alert         = session.alert, // POD, copied whole - see gui_alert_overlay
     }
     // Waypoint route. Cheap (a handful of rows), and unconditional rather than mode-gated: the toolbar
     // button carries the count in its tooltip whether or not the editor is open. Names are cloned into
@@ -2713,6 +2714,10 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // === UI === (see gui.odin). Built here in the UNLOCKED phase from the gf snapshot; every action it
     // wants lands in ps.pending and is drained under exec_mutex below, exactly like a typed REPL line.
     gui_frame(session, &ps, &gf, Gui_View{mode = &mode, cam_lock = &cam_lock, recenter = &recenter_req, tool = &tool, tag = &tag_i})
+    // AFTER gui_frame, not inside it: gui_frame returns early for the editor, the browser and every
+    // dialog, and an alert that disappears whenever one of those is open is not doing its job. It draws
+    // on the foreground list and takes no input, so it cannot swallow a click meant for anything below.
+    gui_alert_overlay(&gf, time.now()._nsec, rl.GetTime(), L.alert_scale)
     imgui_rl.end() // renders the ImGui draw data through rlgl - must be inside Begin/EndDrawing
 
     rl.EndDrawing()

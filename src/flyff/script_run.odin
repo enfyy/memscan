@@ -10,6 +10,7 @@ import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "core:unicode/utf8"
 
 import "../engine"
 
@@ -1638,9 +1639,163 @@ script_cmd_selftest :: proc(session: ^Session) {
   script_selftest_roundtrip()
   ed_selftest_insert()
   name_list_selftest()
+  script_selftest_alert()
   // Last, and called from here rather than chained off the end of the others, because it is the one
   // section that needs the SESSION - it writes and reads real variables.
   script_selftest_coord(session)
+}
+
+// The alert envelope (alert.odin), checked as arithmetic - it drives a full-window effect that no
+// headless test can look at, so the numbers are the only thing there is to hold on to.
+//
+// Two of these are real invariants rather than regression guards. The border must never cross
+// ALERT_ALPHA_CEILING, because an alert you cannot read the map through stops being a notification and
+// becomes a modal. And it must reach EXACTLY zero, because an alert that leaves a permanent tint on the
+// window is a bug everyone would blame on the renderer.
+@(private = "file")
+script_selftest_alert :: proc() {
+  fmt.println("=== alert envelope ===")
+  fails := 0
+
+  hold := i64(3 * time.Second)
+  a := Alert_State{active = true, severity = .Danger, hold_ns = hold}
+  total := ALERT_ATTACK_NS + hold + ALERT_RELEASE_NS
+
+  if v := alert_envelope(a, 0); v != 0 {
+    fmt.eprintfln("  FAIL: envelope at t=0 is %v, want 0", v)
+    fails += 1
+  }
+  if v := alert_envelope(a, ALERT_ATTACK_NS); v < 0.999 {
+    fmt.eprintfln("  FAIL: envelope at the top of the attack is %v, want 1", v)
+    fails += 1
+  }
+  if v := alert_envelope(a, ALERT_ATTACK_NS + hold / 2); v < 0.999 {
+    fmt.eprintfln("  FAIL: envelope mid-sustain is %v, want 1", v)
+    fails += 1
+  }
+  if v := alert_envelope(a, total); v != 0 {
+    fmt.eprintfln("  FAIL: envelope at the end is %v, want 0", v)
+    fails += 1
+  }
+  if v := alert_envelope(a, total + i64(time.Second)); v != 0 {
+    fmt.eprintfln("  FAIL: envelope a second past the end is %v, want 0", v)
+    fails += 1
+  }
+
+  // Monotonic on both ramps. A wobble on the way in or out reads as a dropped frame, and a dropped
+  // frame in the one thing that is meant to look deliberate undermines the whole effect.
+  previous := f32(-1)
+  for i in 0 ..= 40 {
+    v := alert_envelope(a, ALERT_ATTACK_NS * i64(i) / 40)
+    if v < previous {
+      fmt.eprintfln("  FAIL: attack ramp went backwards at step %d (%v after %v)", i, v, previous)
+      fails += 1
+      break
+    }
+    previous = v
+  }
+  previous = 2
+  for i in 0 ..= 40 {
+    v := alert_envelope(a, ALERT_ATTACK_NS + hold + ALERT_RELEASE_NS * i64(i) / 40)
+    if v > previous {
+      fmt.eprintfln("  FAIL: release ramp went back up at step %d (%v after %v)", i, v, previous)
+      fails += 1
+      break
+    }
+    previous = v
+  }
+
+  // A sticky alert holds until something clears it, and the clear FADES rather than cutting.
+  sticky := Alert_State{active = true, severity = .Warn, hold_ns = 0}
+  if v := alert_envelope(sticky, i64(time.Hour)); v < 0.999 {
+    fmt.eprintfln("  FAIL: a 0-second alert faded on its own (%v an hour in), want it held", v)
+    fails += 1
+  }
+  sticky.ended_at = i64(time.Second)
+  if v := alert_envelope(sticky, sticky.ended_at + ALERT_RELEASE_NS / 2); v <= 0 || v >= 1 {
+    fmt.eprintfln("  FAIL: a cleared alert is at %v halfway through its fade, want strictly between 0 and 1", v)
+    fails += 1
+  }
+  if v := alert_envelope(sticky, sticky.ended_at + ALERT_RELEASE_NS); v != 0 {
+    fmt.eprintfln("  FAIL: a cleared alert is at %v after its fade, want 0", v)
+    fails += 1
+  }
+
+  // A clear that lands mid-attack must come back DOWN, not finish rising first.
+  interrupted := Alert_State{active = true, severity = .Info, hold_ns = 0, ended_at = ALERT_ATTACK_NS / 2}
+  if v := alert_envelope(interrupted, ALERT_ATTACK_NS / 2 + ALERT_RELEASE_NS); v != 0 {
+    fmt.eprintfln("  FAIL: an alert cleared mid-attack is at %v after its fade, want 0", v)
+    fails += 1
+  }
+
+  // THE readability invariant: peak border opacity, breathing and all, over a full cycle.
+  worst := f32(0)
+  for severity in Alert_Severity {
+    for i in 0 ..< 400 {
+      seconds := f64(i) / 400 / f64(ALERT_PULSE_HZ) // one whole breath
+      worst = max(worst, ALERT_PEAK_ALPHA[severity] * alert_pulse(seconds))
+    }
+  }
+  if worst > ALERT_ALPHA_CEILING {
+    fmt.eprintfln("  FAIL: border peaks at alpha %v, over the %v ceiling - the map stops being readable through it", worst, ALERT_ALPHA_CEILING)
+    fails += 1
+  }
+
+  // The banner's size animation: lands oversized, settles to 1, swells again as it goes. The settled
+  // size is the one that matters - text that comes to rest anywhere but 1 is text drawn at the wrong
+  // size for as long as it is up.
+  steady := alert_pulse(0.25 / f64(ALERT_PULSE_HZ)) // the top of the breath, where the wobble is +ALERT_BREATH
+  if v := alert_text_scale(a, 0, steady); v < 1 + ALERT_PUNCH - 0.01 {
+    fmt.eprintfln("  FAIL: banner lands at %vx, want about %vx", v, 1 + ALERT_PUNCH)
+    fails += 1
+  }
+  if v := alert_text_scale(a, ALERT_ATTACK_NS + hold / 2, steady); abs(v - 1) > ALERT_BREATH + 0.001 {
+    fmt.eprintfln("  FAIL: banner settles at %vx, want 1x give or take the %v breath", v, ALERT_BREATH)
+    fails += 1
+  }
+  if v := alert_text_scale(a, total, steady); v < 1 + ALERT_DISSIPATE - ALERT_BREATH - 0.001 {
+    fmt.eprintfln("  FAIL: banner ends at %vx, want it swollen to about %vx", v, 1 + ALERT_DISSIPATE)
+    fails += 1
+  }
+  // Monotonic settle: a wobble on the way down would read as the text bouncing, which is a different
+  // (and much noisier) effect from the one intended.
+  previous = f32(1e9)
+  for i in 0 ..= 40 {
+    v := alert_text_scale(a, ALERT_ATTACK_NS * i64(i) / 40, steady)
+    if v > previous + 0.0001 {
+      fmt.eprintfln("  FAIL: banner grew again while settling, at step %d (%v after %v)", i, v, previous)
+      fails += 1
+      break
+    }
+    previous = v
+  }
+
+  // The message is user text, so it can be any length and any encoding. Truncating it must not leave a
+  // half-written rune behind - that draws as a replacement box and looks like a bug in the alert.
+  long := strings.repeat("★", 60, context.temp_allocator) // 60 stars, 3 bytes each
+  truncated := Alert_State{}
+  alert_set_text(&truncated, long)
+  text := alert_text(&truncated)
+  if len(text) > ALERT_TEXT_MAX {
+    fmt.eprintfln("  FAIL: truncated message is %d bytes, over the %d cap", len(text), ALERT_TEXT_MAX)
+    fails += 1
+  }
+  if !utf8.valid_string(text) {
+    fmt.eprintfln("  FAIL: truncation split a rune - %q is not valid UTF-8", text)
+    fails += 1
+  }
+
+  if fails == 0 {
+    fmt.printfln(
+      "  PASS: envelope, sticky/clear fades, banner size %.2fx -> 1x -> %.2fx, alpha ceiling (peak %.3f of %.2f)",
+      1 + ALERT_PUNCH,
+      1 + ALERT_DISSIPATE,
+      worst,
+      ALERT_ALPHA_CEILING,
+    )
+  } else {
+    fmt.eprintfln("  %d alert check(s) failed", fails)
+  }
 }
 
 // Prove the file format is lossless: build every Odin behaviour, serialize it, parse it back, and

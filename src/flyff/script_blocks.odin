@@ -3,7 +3,6 @@
 import "core:fmt"
 import "core:strconv"
 import "core:strings"
-import win "core:sys/windows"
 
 import "../engine"
 
@@ -334,6 +333,7 @@ Script_Action_Kind :: enum {
   Farm,
   Sweep_To,
   Alert,
+  Alert_Clear,
   Pause,
   Run_Cmd,
   Press_Key,
@@ -678,6 +678,29 @@ PARAMS_RUN_CMD := [?]Param_Spec {
   {
     name = "text", kind = .Str, title = "Command line",
     help = "Any line you could type at the memscan prompt, run exactly as typed.",
+  },
+}
+
+// Every argument is optional, so a bare `alert` written before these existed still parses and still
+// means something sensible. Slots: strs[0]=message, strs[1]=severity, nums[0]=seconds, nums[1]=beep -
+// the two storage classes count separately, see param_slots.
+@(rodata)
+PARAMS_ALERT := [?]Param_Spec {
+  {
+    name = "message", kind = .Str, optional = true, title = "Message",
+    help = "What the banner says - @name is filled in, so 'HP at @hp%' reads the variable. Leave it blank for the border alone, which is the quieter option when the chart itself is the explanation.",
+  },
+  {
+    name = "severity", kind = .Choice, optional = true, title = "Severity", choices = ALERT_SEVERITY_NAMES,
+    help = "How loud it looks: info is blue and faint, warn amber, danger red and heaviest. All three move the same way - only the weight changes. Blank means warn.",
+  },
+  {
+    name = "seconds", kind = .Duration, optional = true, def = ALERT_DEFAULT_SECONDS, max_value = 600, title = "Seconds",
+    help = "How long it stays up before fading. 0 leaves it up until a 'Clear the alert' block takes it down, which is what you want for something you must acknowledge.",
+  },
+  {
+    name = "beep", kind = .Num, optional = true, unit = "bool", max_value = 1, title = "Beep",
+    help = "Also sound the system beep. Off by default; worth turning on for the ones that matter, because it is the only half that still works with the radar window closed.",
   },
 }
 
@@ -1097,9 +1120,14 @@ ACTIONS := [?]Action_Def {
     avail = avail_moveto, start = act_sweep_start, poll = act_sweep_poll, exit = act_sweep_exit,
   },
   {
-    kind = .Alert, name = "alert", title = "Sound the alert", cat = .System, params = {},
-    blurb = "sound the system alert (works with the radar closed - it has no audio device of its own)",
+    kind = .Alert, name = "alert", title = "Raise an alert", cat = .System, params = PARAMS_ALERT[:],
+    blurb = "put a coloured border and a banner over the radar window - the way a chart says something you need to look at",
     start = act_alert_start,
+  },
+  {
+    kind = .Alert_Clear, name = "alert_clear", title = "Clear the alert", cat = .System, params = {},
+    blurb = "take the alert down early (it fades); pairs with an alert whose duration is 0",
+    start = act_alert_clear_start,
   },
     {
     kind = .Pause, name = "pause", title = "Pause the run", cat = .Flow, params = {},
@@ -2724,8 +2752,22 @@ act_sweep_exit :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
 
 // --- misc actions ------------------------------------------------------------------------------------
 
+// The visual half lives in alert.odin; this is only the argument unpacking. The beep is a flag rather
+// than a separate block because "make sure I notice this" is one intent, and splitting it across two
+// nodes would mean every alert that matters is two nodes.
 act_alert_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  win.MessageBeep(0xFFFFFFFF) // MB_OK-ish default beep; the radar's raylib audio device is window-scoped
+  message := script_arg(ctx, step.action.strs[0])
+  severity, ok := alert_severity_from_name(step.action.strs[1])
+  if !ok && step.action.strs[1] != "" {
+    // Not fatal: an alert that argues about its own colour is worse than one that shows up in amber.
+    script_trace(ctx.session, script_current_node(ctx), .Warn, "unknown severity '%s' - using warn", step.action.strs[1])
+  }
+  alert_show(ctx.session, severity, message, i64(step.action.nums[0] * 1e9), step.action.nums[1] != 0)
+  return .Done
+}
+
+act_alert_clear_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+  alert_clear(ctx.session)
   return .Done
 }
 

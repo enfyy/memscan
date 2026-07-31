@@ -217,6 +217,7 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "trail_on=%d", layout.trail_on ? 1 : 0)
   fmt.sbprintfln(&b, "trail_len=%v", layout.trail_len)
   fmt.sbprintfln(&b, "trail_fade=%v", layout.trail_fade)
+  fmt.sbprintfln(&b, "alert_scale=%v", layout.alert_scale)
   fmt.sbprintfln(&b, "hillshade_on=%d", layout.hillshade_on ? 1 : 0)
   fmt.sbprintfln(&b, "hillshade_z=%v", layout.hillshade_z)
   fmt.sbprintfln(&b, "hillshade_light=%v", layout.hillshade_light)
@@ -344,6 +345,12 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     if key == "trail_fade" {
       if fv, ok := strconv.parse_f64(val); ok {
         layout.trail_fade = f32(fv) // fade exponent - parse as float
+      }
+      continue
+    }
+    if key == "alert_scale" {
+      if fv, ok := strconv.parse_f64(val); ok {
+        layout.alert_scale = f32(fv) // alert border opacity multiplier - parse as float
       }
       continue
     }
@@ -960,7 +967,7 @@ cli_set :: proc(session: ^Session, args: []string) {
   }
   // attack_range / radar_range / density_weight / density_max_detour / la_* delays are the fractional
   // fields - parse as floats (la_jump_chance is an int and takes the generic parse_addr path below).
-  if args[0] == "attack_range" || args[0] == "radar_range" || args[0] == "trail_len" || args[0] == "trail_fade" || args[0] == "hillshade_z" || args[0] == "hillshade_light" || args[0] == "collider_memory_range" || args[0] == "density_weight" || args[0] == "density_max_detour" || args[0] == "combat_grace" || args[0] == "melee_range" || args[0] == "la_hold_min" || args[0] == "la_hold_max" || args[0] == "la_jump_min" || args[0] == "la_jump_max" || args[0] == "la_step_spread" || args[0] == "la_max_range" || args[0] == "ui_scale" {
+  if args[0] == "attack_range" || args[0] == "radar_range" || args[0] == "trail_len" || args[0] == "trail_fade" || args[0] == "alert_scale" || args[0] == "hillshade_z" || args[0] == "hillshade_light" || args[0] == "collider_memory_range" || args[0] == "density_weight" || args[0] == "density_max_detour" || args[0] == "combat_grace" || args[0] == "melee_range" || args[0] == "la_hold_min" || args[0] == "la_hold_max" || args[0] == "la_jump_min" || args[0] == "la_jump_max" || args[0] == "la_step_spread" || args[0] == "la_max_range" || args[0] == "ui_scale" {
     fv, ok := strconv.parse_f64(args[1])
     if !ok || fv < 0 {
       fmt.eprintfln("invalid value: %s (want a number >= 0, e.g. 1.75)", args[1])
@@ -975,6 +982,8 @@ cli_set :: proc(session: ^Session, args: []string) {
       session.layout.trail_len = f32(fv)
     case "trail_fade":
       session.layout.trail_fade = f32(fv)
+    case "alert_scale":
+      session.layout.alert_scale = f32(fv)
     case "collider_memory_range":
       session.layout.collider_memory_range = f32(fv)
       collider_memory_trim(session) // shrinking it evicts now, not at the next 16-unit rebuild

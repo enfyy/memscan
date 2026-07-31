@@ -166,6 +166,9 @@ FLYFF_FX_LASER_ON :: true
 FLYFF_TRAIL_ON :: false      // radar player-path trail (off by default; subtle, fades over distance)
 FLYFF_TRAIL_LEN :: f32(60.0) // trail length: crumbs kept up to this many world units back
 FLYFF_TRAIL_FADE :: f32(1.0) // fade exponent: >1 fades faster near the player, <1 stays visible further
+// Global multiplier on the alert border's opacity (see alert.odin). The one knob for "this is too much
+// for me" that does not mean editing every chart that raises one; 0 hides the border but keeps the banner.
+FLYFF_ALERT_SCALE :: f32(1.0)
 
 // Radar terrain hillshade (display-only relief; colourless, off by default). hillshade_z is the vertical
 // exaggeration (higher = more dramatic slopes); hillshade_light is the light azimuth in degrees CW from
@@ -437,6 +440,7 @@ Flyff_Layout :: struct {
   trail_on:          bool, // radar display: fading player-path trail
   trail_len:         f32,  // player-path trail length (world units)
   trail_fade:        f32,  // player-path trail fade exponent (how fast opacity falls off)
+  alert_scale:       f32,  // multiplier on the alert border's opacity (0 = banner only, no border)
   hillshade_on:      bool, // radar display: colourless terrain shaded-relief backdrop
   hillshade_z:       f32,  // hillshade vertical exaggeration (relief depth)
   hillshade_light:   f32,  // hillshade light azimuth (degrees CW from north; 315 = NW)
@@ -571,6 +575,7 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     trail_on          = FLYFF_TRAIL_ON,
     trail_len         = FLYFF_TRAIL_LEN,
     trail_fade        = FLYFF_TRAIL_FADE,
+    alert_scale       = FLYFF_ALERT_SCALE,
     hillshade_on      = FLYFF_HILLSHADE_ON,
     hillshade_z       = FLYFF_HILLSHADE_Z,
     hillshade_light   = FLYFF_HILLSHADE_LIGHT,

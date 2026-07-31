@@ -148,6 +148,11 @@ Session :: struct {
   // the radar can play a dot-hop animation for every jump (manual + autonomous look-alive). 0 = none.
   jump_fired_at: i64,
 
+  // The visual alert currently raised, if any (see alert.odin). Written by the `alert` block under
+  // exec_mutex, snapshotted into Gui_Frame and drawn unlocked. Pure POD and self-expiring: the
+  // timestamps on it decide what is on screen, so nothing has to tick it and a stale one costs nothing.
+  alert:         Alert_State,
+
   // Leaderboard recording + backend (see leaderboard.odin). lb_run is an explicit Start/Stop span that
   // accumulates the farm stats to submit; lb_cur_name / lb_cur_pack carry the committed target's identity
   // + local pack size forward from the pick sites (target.odin / auto_commit_pick) so the kill sites can

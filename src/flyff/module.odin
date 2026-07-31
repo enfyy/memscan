@@ -52,6 +52,8 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_meshreach(s, args)
   case "sfx":
     cli_sfx(s, args)
+  case "alert":
+    cli_alert(s, args)
   case "fxlaser":
     cli_fxlaser(s, args)
   case "trail":
@@ -374,6 +376,10 @@ farming (day to day)
   reachgate [on|off]         proactively skip mobs behind walls/trees/buildings when auto-picks a target
   hunt [on|off]              hunt mode: commit to one target (giant/quest), never drop it for being far/unreachable; side-step around blocks (needs findmove)
   sfx [on|off]               radar sound effects (penya chime + kill zap); persisted to flyff.cfg
+  alert <sev> <text> [secs]  raise a visual alert over the radar: coloured border + banner. sev is
+                             info/warn/danger; a trailing number is the duration (0 = until cleared).
+                             'alert clear' takes it down, 'alert' alone reports what is up.
+                             Border strength is 'set alert_scale' (0 = banner only).
   fxlaser [on|off]           radar kill laser-beam effect; persisted to flyff.cfg
   set ui_scale <n>           UI scale (0.6..3.0, default 1). The font atlas is baked when the window
                              opens, so re-open the radar for it to take effect.

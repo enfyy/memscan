@@ -155,6 +155,32 @@ icon_ranges: [2 * len(ICON_ALL) + 1]imgui.Wchar
 @(private = "file")
 icon_ink_y0, icon_ink_y1: f32
 
+// A SECOND baking of the UI face, at display size, for the one thing drawn far larger than the UI: the
+// alert banner. ImGui 1.91 rasterizes an atlas once at a fixed size, so drawing the 17px face at ~50px
+// is a 3x upscale of a bitmap and looks exactly as soft as that sounds. A second baking costs one more
+// atlas region and makes the banner 1:1 at rest.
+//
+// This is the cheap half of the fix. The real one is ImGui 1.92's on-demand rasterization, which would
+// make text crisp at ANY size and retire this global - but it also replaces the one-shot texture upload
+// that lib/imgui_impl_raylib.odin is built around, so it is a backend rewrite rather than a version bump.
+// The node canvas, whose text scales continuously with zoom, is what would actually justify that work.
+FONT_DISPLAY_PX :: f32(50)
+
+@(private = "file")
+ui_font_display: ^imgui.Font
+@(private = "file")
+ui_font_display_size: f32
+
+// The display face and the size it was baked at. Draw at exactly this size and no scaling happens at
+// all; the alert's size animation multiplies it, so the settled banner is the crisp case and only the
+// 180ms punch is (imperceptibly) stretched. Falls back to the UI face if the atlas build ever failed.
+gui_display_font :: proc() -> (font: ^imgui.Font, size: f32) {
+  if ui_font_display == nil {
+    return imgui.GetFont(), imgui.GetFontSize() * 2.9
+  }
+  return ui_font_display, ui_font_display_size
+}
+
 // Final optical nudge, in px at scale 1, positive = down. Zero because the geometry is now exact (see
 // the FontGlyph note in lib/odin-imgui/imgui.odin - the binding used to report the wrong rect, which is
 // what made every icon sit high). Kept as one named knob so a future optical tweak is one number for the
@@ -284,6 +310,11 @@ Gui_Frame :: struct {
   watcher_count:       int,
   armed:         [FLYFF_MAX_ARMED_WATCHERS]Gui_Armed_Row,
   armed_watcher_count:         int,
+
+  // The raised alert (alert.odin), copied WHOLE - it is POD with an inline message buffer precisely so
+  // it can cross into the draw phase without anybody owning a string. gui_alert_overlay is the only
+  // reader; it decides from the timestamps whether there is anything left to draw.
+  alert:         Alert_State,
 
   // Where the character is standing, for the node editor's "Here" button on a Coord argument -
   // typing a waypoint by hand is exactly the thing you have the game open to avoid.
@@ -459,6 +490,18 @@ gui_init :: proc(scale: f32) {
   // No GlyphOffset / GlyphMinAdvanceX nudging: those shifted the icons off-centre (down and right) in
   // every button. Placement is gui_draw_icon's job now - it centres the glyph's real ink box.
   imgui.FontAtlas_AddFontFromMemoryTTF(fonts, raw_data(FONT_ICONS), i32(len(FONT_ICONS)), math.round(18 * s), &icon_cfg, &icon_ranges[0])
+
+  // The display face (see FONT_DISPLAY_PX). Added LAST so it cannot become the default font - ImGui
+  // hands that role to whatever was added first, and every other call site wants the 17px one.
+  // NOT merged: a merge would fold these glyphs into the UI font and replace it at UI sizes.
+  //
+  // Oversampling back to 1: it exists to recover detail when a glyph is rasterized smaller than the pixel
+  // grid deserves, which is a small-text problem. At 50px it would double this face's atlas footprint to
+  // sharpen something already sharp.
+  display_cfg := gui_font_config()
+  display_cfg.OversampleH = 1
+  ui_font_display_size = math.round(FONT_DISPLAY_PX * s)
+  ui_font_display = imgui.FontAtlas_AddFontFromMemoryTTF(fonts, raw_data(FONT_UI), i32(len(FONT_UI)), ui_font_display_size, &display_cfg)
 
   imgui_rl.build_font_atlas()
   gui_apply_theme(s)
@@ -927,6 +970,150 @@ gui_frame :: proc(session: ^Session, ps: ^Panel_State, f: ^Gui_Frame, view: Gui_
 // input, so a click that lands NEXT TO (not on) an open dialog can't also target a mob behind it.
 gui_modal_up :: proc(ps: ^Panel_State, attached: bool) -> bool {
   return (!attached && !ps.offline) || ps.setup_open || ps.browser_open || ps.ed.open || ps.leaderboard_open
+}
+
+// ===========================================================================
+// Alert overlay (alert.odin)
+//
+// Drawn on the FOREGROUND draw list, which is the only layer above ImGui's own windows - and it has to
+// be, because gui_frame returns early for the editor, the browser and every dialog. An alert that is
+// invisible whenever the chart editor happens to be open is not an alert.
+//
+// For the same reason it is called from cli_radar rather than from gui_frame: it must not sit behind
+// any of those early returns. It draws and nothing else - no input, no hit-testing - so it can never
+// swallow a click meant for the map or a widget underneath it.
+// ===========================================================================
+
+ALERT_BAND_FRAC :: f32(0.13) // border depth as a fraction of the window's short side
+ALERT_BAND_MIN :: f32(48)
+ALERT_BAND_MAX :: f32(160)
+
+// The banner. No plate behind it on purpose: a filled bar reads as a web notification, and the thing
+// this wants to look like is a game calling something out. What replaces the plate is an outline - the
+// text carries its own contrast wherever it lands, over dark terrain or a bright panel alike, and stays
+// part of the scene instead of sitting in a box on top of it.
+// Size comes from the display face's baked size (gui_display_font), not from a multiple of the UI font -
+// so "the size it rests at" and "the size it was rasterized at" are the same number by construction and
+// cannot drift apart into a blurry banner.
+ALERT_TEXT_Y :: f32(0.15) // vertical centre, as a fraction of window height
+ALERT_TEXT_MARGIN :: f32(48) // shrink-to-fit keeps at least this much clear on each side
+ALERT_OUTLINE_FRAC :: f32(0.06) // outline width, as a fraction of the text size
+
+@(private = "file")
+alert_severity_color :: proc(s: Alert_Severity) -> imgui.Vec4 {
+  switch s {
+  case .Info:
+    return COL_ACCENT
+  case .Warn:
+    return COL_WARN
+  case .Danger:
+    return COL_BAD
+  }
+  return COL_WARN
+}
+
+gui_alert_overlay :: proc(f: ^Gui_Frame, now_ns: i64, now_seconds: f64, scale: f32) {
+  envelope := alert_envelope(f.alert, now_ns)
+  if envelope <= 0 {
+    return
+  }
+
+  vp := imgui.GetMainViewport()
+  dl := imgui.GetForegroundDrawList()
+  col := alert_severity_color(f.alert.severity)
+  x0, y0 := vp.Pos.x, vp.Pos.y
+  x1, y1 := x0 + vp.Size.x, y0 + vp.Size.y
+
+  // --- the border. Four bands, opaque at the window edge and gone by the time they reach the middle.
+  // The corners need no special case: two bands overlap there and compound, which is the whole reason
+  // this reads as a vignette rather than as four stripes.
+  //
+  // Only the border breathes. The pulse is bounded well below 1 so the map stays legible THROUGH it -
+  // see ALERT_ALPHA_CEILING, which script_selftest_alert holds this to. `scale` is the user's own
+  // multiplier on top; at 0 the border is gone and the banner still says its piece.
+  alpha := ALERT_PEAK_ALPHA[f.alert.severity] * envelope * alert_pulse(now_seconds) * max(scale, 0)
+  if alpha > 0 {
+    edge := u32_of(tint(col, alpha))
+    gone := u32_of(tint(col, 0))
+    depth := clamp(min(vp.Size.x, vp.Size.y) * ALERT_BAND_FRAC, px(ALERT_BAND_MIN), px(ALERT_BAND_MAX))
+
+    imgui.DrawList_AddRectFilledMultiColor(dl, {x0, y0}, {x1, y0 + depth}, edge, edge, gone, gone)
+    imgui.DrawList_AddRectFilledMultiColor(dl, {x0, y1 - depth}, {x1, y1}, gone, gone, edge, edge)
+    imgui.DrawList_AddRectFilledMultiColor(dl, {x0, y0}, {x0 + depth, y1}, edge, gone, gone, edge)
+    imgui.DrawList_AddRectFilledMultiColor(dl, {x1 - depth, y0}, {x1, y1}, gone, edge, edge, gone)
+  }
+
+  // --- the banner. No plate: it lands oversized, settles to its real size, and swells again as it
+  // fades. The size IS the entrance - that is what makes a bar unnecessary - and once it has settled the
+  // text is effectively still, because the sustain breath is 2% and shared with the border.
+  message := alert_text(&f.alert)
+  if message == "" {
+    return
+  }
+  font, rest_size := gui_display_font()
+  text := fmt.ctprintf("%s", message)
+
+  // Measured with the DISPLAY face at the size it will actually be drawn, not scaled off the UI face's
+  // metrics: the two are baked at different sizes and oversampling, so per-glyph advance rounding differs
+  // and a ratio would drift the centring on a long line.
+  size := rest_size * alert_text_scale(f.alert, now_ns, alert_pulse(now_seconds))
+  width := imgui.Font_CalcTextSizeA(font, size, max(f32), 0, text).x
+  if available := vp.Size.x - px(ALERT_TEXT_MARGIN) * 2; width > available && width > 0 {
+    size *= available / width // a long message shrinks to fit rather than running off both edges
+    width = available // advances scale linearly with size, so this is exact rather than an estimate
+  }
+
+  // Centre-anchored, so it grows out of its own middle instead of sliding right as it scales.
+  centre := imgui.Vec2{x0 + vp.Size.x * 0.5, y0 + vp.Size.y * ALERT_TEXT_Y}
+  pen := imgui.Vec2{centre.x - width * 0.5, centre.y - size * 0.5}
+
+  outline := max(size * ALERT_OUTLINE_FRAC, 1)
+  gui_text_outlined(
+    dl,
+    font,
+    size,
+    pen,
+    text,
+    blend(col, {1, 1, 1, 1}, 0.62, envelope), // fill: the severity colour, lifted toward white to read
+    imgui.Vec4{0.02, 0.03, 0.04, 0.95 * envelope}, // outline: near-black
+    outline,
+  )
+}
+
+// Text with a dark outline, drawn by stamping the string around itself. Eight directions rather than
+// four: at this size a four-way outline leaves the diagonals visibly thin, and the corners are exactly
+// where text crosses a busy background.
+//
+// This is what lets the banner sit directly on the map with no plate under it - the glyphs carry their
+// own contrast, so they stay readable over dark terrain and a bright panel alike.
+//
+// THERE IS NO GLOW, and stamping is the reason. A ring of copies at one radius is not a blur: at any
+// radius wide enough to read as a halo the copies are far enough out to be individually visible, so you
+// get text-shaped ghosts rather than falloff. Worse, eight stamps at the alpha a glow needs composite to
+// very nearly opaque where they overlap (1 - a^8), so the "glow" comes out a solid coloured slab. A real
+// one needs an actual blur - a shader, or a pre-blurred texture - not more stamps. The severity colour is
+// already carried by the fill and the border, so this loses no information.
+@(private = "file")
+gui_text_outlined :: proc(
+  dl: ^imgui.DrawList,
+  font: ^imgui.Font,
+  size: f32,
+  pen: imgui.Vec2,
+  text: cstring,
+  fill, outline: imgui.Vec4,
+  width: f32,
+) {
+  if size < 5 {
+    return // matches ed_text: below this it is a smudge, and a smudge reads as dirt on the screen
+  }
+  ring := [8][2]f32{{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {0.7, 0.7}, {0.7, -0.7}, {-0.7, 0.7}, {-0.7, -0.7}}
+
+  outline_packed := u32_of(outline)
+  for d in ring {
+    at := imgui.Vec2{pen.x + d[0] * width, pen.y + d[1] * width}
+    imgui.DrawList_AddTextImFontPtr(dl, font, size, at, outline_packed, text)
+  }
+  imgui.DrawList_AddTextImFontPtr(dl, font, size, pen, u32_of(fill), text)
 }
 
 // ===========================================================================

@@ -275,8 +275,14 @@ sweep :: proc(s: ^Seq, to: [3]f32) {
   act(s, a)
 }
 
-alert :: proc(s: ^Seq) {
-  act(s, Script_Action{kind = .Alert})
+alert :: proc(s: ^Seq, message := "", severity := "warn", seconds := ALERT_DEFAULT_SECONDS, beep := false) {
+  act(s, do_alert(message, severity, seconds, beep))
+}
+
+// Verb-first, unlike the block's own name: `alert_clear` is taken by the procedure in alert.odin that
+// actually does it, and the DSL is the surface that should yield the shorter spelling.
+clear_alert :: proc(s: ^Seq) {
+  act(s, Script_Action{kind = .Alert_Clear})
 }
 
 abort :: proc(s: ^Seq) {
@@ -694,7 +700,16 @@ on_condition :: proc(s: ^Seq, c: Script_Condition, do_action: Script_Action) {
 
 // The interrupt bodies worth having pre-made; `on` takes any Script_Action.
 do_abort :: proc() -> Script_Action {return Script_Action{kind = .Stop}}
-do_alert :: proc() -> Script_Action {return Script_Action{kind = .Alert}}
+do_alert :: proc(message := "", severity := "warn", seconds := ALERT_DEFAULT_SECONDS, beep := false) -> Script_Action {
+  a := Script_Action{kind = .Alert}
+  a.strs[0] = message
+  a.strs[1] = severity
+  a.nums[0] = seconds
+  a.nums[1] = beep ? 1 : 0
+  return a
+}
+
+do_alert_clear :: proc() -> Script_Action {return Script_Action{kind = .Alert_Clear}}
 
 do_key :: proc(k: string) -> Script_Action {
   a := Script_Action{kind = .Press_Key}
