@@ -131,6 +131,8 @@ layout_set_field :: proc(layout: ^Flyff_Layout, key: string, v: u64) -> bool {
     layout.actmover_off = i64(v)
   case "jump_msg":
     layout.jump_msg = u32(v)
+  case "activeflag_rva":
+    layout.activeflag_rva = uintptr(v)
   case "destpos_off":
     layout.destpos_off = i64(v)
   case "iddest_off":
@@ -201,6 +203,7 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "la_step_spread=%v", layout.la_step_spread)
   fmt.sbprintfln(&b, "la_max_range=%v", layout.la_max_range)
   fmt.sbprintfln(&b, "reach_gate_on=%d", layout.reach_gate_on ? 1 : 0)
+  fmt.sbprintfln(&b, "bgkeys_on=%d", layout.bgkeys_on ? 1 : 0)
   fmt.sbprintfln(&b, "hunt_on=%d", layout.hunt_on ? 1 : 0)
   fmt.sbprintfln(&b, "combat_watch_on=%d", layout.combat_watch_on ? 1 : 0)
   fmt.sbprintfln(&b, "combat_grace=%v", layout.combat_grace)
@@ -231,6 +234,7 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
   fmt.sbprintfln(&b, "sendactmsg_rva=0x%X", layout.sendactmsg_rva)
   fmt.sbprintfln(&b, "actmover_off=0x%X", layout.actmover_off)
   fmt.sbprintfln(&b, "jump_msg=0x%X", layout.jump_msg)
+  fmt.sbprintfln(&b, "activeflag_rva=0x%X", layout.activeflag_rva)
   fmt.sbprintfln(&b, "destpos_off=0x%X", layout.destpos_off)
   fmt.sbprintfln(&b, "iddest_off=0x%X", layout.iddest_off)
   fmt.sbprintfln(&b, "forward_off=0x%X", layout.forward_off)
@@ -256,7 +260,7 @@ flyff_save_cfg :: proc(layout: Flyff_Layout, path: string) -> bool {
     if i > 0 {
       fmt.sbprint(&b, ",")
     }
-    fmt.sbprint(&b, irq_layout_name(&L, i))
+    fmt.sbprint(&b, armed_watcher_layout_name(&L, i))
   }
   fmt.sbprintln(&b, "")
   err := os.write_entire_file(path, transmute([]byte)strings.to_string(b))
@@ -315,7 +319,7 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     }
     if key == "interrupts" {
       // Comma list of behaviour names. Rebuilt from scratch; the runtime half (triggers + latches) is
-      // derived by irq_reload, which the caller runs once the whole file is in.
+      // derived by armed_watcher_reload, which the caller runs once the whole file is in.
       layout.interrupts_n = 0
       if val != "" {
         for p in strings.split(val, ",", context.temp_allocator) {
@@ -420,7 +424,7 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
     // Persisted runtime toggles - bool-parsed like density_on. Deliberately NOT in layout_set_field:
     // the first three are session-mirrored (their CLI toggles keep both sides in sync; a raw `set`
     // would silently desync), and sfx/fxlaser have their own commands.
-    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "hunt_on" || key == "combat_watch_on" || key == "auto_stuck_on" || key == "aggro_first_on" || key == "melee_first_on" || key == "pocket_on" || key == "sfx_on" || key == "fx_laser_on" || key == "trail_on" || key == "hillshade_on" || key == "nowalk_on" || key == "collider_memory_on" || key == "collider_memory_map" || key == "density_hue_on" || key == "la_hesitate_on" || key == "la_jump_on" || key == "la_step_on" || key == "la_maxrange_on" {
+    if key == "preselect_on" || key == "lookalive_on" || key == "reach_gate_on" || key == "bgkeys_on" || key == "hunt_on" || key == "combat_watch_on" || key == "auto_stuck_on" || key == "aggro_first_on" || key == "melee_first_on" || key == "pocket_on" || key == "sfx_on" || key == "fx_laser_on" || key == "trail_on" || key == "hillshade_on" || key == "nowalk_on" || key == "collider_memory_on" || key == "collider_memory_map" || key == "density_hue_on" || key == "la_hesitate_on" || key == "la_jump_on" || key == "la_step_on" || key == "la_maxrange_on" {
       bv := val == "1" || strings.equal_fold(val, "true") || strings.equal_fold(val, "on")
       switch key {
       case "preselect_on":
@@ -429,6 +433,8 @@ flyff_load_cfg :: proc(layout: ^Flyff_Layout, path: string) -> bool {
         layout.lookalive_on = bv
       case "reach_gate_on":
         layout.reach_gate_on = bv
+      case "bgkeys_on":
+        layout.bgkeys_on = bv
       case "hunt_on":
         layout.hunt_on = bv
       case "combat_watch_on":
@@ -550,8 +556,11 @@ cli_status_full :: proc(session: ^Session) {
 
   if !session.attached {
     fmt.println("process : NOT attached")
-    fmt.println("  the layout only becomes live once you attach (that's when flyff.cfg loads).")
+    fmt.println("  flyff.cfg is loaded (it is read at startup), but nothing can be PROBED without a")
+    fmt.println("  process, so there is no live layout to report on yet.")
     fmt.println("  fix     : attach <Neuz|pid>   then run 'status' again")
+    fmt.printfln("behaviour: %s", script_status_line(session))
+    fmt.println("  charts are authorable offline - 'script list', or the window's Work offline shell.")
     return
   }
 
@@ -651,6 +660,18 @@ cli_status_full :: proc(session: ^Session) {
   )
   if !move_sync_ok || !jump_sync_ok {
     fmt.println("       [OFF] = LOCAL-ONLY (others see a teleport / miss the jump). fix: 'findmove' in-game.")
+  }
+  // Background movement keys. Separate from moveto/jump because it is not a destination write at all - it
+  // un-gates the client's OWN input pass, which is the only way key_down W/A/S/D move and turn like the
+  // real thing (A/D are OBJMSG_LTURN/RTURN, not strafe - see keys.odin).
+  fmt.printfln("  bgkeys:  activeflag_rva=0x%X   %s", L.activeflag_rva, session.bgkeys_on ? "ON" : "off")
+  if L.activeflag_rva == 0 {
+    fmt.println("       [--] INERT (nothing pinned to hold open) - movement keys need the game FOCUSED.")
+    fmt.println("            fix: 'findactive', then alt-tab in and out a couple of times.")
+  } else if session.bgkeys_on {
+    fmt.println("       [OK] m_bActiveNeuz held TRUE - key_down W/A/S/D work with the game in the background.")
+  } else {
+    fmt.println("       [--] pinned but off - 'bgkeys on' to hold the client's input pass open.")
   }
 
   // --- Look-alive tuning (mode toggle mirrored in Session; sub-feature enables + delays persisted here) ---
@@ -843,11 +864,11 @@ cli_status_full :: proc(session: ^Session) {
     }
   }
 
-  // --- Leaderboard backend (optional; enables the radar's "Leaderboards..." button + `leaderboard` cmds) ---
+  // --- Leaderboard backend (optional; enables the radar's trophy button + `leaderboard` cmds) ---
   fmt.println("")
   fmt.println("LEADERBOARD (optional) - submit timed farm runs to a backend; download others' configs:")
   if L.leaderboard_url != "" {
-    fmt.printfln("  leaderboard_url=%s  [OK] configured - radar 'Leaderboards...' button shows; `leaderboard` cmds live.", L.leaderboard_url)
+    fmt.printfln("  leaderboard_url=%s  [OK] configured - the radar toolbar's trophy shows; `leaderboard` cmds live.", L.leaderboard_url)
     if s := lb_status_str(session); s != "" {
       fmt.printfln("  last: %s", s)
     }
@@ -1009,70 +1030,6 @@ cli_set :: proc(session: ^Session, args: []string) {
   path := flyff_cfg_path()
   if flyff_save_cfg(session.layout, path) {
     fmt.printfln("saved -> %s", path)
-  }
-}
-
-// findpos <x,y,z> [eps] -> addresses whose 3 contiguous f32 match the position (recon primitive).
-cli_findpos :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 1 {
-    fmt.eprintln("usage: findpos <x,y,z> [eps]   (x,y,z from /position; eps default 1.0)")
-    return
-  }
-  pos, pok := parse_vec3_literal(args[0])
-  if !pok {
-    fmt.eprintln("expected x,y,z (commas, no spaces).")
-    return
-  }
-  eps: f32 = 1.0
-  if len(args) >= 2 {
-    if e, eok := strconv.parse_f64(args[1]); eok {
-      eps = f32(e)
-    }
-  }
-  hits := engine.scan_vec3(session.proc_info.handle, pos, eps, context.temp_allocator)
-  fmt.printfln("findpos (%.1f, %.1f, %.1f) eps %.2f: %d hit(s)", pos[0], pos[1], pos[2], eps, len(hits))
-  for h, i in hits {
-    if i >= 40 {
-      fmt.printfln("  ... (%d more)", len(hits) - i)
-      break
-    }
-    fmt.printfln("  0x%X", h)
-  }
-}
-
-// findplayer <name> -> locate the player object by NAME (the position-free anchor `setup` uses). Prints
-// the resolved object + name_off + position and cross-checks it against [base+player_rva] so you can see
-// they agree. Read-only; validation aid for the name-anchored setup.
-cli_findplayer :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 1 {
-    fmt.eprintln("usage: findplayer <name>")
-    return
-  }
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  pt := session.ptr_size == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
-  obj, noff, ok := find_player_by_name(session, name)
-  if !ok {
-    fmt.eprintfln("findplayer: no mover named '%s' resolved (be fully in-game; if a patch moved the mover struct, the built-in defaults need updating).", name)
-    return
-  }
-  pos, _ := engine.read_vec3(handle, obj + uintptr(session.layout.pos_off))
-  nm, _ := engine.read_obj_name(handle, session.ptr_size, obj, noff)
-  fmt.printfln("findplayer '%s' -> obj=0x%X name_off=0x%X pos=(%.1f, %.1f, %.1f) readback='%s'", name, obj, noff, pos[0], pos[1], pos[2], nm)
-  rva_player := read_ptr_at(handle, base + session.layout.player_rva, pt)
-  if rva_player == obj {
-    fmt.printfln("  [OK] matches [base+player_rva]=0x%X - name-anchor agrees with the known player pointer.", rva_player)
-  } else {
-    fmt.printfln("  [note] [base+player_rva]=0x%X differs (rva stale/patched or ambiguous name); the name-anchor stands on its own.", rva_player)
   }
 }
 
@@ -1272,472 +1229,6 @@ focus_pick :: proc(cands: []Focus_Cand, cur: i64) -> (off: i64, ok: bool) {
     }
   }
   return 0, false
-}
-
-// findfocus -> derive focus_off (m_pObjFocus in CWorld). CLICK a monster in-game first, then run it:
-// it finds the world slot pointing at the selected target and auto-saves focus_off on a single clear
-// hit, else lists candidates. calibrate now does this too when a mob is selected, so you usually
-// don't need findfocus separately.
-cli_findfocus :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  ps := session.ptr_size
-  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
-  world := read_ptr_at(handle, base + session.layout.world_rva, pt)
-  player := read_ptr_at(handle, base + session.layout.player_rva, pt)
-  if world == 0 {
-    fmt.eprintln("world not resolved - run 'setup <name>' first.")
-    return
-  }
-  cands := scan_focus_cands(session, world, player)
-  if len(cands) == 0 {
-    fmt.eprintln("no selected target found in the world object. Click a monster in-game, then re-run findfocus.")
-    return
-  }
-  fmt.printfln("%d world slot(s) point at a live non-player mover:", len(cands))
-  for c in cands {
-    fmt.printfln("  +0x%X -> obj=0x%X '%s' d=%.1f", c.off, c.obj, c.name, c.d)
-  }
-  off, ok := focus_pick(cands[:], session.layout.focus_off)
-  if !ok {
-    fmt.println("multiple candidates - pick the one pointing at the monster you clicked and run 'set focus_off 0x..'.")
-    return
-  }
-  session.layout.focus_off = off
-  fmt.printfln("focus_off = 0x%X", off)
-  if flyff_save_cfg(session.layout, flyff_cfg_path()) {
-    fmt.println("saved to flyff.cfg.")
-  }
-}
-
-// findhp <name> -> derive hp_off (currentHP). Enumerates movers named <name> and finds the 4-byte
-// field that stays within each mob's max HP and varies across them - i.e. current HP. DAMAGE a few
-// (don't kill) first so current != max, else current is indistinguishable from max. Auto-sets hp_off.
-cli_findhp :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 1 {
-    fmt.eprintln("usage: findhp <name>   (damage a few of them first so they're not all full HP)")
-    return
-  }
-  name := strings.trim(strings.join(args, " ", context.temp_allocator), "'\"")
-  LEN :: 0x8000
-
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
-  ps := session.ptr_size
-  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
-  L := session.layout
-  wv, wok := engine.read_value(handle, base + L.world_rva, pt)
-  if !wok {
-    fmt.eprintln("could not read world anchor - run 'setup <name>' first.")
-    return
-  }
-  world := uintptr(engine.value_as_u64(pt, wv))
-  wval := engine.ptr_to_value(world, ps)
-  all := engine.collect_regions(handle, true)
-  defer delete(all)
-  set := engine.scan_exact_regions(handle, pt, wval, all[:], nil, context.temp_allocator)
-  bufs := make([dynamic][]byte, context.temp_allocator)
-  for m in set.matches {
-    obj := uintptr(i64(m.addr) - L.field_off)
-    vt, vok := engine.read_value(handle, obj, pt)
-    if !vok || !in_module_range(uintptr(engine.value_as_u64(pt, vt)), base, mod_end) {
-      continue
-    }
-    if engine.read_obj_type(handle, obj, L.pos_off) != L.mover_type {
-      continue
-    }
-    nm, nok := engine.read_obj_name(handle, ps, obj, L.name_off)
-    if !nok || !strings.contains(nm, name) {
-      continue
-    }
-    b := make([]byte, LEN, context.temp_allocator)
-    engine.read_into(handle, obj, b)
-    append(&bufs, b)
-  }
-  n := len(bufs)
-  fmt.printfln("findhp '%s': %d movers.", name, n)
-  if n < 2 {
-    fmt.println("need >=2 of them on screen. get more into view and retry.")
-    return
-  }
-
-  // maxHP candidates: fields where a majority of mobs share a plausible value (maxHP is constant
-  // per species even on damaged mobs; a few transient/just-spawned mobs may differ). We try each.
-  MaxCand :: struct {
-    off: int,
-    val: u32,
-    cnt: int,
-  }
-  maxc := make([dynamic]MaxCand, context.temp_allocator)
-  mo := 0
-  for mo + 4 <= LEN {
-    v, c := hp_modal(bufs, mo)
-    if v >= 40 && v <= 1_000_000 && c * 100 >= n * 55 {
-      append(&maxc, MaxCand{mo, v, c})
-    }
-    mo += 4
-  }
-  if len(maxc) == 0 {
-    fmt.println("no stable per-species field to anchor maxHP on. Mixed species/levels? Try a more specific name.")
-    return
-  }
-  anchor := maxc[0] // highest-agreement candidate, for the failure diagnostic
-  for mc in maxc {
-    if mc.cnt > anchor.cnt || (mc.cnt == anchor.cnt && mc.val > anchor.val) {
-      anchor = mc
-    }
-  }
-
-  // currentHP: for normal mobs (max field == mc.val) values are in [0,max], most alive (cur>0),
-  // with some full (==max) and some damaged (0<cur<max). Tolerate a few outliers; rank by full.
-  best_co, best_mo, best_full, best_dmg := -1, -1, -1, -1
-  best_maxval: u32 = 0
-  for mc in maxc {
-    co := 0
-    for co + 4 <= LEN {
-      if co != mc.off {
-        norm, alive, full, dmg, over := 0, 0, 0, 0, 0
-        for i in 0 ..< n {
-          if rd_u32le(bufs[i], mc.off) != mc.val {
-            continue
-          }
-          norm += 1
-          cur := rd_u32le(bufs[i], co)
-          if cur > mc.val {
-            over += 1
-          } else if cur > 0 {
-            alive += 1
-            if cur == mc.val {
-              full += 1
-            } else {
-              dmg += 1
-            }
-          }
-        }
-        if over <= max(2, norm / 8) && full >= 1 && dmg >= 1 && alive * 5 >= norm * 2 && full > best_full {
-          best_co, best_mo, best_full, best_dmg, best_maxval = co, mc.off, full, dmg, mc.val
-        }
-      }
-      co += 4
-    }
-  }
-
-  if best_co >= 0 {
-    session.layout.hp_off = i64(best_co)
-    fmt.printfln(
-      "hp_off = 0x%X (currentHP; maxHP %d at +0x%X; %d full, %d damaged of %d sampled).",
-      best_co,
-      best_maxval,
-      best_mo,
-      best_full,
-      best_dmg,
-      n,
-    )
-    fmt.print("  sample currentHP values:")
-    for i in 0 ..< min(n, 14) {
-      fmt.printf(" %d", rd_u32le(bufs[i], best_co))
-    }
-    fmt.println("")
-    if flyff_save_cfg(session.layout, flyff_cfg_path()) {
-      fmt.println("saved to flyff.cfg.")
-    }
-    return
-  }
-
-  // No clean match - dump diagnostics so currentHP can be picked by eye, then 'set hp_off 0x..'.
-  fmt.print("no clean currentHP match. maxHP candidates:")
-  for mc, i in maxc {
-    if i >= 6 {
-      break
-    }
-    fmt.printf("  +0x%X=%d x%d", mc.off, mc.val, mc.cnt)
-  }
-  fmt.println("")
-  fmt.printfln("fields that vary within [0, %d] (anchor +0x%X, %d/%d mobs):", anchor.val, anchor.off, anchor.cnt, n)
-  shown := 0
-  dco := 0
-  for dco + 4 <= LEN {
-    if dco != anchor.off {
-      over, dmg, full := 0, 0, 0
-      for i in 0 ..< n {
-        if rd_u32le(bufs[i], anchor.off) != anchor.val {
-          continue
-        }
-        cur := rd_u32le(bufs[i], dco)
-        if cur > anchor.val {
-          over += 1
-        } else if cur == anchor.val {
-          full += 1
-        } else if cur > 0 {
-          dmg += 1
-        }
-      }
-      if over == 0 && dmg >= 1 && full >= 1 && shown < 16 {
-        sb := strings.builder_make(context.temp_allocator)
-        fmt.sbprintf(&sb, "  +0x%X full=%d dmg=%d :", dco, full, dmg)
-        c2 := 0
-        for i in 0 ..< n {
-          if c2 >= 10 {
-            break
-          }
-          fmt.sbprintf(&sb, " %d", rd_u32le(bufs[i], dco))
-          c2 += 1
-        }
-        fmt.println(strings.to_string(sb))
-        shown += 1
-      }
-    }
-    dco += 4
-  }
-  if shown == 0 {
-    fmt.println("  (none in range - currentHP is likely past the scan window; tell me and I'll widen it)")
-  }
-}
-
-// hpwatch -> Deterministic currentHP finder (use this when findhp guesses wrong). Click ONE mob to
-// target it and keep it selected, run this, then HIT it during the ~3s window. It diffs the mob's
-// memory and reports every 4-byte field that DROPPED - currentHP is the one that fell by your hit's
-// damage. Auto-sets hp_off if exactly one HP-like field drops.
-cli_hpwatch :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
-  ps := session.ptr_size
-  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
-  L := session.layout
-  world := read_ptr_at(handle, base + L.world_rva, pt)
-  if world == 0 {
-    fmt.eprintln("world not resolved - run 'setup <name>' first.")
-    return
-  }
-  focus := read_ptr_at(handle, world + uintptr(L.focus_off), pt)
-  if focus == 0 || !in_module_range(read_ptr_at(handle, focus, pt), base, mod_end) {
-    fmt.eprintln("no live mob targeted. Click a monster in-game (keep it selected), then run hpwatch.")
-    return
-  }
-  LEN :: 0x8000
-  s1 := make([]byte, LEN, context.temp_allocator)
-  n1, _ := engine.read_into(handle, focus, s1)
-  fmt.println("HIT the targeted mob NOW - watching ~3s...")
-  win.Sleep(3000)
-  if !in_module_range(read_ptr_at(handle, focus, pt), base, mod_end) {
-    fmt.eprintln("the mob despawned / was freed during the window - retry on a tankier one.")
-    return
-  }
-  s2 := make([]byte, LEN, context.temp_allocator)
-  n2, _ := engine.read_into(handle, focus, s2)
-  lim := min(int(n1), int(n2))
-
-  Drop :: struct {
-    off:    int,
-    v1, v2: u32,
-  }
-  drops := make([dynamic]Drop, context.temp_allocator)
-  off := 0
-  for off + 4 <= lim {
-    v1 := rd_u32le(s1, off)
-    v2 := rd_u32le(s2, off)
-    if v2 < v1 && v1 <= 2_000_000 && v1 - v2 <= 1_000_000 {
-      append(&drops, Drop{off, v1, v2})
-    }
-    off += 4
-  }
-  if len(drops) == 0 {
-    fmt.println("no field dropped. Did the hit land (mob still alive)? Retry.")
-    return
-  }
-  fmt.printfln("%d field(s) dropped:", len(drops))
-  for d in drops {
-    fmt.printfln("  +0x%X: %d -> %d  (drop %d)", d.off, d.v1, d.v2, d.v1 - d.v2)
-  }
-  if len(drops) == 1 {
-    session.layout.hp_off = i64(drops[0].off)
-    fmt.printfln("hp_off = 0x%X (auto-set: only field that dropped).", drops[0].off)
-    if flyff_save_cfg(session.layout, flyff_cfg_path()) {
-      fmt.println("saved to flyff.cfg.")
-    }
-  } else {
-    fmt.println("multiple dropped - currentHP is the one that fell by your hit's damage; run 'set hp_off 0x..'.")
-  }
-}
-
-// findpacket [objid] -> Confirm objid_off AND reveal the renumbered SETTARGET packet id. Target a
-// mob and keep it selected, then run this: it reads the mob's objid ([focus+objid_off], or the arg
-// if given) and scans memory for that value immediately followed by a 0x02/0x01 (bClear). The
-// client's outgoing SendSetTarget packet is [type:4][objid:4][bClear:1], so the 4 bytes in front of
-// such a hit ARE the packet id. Click the mob right before running so the send buffer is fresh.
-cli_findpacket :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
-  ps := session.ptr_size
-  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
-  L := session.layout
-
-  objid: u32 = 0
-  if len(args) >= 1 {
-    if v, ok := engine.parse_addr(args[0]); ok {
-      objid = u32(v)
-    }
-  }
-  if objid == 0 {
-    if L.objid_off == 0 {
-      fmt.eprintln("objid_off not set. Run 'set objid_off 0x22F8' first, or pass an objid: findpacket <id>.")
-      return
-    }
-    world := read_ptr_at(handle, base + L.world_rva, pt)
-    focus := read_ptr_at(handle, world + uintptr(L.focus_off), pt)
-    if focus == 0 || !in_module_range(read_ptr_at(handle, focus, pt), base, mod_end) {
-      fmt.eprintln("no live mob targeted. Click a monster in-game (keep it selected), then run findpacket.")
-      return
-    }
-    idv, idok := engine.read_value(handle, focus + uintptr(L.objid_off), .U32)
-    if !idok {
-      fmt.eprintln("couldn't read objid from the target.")
-      return
-    }
-    objid = u32(engine.value_as_u64(.U32, idv))
-  }
-  if objid == 0 {
-    fmt.eprintln("objid is 0 - target a mob first.")
-    return
-  }
-
-  fmt.printfln("targeted objid = %d (0x%X); scanning memory for [objid][02] packets...", objid, objid)
-  pat := [4]byte{byte(objid), byte(objid >> 8), byte(objid >> 16), byte(objid >> 24)}
-  hits := engine.scan_bytes(handle, pat[:], context.temp_allocator)
-
-  shown := 0
-  for h in hits {
-    wb: [16]byte
-    rn, _ := engine.read_into(handle, h - 4, wb[:])
-    if int(rn) < 9 {
-      continue
-    }
-    // wb[0..3] = 4 bytes before objid (candidate packet type); wb[8] = byte after objid (bClear)
-    if wb[8] == 0x02 || wb[8] == 0x01 {
-      typ := u32(wb[0]) | u32(wb[1]) << 8 | u32(wb[2]) << 16 | u32(wb[3]) << 24
-      fmt.printfln("  0x%X: type=0x%X (objid=%d, bClear=%d)", h, typ, objid, wb[8])
-      shown += 1
-      if shown >= 20 {
-        break
-      }
-    }
-  }
-  fmt.printfln("(%d total occurrences of the objid; %d look like SETTARGET packets)", len(hits), shown)
-  if shown == 0 {
-    fmt.println(
-      "no [objid][02] found. Click the mob again right before running (buffer may have flushed); if it never appears the wire is likely encrypted.",
-    )
-  } else {
-    fmt.println("that 'type' is the renumbered PACKETTYPE_SETTARGET - next: codescan 0x<type> to find SendSetTarget.")
-  }
-}
-
-// packetwatch -> Deterministic SETTARGET-packet finder (use when findpacket only shows coincidental
-// hits). Target a mob, run this, then CLICK A DIFFERENT MOB during the window. It snapshots writable
-// memory first, then reports only [objid][02] that FRESHLY appeared (bytes changed since the
-// snapshot) - stripping every coincidental static match, leaving the actual outgoing packet. The 4
-// bytes before it are the renumbered packet id.
-cli_packetwatch :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  handle := session.proc_info.handle
-  base := session.proc_info.base
-  mod_end := base + uintptr(session.proc_info.module_size)
-  ps := session.ptr_size
-  pt := ps == 4 ? engine.Value_Type.U32 : engine.Value_Type.U64
-  L := session.layout
-  if L.objid_off == 0 {
-    fmt.eprintln("objid_off not set. Run 'set objid_off 0x22F8' first.")
-    return
-  }
-  world := read_ptr_at(handle, base + L.world_rva, pt)
-  if world == 0 {
-    fmt.eprintln("world not resolved - run 'setup <name>' first.")
-    return
-  }
-  snap := engine.take_snapshot(handle, .U32, true, context.temp_allocator)
-  fmt.printfln(
-    "baseline captured (%d regions). Now CLICK A DIFFERENT MOB in-game to send a fresh SETTARGET... (~3s)",
-    len(snap.regions),
-  )
-  win.Sleep(3000)
-  focus := read_ptr_at(handle, world + uintptr(L.focus_off), pt)
-  if focus == 0 || !in_module_range(read_ptr_at(handle, focus, pt), base, mod_end) {
-    fmt.eprintln("no mob targeted after the click - retry and make sure you click a mob.")
-    return
-  }
-  idv, idok := engine.read_value(handle, focus + uintptr(L.objid_off), .U32)
-  if !idok {
-    fmt.eprintln("couldn't read the new objid.")
-    return
-  }
-  objid := u32(engine.value_as_u64(.U32, idv))
-  idb := [4]byte{byte(objid), byte(objid >> 8), byte(objid >> 16), byte(objid >> 24)}
-  fmt.printfln("new target objid = %d (0x%X); scanning for freshly-written [objid][02]...", objid, objid)
-
-  found := 0
-  outer: for rc in snap.regions {
-    cur := make([]byte, len(rc.data), context.temp_allocator)
-    n, ok := engine.read_into(handle, rc.base, cur)
-    if !ok {
-      continue
-    }
-    lim := min(int(n), len(rc.data))
-    off := 4
-    for off + 5 <= lim {
-      if cur[off] == idb[0] &&
-         cur[off + 1] == idb[1] &&
-         cur[off + 2] == idb[2] &&
-         cur[off + 3] == idb[3] &&
-         cur[off + 4] == 0x02 {
-        changed := false
-        for k in 0 ..< 5 {
-          if cur[off + k] != rc.data[off + k] {
-            changed = true
-            break
-          }
-        }
-        if changed {
-          typ := u32(cur[off - 4]) | u32(cur[off - 3]) << 8 | u32(cur[off - 2]) << 16 | u32(cur[off - 1]) << 24
-          fmt.printfln("  0x%X: type=0x%X (freshly written)", rc.base + uintptr(off), typ)
-          found += 1
-          if found >= 20 {
-            break outer
-          }
-        }
-      }
-      off += 1
-    }
-  }
-  fmt.printfln("(%d freshly-written SETTARGET packet(s))", found)
-  if found == 0 {
-    fmt.println(
-      "nothing new appeared. Either you didn't click a different mob in the window, or the packet is encrypted before reaching a readable buffer. Retry once; if still nothing, it's encryption.",
-    )
-  } else {
-    fmt.println("that NEW type is PACKETTYPE_SETTARGET - run 'codescan 0x<type>' to find SendSetTarget.")
-  }
 }
 
 // ---------------------------------------------------------------------------

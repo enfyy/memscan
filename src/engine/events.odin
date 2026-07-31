@@ -1,7 +1,7 @@
 package engine
 
 // ===========================================================================
-// Event Board + Inbox - two tiny generic message containers.
+// Event Board - a tiny generic per-tick message latch.
 //
 // Copied from the author's RTS engine (C:\Users\jul\Documents\GitHub\rts,
 // src/events/events.odin). The verbs are renamed to the noun_verb form this
@@ -16,9 +16,11 @@ package engine
 // senses and interrupts need (see flyff/behaviour.odin). Sense once, then let any
 // number of readers ask, instead of each one polling the game independently.
 //
-// INBOX is the queue: fixed capacity, preserves duplicates, drainable, and posts
-// to a full inbox are refused rather than dropping what's already queued. Suits
-// deferred commands (the radar already hand-rolls this shape in radar.odin).
+// The RTS original also has an Inbox (a fixed-capacity queue that preserves
+// duplicates). It was copied over with the Board and never used - the radar's
+// deferred-command list, the one thing shaped like it, predates this file and
+// hand-rolls a [dynamic]string. Deleted rather than kept "in case": an unused
+// generic is a thing every reader has to rule out.
 // ===========================================================================
 
 // At most one message per kind until cleared. $Kind must be an enum.
@@ -26,17 +28,6 @@ Board :: struct($Kind: typeid, $Message: typeid) {
   posted: bit_set[Kind],
   data:   [Kind]Message,
 }
-
-// Fixed-capacity pending message list. Unlike Board, identity is the message itself
-// (e.g. a union tag), so duplicates are preserved.
-Inbox :: struct($Message: typeid, $N: uint) {
-  items: [N]Message,
-  size:  int,
-}
-
-// ---------------------------------------------------------------------------
-// Board
-// ---------------------------------------------------------------------------
 
 board_clear :: proc(board: ^Board($Kind, $Message)) {
   if board == nil {
@@ -68,57 +59,4 @@ board_get :: proc(board: ^Board($Kind, $Message), kind: Kind) -> (message: Messa
     return
   }
   return board.data[kind], true
-}
-
-// ---------------------------------------------------------------------------
-// Inbox
-// ---------------------------------------------------------------------------
-
-inbox_clear :: proc(inbox: ^Inbox($Message, $N)) {
-  if inbox == nil {
-    return
-  }
-  inbox.size = 0
-}
-
-// Returns false when the inbox is full; queued messages are left intact.
-inbox_post :: proc(inbox: ^Inbox($Message, $N), message: Message) -> bool {
-  if inbox == nil {
-    return false
-  }
-  if uint(inbox.size) >= N {
-    return false
-  }
-  inbox.items[inbox.size] = message
-  inbox.size += 1
-  return true
-}
-
-inbox_count :: proc "contextless" (inbox: ^Inbox($Message, $N)) -> int {
-  if inbox == nil {
-    return 0
-  }
-  return inbox.size
-}
-
-inbox_empty :: proc "contextless" (inbox: ^Inbox($Message, $N)) -> bool {
-  return inbox_count(inbox) == 0
-}
-
-// The live messages, in post order. Borrowed - valid until the next post/clear.
-inbox_drain :: proc(inbox: ^Inbox($Message, $N)) -> []Message {
-  if inbox == nil {
-    return nil
-  }
-  return inbox.items[:inbox.size]
-}
-
-inbox_get :: proc(inbox: ^Inbox($Message, $N), index: int) -> (message: Message, ok: bool) #optional_ok {
-  if inbox == nil {
-    return
-  }
-  if index < 0 || index >= inbox.size {
-    return
-  }
-  return inbox.items[index], true
 }

@@ -473,13 +473,13 @@ derive_jump_msg :: proc(session: ^Session, sendactmsg_rva: uintptr) -> (msg: u32
   handle := session.proc_info.handle
   base := session.proc_info.base
   mod_end := base + uintptr(session.proc_info.module_size)
-  sbuf: [80]byte
-  engine.read_into(handle, base + sendactmsg_rva, sbuf[:])
-  for i := 0; i + 5 <= len(sbuf); i += 1 {
-    if sbuf[i] != 0xE8 { // E8 rel32 = call
+  text_buffers: [80]byte
+  engine.read_into(handle, base + sendactmsg_rva, text_buffers[:])
+  for i := 0; i + 5 <= len(text_buffers); i += 1 {
+    if text_buffers[i] != 0xE8 { // E8 rel32 = call
       continue
     }
-    rel := i32(u32(sbuf[i + 1]) | u32(sbuf[i + 2]) << 8 | u32(sbuf[i + 3]) << 16 | u32(sbuf[i + 4]) << 24)
+    rel := i32(u32(text_buffers[i + 1]) | u32(text_buffers[i + 2]) << 8 | u32(text_buffers[i + 3]) << 16 | u32(text_buffers[i + 4]) << 24)
     tgt := base + sendactmsg_rva + uintptr(i) + 5 + uintptr(int(rel))
     if tgt < base || tgt >= mod_end {
       continue
@@ -585,22 +585,6 @@ case_writes_sjump1 :: proc(body: []byte) -> bool {
 // position
 // ---------------------------------------------------------------------------
 
-// position (aliases: pos, /position) - print the player's world position, with a copy-paste x,y,z form
-// (commas, no spaces) that calibrate / moveto / findpos accept directly.
-cli_position :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  pos, ok := read_player_pos(session)
-  if !ok {
-    fmt.eprintln("couldn't read player position - run 'setup <name>' first (need a resolved player).")
-    return
-  }
-  fmt.printfln("position: x=%.3f  y=%.3f  z=%.3f", pos[0], pos[1], pos[2])
-  fmt.printfln("copy: %.3f,%.3f,%.3f", pos[0], pos[1], pos[2])
-}
-
 // ---------------------------------------------------------------------------
 // preconditions + coord parsing + write helpers
 // ---------------------------------------------------------------------------
@@ -688,4 +672,288 @@ wr_vec3 :: proc(handle: win.HANDLE, addr: uintptr, v: [3]f32) -> bool {
   put32_le(b[8:], transmute(u32)v[2])
   w: uint
   return win.WriteProcessMemory(handle, rawptr(addr), raw_data(b[:]), 12, &w) != win.FALSE && w == 12
+}
+
+// ---------------------------------------------------------------------------
+// findactive - pin m_bActiveNeuz, the flag that gates the client's own input pass
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. Posting W/A/S/D to an unfocused window sets g_bKeyTable correctly and the character
+// still does not move, because _Interface/WndWorldControlPlayer.cpp opens its per-frame input pass with:
+//
+//     if (g_Neuz.m_bActiveNeuz == FALSE || <chat box focused>) {
+//         g_bKeyTable[g_Neuz.Key.chUp] = FALSE;   // + chLeft / chBack / chRight / chQuest / 'E'
+//     }
+//
+// It does not skip the movement keys, it ZEROES them, every frame the window is inactive. Hold this flag
+// TRUE and the client's OWN code does the walking and turning - at its own turn rate, with its own air
+// control - which is the only way to get movement identical to holding the keys. A/D are OBJMSG_LTURN /
+// OBJMSG_RTURN, not strafe, and the client asserts OBJMSG_STOP_TURN every frame no key is held, so
+// injecting turn messages from a 50Hz tick loses to a 60Hz+ render loop by construction. See keys.odin.
+//
+// WHY THE TOOL SAMPLES ITSELF, instead of asking you to run it once per focus state.
+//
+// The first cut of this had a phase-per-command design: "run findactive with the game focused, now alt-tab,
+// now run it again". That cannot work, and it is worth writing down why, because it looks reasonable right
+// up until you try it: TYPING THE COMMAND MEANS MEMSCAN IS FOCUSED, so the game is inactive and the flag
+// reads 0 at the moment of every sample. The one state you most need to observe is the one you can never be
+// in while issuing an instruction.
+//
+// So the sampling moved onto the watcher tick and the tool decides the polarity itself: GetForegroundWindow
+// against the client's own hwnd (which keys.odin already resolves for PostMessage) says whether it is active
+// RIGHT NOW, and a candidate must read 1 in every foreground sample and 0 in every background one. That is a
+// CORRELATED diff rather than "something that changed", which is much stronger - and it needs no timing from
+// the user at all. Arm it and alt-tab in and out a couple of times.
+//
+// Restricted to the MODULE IMAGE. g_Neuz is a global, so the flag lives in Neuz.exe's own static data;
+// scanning the whole address space would drag in thousands of unrelated heap DWORDs holding 1. Bounding it
+// to [base, base+module_size) also makes the result an RVA, which is what survives a restart.
+//
+// SEEDED ON A FOREGROUND SAMPLE ONLY. Seeding while the client is inactive would collect every zero DWORD in
+// the image, which is most of it; seeding on == 1 starts from a few hundred.
+
+ACTIVE_CONFIRM_FLIPS :: 3 // focus CHANGES a lone survivor must keep agreeing across before it is pinned
+
+// Companion to read_f32_at (terrain.odin), for the places that want a DWORD with a success flag.
+read_u32_at :: proc(handle: win.HANDLE, addr: uintptr) -> (u32, bool) {
+  if v, ok := engine.read_value(handle, addr, .U32); ok {
+    return u32(engine.value_as_u64(.U32, v)), true
+  }
+  return 0, false
+}
+
+// Is the attached client the foreground window right now?
+@(private = "file")
+game_is_foreground :: proc(session: ^Session) -> (foreground: bool, known: bool) {
+  hwnd, ok := game_window(session)
+  if !ok || hwnd == nil {
+    return false, false
+  }
+  return win.GetForegroundWindow() == hwnd, true
+}
+
+// One sample, on the watcher tick. Narrows the candidate set, and pins the flag as soon as exactly one
+// address has been seen holding 1 while the client was foreground AND 0 while it was not.
+active_flag_scan_tick :: proc(session: ^Session) {
+  if !session.active_scan_on || !session.attached {
+    return
+  }
+  foreground, known := game_is_foreground(session)
+  if !known {
+    return // cannot tell which state we are in, so a sample would mean nothing
+  }
+  handle := session.proc_info.handle
+
+  if session.active_cand_count == 0 {
+    if !foreground {
+      return // seed on a foreground sample only - see the note above
+    }
+    base := session.proc_info.base
+    mod_end := base + uintptr(session.proc_info.module_size)
+    regions := engine.collect_regions(handle, false)
+    defer delete(regions)
+    for r in regions {
+      rs := max(r.base, base)
+      re := min(r.base + uintptr(r.size), mod_end)
+      if rs >= re {
+        continue
+      }
+      buf := make([]byte, int(re - rs))
+      defer delete(buf)
+      n, ok := engine.read_into(handle, rs, buf)
+      if !ok {
+        continue
+      }
+      for off := 0; off + 4 <= int(n); off += 4 {
+        if rd_u32le(buf, off) == 1 {
+          append(&session.active_cands, rs + uintptr(off))
+        }
+      }
+    }
+    session.active_cand_count = len(session.active_cands)
+    session.active_saw_fg = 1
+    fmt.printf("\n[findactive] %d candidate(s) with the game focused. Now click away from it, then back, once or twice.\n", session.active_cand_count)
+    fmt.print("memscan> ")
+    return
+  }
+
+  want: u32 = foreground ? 1 : 0
+  kept := 0
+  for i in 0 ..< session.active_cand_count {
+    addr := session.active_cands[i]
+    if v, ok := read_u32_at(handle, addr); ok && v == want {
+      session.active_cands[kept] = addr
+      kept += 1
+    }
+  }
+  before := session.active_cand_count
+  session.active_cand_count = kept
+  if foreground {
+    session.active_saw_fg += 1
+  } else {
+    session.active_saw_bg += 1
+  }
+
+  if kept == 0 {
+    // Covers the case where the single CONFIRMING candidate disagreed, which is the entire point of the
+    // confirm phase - so say that, rather than reporting it as a generic wipe.
+    fmt.printf(
+      "\n[findactive] %s - re-seeding on the next focused sample.\n",
+      session.active_confirming ? "the candidate FAILED confirmation (it was a coincidence)" : "every candidate was eliminated",
+    )
+    fmt.print("memscan> ")
+    clear(&session.active_cands)
+    session.active_confirming = false
+    session.active_saw_fg, session.active_saw_bg = 0, 0
+    return
+  }
+  // BOTH polarities are required, and then a CONFIRM phase on top.
+  //
+  // Requiring one sample of each is not enough on its own: the client has more than one flag derived from
+  // activation, so a decoy can correlate for a single transition and then diverge. Narrowing to one address
+  // is a hypothesis, not an answer - so once there is a single survivor it has to keep agreeing across
+  // ACTIVE_CONFIRM_FLIPS further transitions before it is written anywhere. A survivor that then disagrees
+  // is thrown out and the scan re-seeds, which is exactly what should happen to a lucky coincidence.
+  if kept == 1 && session.active_saw_fg > 0 && session.active_saw_bg > 0 {
+    if !session.active_confirming {
+      session.active_confirming = true
+      session.active_confirm_flips = 0
+      session.active_confirm_last = foreground
+      fmt.printf("\n[findactive] one candidate left (RVA 0x%X) - confirming across a few more alt-tabs...\n", session.active_cands[0] - session.proc_info.base)
+      fmt.print("memscan> ")
+      return
+    }
+    // Count TRANSITIONS, not samples: fifty ticks in the same focus state prove nothing new.
+    if foreground != session.active_confirm_last {
+      session.active_confirm_last = foreground
+      session.active_confirm_flips += 1
+    }
+    if session.active_confirm_flips < ACTIVE_CONFIRM_FLIPS {
+      return
+    }
+    rva := session.active_cands[0] - session.proc_info.base
+    session.layout.activeflag_rva = rva
+    session.active_scan_on = false
+    session.active_confirming = false
+    clear(&session.active_cands)
+    session.active_cand_count = 0
+    flyff_save_cfg(session.layout, flyff_cfg_path())
+    fmt.printf(
+      "\n[findactive] activeflag_rva = 0x%X   (m_bActiveNeuz, confirmed over %d focus changes - saved to flyff.cfg)\n",
+      rva, session.active_confirm_flips,
+    )
+    fmt.printf(
+      "  bgkeys is %s - key_down W/A/S/D now move and TURN with the game in the background.\n",
+      session.bgkeys_on ? "ON (the default)" : "OFF - 'bgkeys on' to use it",
+    )
+    fmt.print("memscan> ")
+    return
+  }
+  if kept != before {
+    fmt.printf(
+      "\n[findactive] %d -> %d candidate(s)   (%s sample; %d focused / %d away so far)\n",
+      before, kept, foreground ? "focused" : "away", session.active_saw_fg, session.active_saw_bg,
+    )
+    fmt.print("memscan> ")
+  }
+}
+
+cli_findactive :: proc(session: ^Session, args: []string) {
+  if len(args) >= 1 && (args[0] == "off" || args[0] == "stop" || args[0] == "reset") {
+    session.active_scan_on = false
+    clear(&session.active_cands)
+    session.active_cand_count = 0
+    session.active_confirming = false
+    session.active_saw_fg, session.active_saw_bg = 0, 0
+    fmt.println("findactive: stopped.")
+    return
+  }
+  if !session.attached {
+    fmt.eprintln("findactive: attach first.")
+    return
+  }
+  if session.proc_info.module_size == 0 {
+    fmt.eprintln("findactive: module size unknown - re-attach.")
+    return
+  }
+  if _, ok := game_window(session); !ok {
+    fmt.eprintln("findactive: cannot find the client's window - is it running and visible?")
+    return
+  }
+  if session.active_scan_on {
+    fmt.printfln(
+      "findactive: already watching - %d candidate(s), %d focused / %d away sample(s).",
+      session.active_cand_count, session.active_saw_fg, session.active_saw_bg,
+    )
+    fmt.println("  Keep alt-tabbing in and out of the game; it prints when it has pinned one. 'findactive off' cancels.")
+    return
+  }
+  session.active_scan_on = true
+  clear(&session.active_cands)
+  session.active_cand_count = 0
+  session.active_confirming = false
+  session.active_saw_fg, session.active_saw_bg = 0, 0
+  engine.ensure_hotkey_thread(&session.eng) // the sampling rides the watcher tick
+  fmt.println("findactive: watching. NOTHING TO TYPE - just click the game window, wait a second,")
+  fmt.println("  click back here (or anywhere else), and repeat once or twice.")
+  fmt.println("  It samples itself and works out which state it is in. It prints when it has the flag.")
+}
+
+// Hold m_bActiveNeuz TRUE. Re-asserted every tick rather than written once, because WM_ACTIVATE sets it
+// FALSE again every time focus really leaves the client.
+active_flag_tick :: proc(session: ^Session) {
+  if !session.bgkeys_on || !session.attached || session.layout.activeflag_rva == 0 {
+    return
+  }
+  addr := session.proc_info.base + session.layout.activeflag_rva
+  if v, ok := read_u32_at(session.proc_info.handle, addr); ok && v != 0 {
+    return // already TRUE - a focused session costs one read per tick and no write at all
+  }
+  wr_u32(session.proc_info.handle, addr, 1)
+}
+
+active_flag_configured :: proc(session: ^Session) -> bool {
+  return session.layout.activeflag_rva != 0
+}
+
+cli_bgkeys :: proc(session: ^Session, args: []string) {
+  if len(args) == 0 {
+    // Attach-aware, because flyff.cfg (and so the mirrored default) only loads on attach - reporting a
+    // flat "off" while also saying "on by default" is the kind of contradiction that reads as a bug.
+    if !session.attached {
+      fmt.println("bgkeys: on by default, but nothing is loaded yet - flyff.cfg loads when you attach.")
+      fmt.println("  usage: bgkeys on|off")
+      return
+    }
+    fmt.printfln(
+      "bgkeys: %s   (activeflag_rva=0x%X)",
+      session.bgkeys_on ? "ON - movement keys work with the game in the background" : "off",
+      session.layout.activeflag_rva,
+    )
+    if session.layout.activeflag_rva == 0 {
+      fmt.println("  INERT: activeflag_rva isn't pinned, so there is nothing to hold open - harmless until")
+      fmt.println("  then. Run 'findactive' (it watches while you alt-tab; nothing to time).")
+    }
+    fmt.println("  usage: bgkeys on|off")
+    return
+  }
+  switch args[0] {
+  case "on":
+    if session.layout.activeflag_rva == 0 {
+      fmt.eprintln("bgkeys: activeflag_rva isn't pinned - run 'findactive' first.")
+      return
+    }
+    session.bgkeys_on = true
+    session.layout.bgkeys_on = true
+    engine.ensure_hotkey_thread(&session.eng) // the flag is re-asserted on the watcher tick
+    fmt.println("bgkeys ON - the client's input pass now runs while its window is in the background,")
+    fmt.println("  so key_down W / A / S / D move and TURN exactly as if you were holding them.")
+  case "off":
+    session.bgkeys_on = false
+    session.layout.bgkeys_on = false
+    fmt.println("bgkeys off - the client goes back to ignoring movement keys unless it is focused.")
+  case:
+    fmt.eprintfln("bgkeys: unknown '%s' - usage: bgkeys on|off", args[0])
+  }
+  flyff_save_cfg(session.layout, flyff_cfg_path())
 }

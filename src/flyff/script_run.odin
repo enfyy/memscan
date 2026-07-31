@@ -1,8 +1,13 @@
 package flyff
 
+// base:builtin only for `builtin.any`: this package declares its own `any` (builder.odin's condition
+// join, `any(a, b)`), which shadows the builtin TYPE of that name - so a `..any` vararg here resolves to
+// the proc and does not compile. Qualifying it is the fix; see script_trace.
+import "base:builtin"
 import "core:fmt"
 import "core:os"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 import "core:time"
 
@@ -42,7 +47,7 @@ st_script :: proc(user_data: rawptr, phase: engine.State_Phase) -> engine.State_
     // otherwise that escape hatch would need you to hand-step your own kill switch.
     if !run.paused {
       script_interrupts(ctx)
-      if !run.stepping || run.irq_depth > 0 {
+      if !run.stepping || run.watcher_depth > 0 {
         script_walk(ctx)
       }
     }
@@ -76,16 +81,31 @@ script_teardown :: proc(ctx: ^Behaviour_Context) {
   script_exit_current(ctx)
   // Latch handover, half two: give the edge state back to the Session-level watchers before this run
   // stops being the evaluator. Without it, a trigger that is still true when the chart ends would look
-  // like a fresh rising edge to irq_tick a moment later and fire again. See interrupt.odin.
+  // like a fresh rising edge to armed_watcher_tick a moment later and fire again. See interrupt.odin.
   run := &ctx.session.script
   for &w in run.watchers {
-    if w.global == "" {
+    if w.global_source == "" {
       continue
     }
-    if g := irq_find(ctx.session, w.global); g != nil {
-      g.ev_state.latched = w.ev_state.latched
+    if g := armed_watcher_find(ctx.session, w.global_source, w.global_body_id); g != nil {
+      g.condition_state.latched = w.condition_state.latched
       g.fires += w.fires
     }
+  }
+  // Let go of every key a key_down left held. Those blocks have no `exit` on purpose - the whole point
+  // is that the hold outlives the step - so the run is the level that owes the release, and this is the
+  // one path every ending goes through. Without it, stopping a chart mid-hold would leave you running
+  // into a wall with nothing left to stop it (see keys.odin).
+  if n := keys_release_all(ctx.session); n > 0 {
+    fmt.printf("\n[script] released %d key(s) still held down.\n", n)
+    fmt.print("memscan> ")
+    script_trace(ctx.session, 0, .Note, "released %d key(s) still held down", n)
+  }
+  // The farm chart ending IS auto ending - `script stop` on it, its kill quota running out, or a
+  // `stop` node all have to leave auto_on false, or `status` and F10 would keep claiming it is farming.
+  // The other direction lives in auto_stop.
+  if run.name == "auto" {
+    ctx.session.auto_on = false
   }
   run.active = false
 }
@@ -107,22 +127,26 @@ script_interrupts :: proc(ctx: ^Behaviour_Context) {
   // Already inside a region: evaluate nothing. Not even the latches - a condition that becomes true
   // while the region runs is a real edge that has not been serviced yet, and it should fire once the
   // region returns rather than be quietly swallowed here.
-  if run.irq_depth > 0 {
+  if run.watcher_depth > 0 {
     return
   }
-  for &w in run.watchers {
+  for &w, wi in run.watchers {
     // Through script_event_fired, not def.fired, so `on not <event> -> ...` negates like everywhere else.
-    if !script_event_fired(ctx, w.cond, &w.ev_state) {
-      w.ev_state.latched = false // condition went away - re-arm for the next edge
+    if !script_condition_holds(ctx, w.condition, &w.condition_state) {
+      w.condition_state.latched = false // condition went away - re-arm for the next edge
       continue
     }
-    if w.ev_state.latched {
+    if w.condition_state.latched {
       continue // still true from a previous fire; not a new edge
     }
-    w.ev_state.latched = true
+    w.condition_state.latched = true
     w.fires += 1
     fmt.printf("\n[script] interrupt: %s\n", w.src)
     fmt.print("memscan> ")
+    // Anchored on the first node of its BODY: a watcher's own `.On` node id is not carried on the
+    // hoisted row, and the body is what the trace strip should jump you to anyway.
+    body_node := w.entry >= 0 && w.entry < len(run.steps) ? run.steps[w.entry].id : Node_Id(0)
+    script_trace(ctx.session, body_node, .Note, "WATCHER fired: %s", w.src)
     if w.entry < 0 {
       return // nothing to run (an unimplemented block); the edge still counts as serviced
     }
@@ -130,14 +154,15 @@ script_interrupts :: proc(ctx: ^Behaviour_Context) {
     // program from here on: it polls across ticks and its exit runs, so an interrupt can walk somewhere
     // and actually arrive. A body that never finishes freezes the main program until `script stop` -
     // which is the same deal as any other blocking step, and visible in `script` as the current step.
-    run.irq_save = Irq_Frame {
+    run.suspended = Suspended_Frame {
       pc      = run.pc,
       entered = run.entered,
       nloop   = run.nloop,
       loops   = run.loops,
     }
-    run.irq_depth = 1
-    run.nloop = 0 // the region gets its own loop stack; the main program's is in irq_save
+    run.watcher_depth = 1
+    run.active_watcher = wi // which watcher has control, so the UI can light the right chip
+    run.nloop = 0 // the region gets its own loop stack; the main program's is in suspended
     script_goto(run, w.entry)
     return
   }
@@ -153,11 +178,17 @@ script_goto :: proc(run: ^Script_Run, pc: int) {
   run.entered = false
 }
 
-// Where control goes once <step> is done. A step with no explicit edge falls through to the next array
-// slot - which is what builder.odin emits, since it writes steps in execution order. A node placed on a
-// canvas has no "next slot" to fall into, so it names its successor and that wins.
+// Where control goes once <step> is done.
+//
+// Only .Action and .Wait_For reach here (script_advance is called from nowhere else - every structured
+// op does its own `pc + 1`), and neither of them falls through any more: their fall-throughs were made
+// explicit when the document was created. So an unnamed successor is the END of the program, and -1 is
+// how the walker is already told that, by .Branch's unwired false arm. See script_op_falls_through.
 script_next_pc :: proc(run: ^Script_Run, step: ^Script_Step) -> int {
-  return step.goto_id != 0 ? step.jump : run.pc + 1
+  if step.goto_id != 0 {
+    return step.jump
+  }
+  return script_op_falls_through(step.op) ? run.pc + 1 : -1
 }
 
 // Advance past the current step, running its exit first.
@@ -170,6 +201,31 @@ script_advance :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
   }
   run.steps_done += 1
   script_goto(run, script_next_pc(run, step))
+}
+
+// An action that FAILED leaves by its else edge when one is wired, instead of ending the run.
+//
+// That edge is what lets a chart draw a fall-through chain: the priority ladder is a row of pick
+// blocks whose fail edges point at the next rung, so "this rung found nothing, ask the next one" is
+// one wire rather than a branch node per rung. Anything else that can fail usefully - a target lock
+// refused because the mob died mid-reach - gets a retry path for free.
+//
+// UNWIRED KEEPS THE OLD BEHAVIOUR: jump_else < 0 means no edge was named, and a failing block then
+// stops the program exactly as before. That is what you still want for, say, a walk that cannot
+// start. The step's exit runs on this path too, same as script_advance - a failed block may well have
+// started something that needs tearing down.
+script_take_fail_edge :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> bool {
+  if step.else_id == 0 || step.jump_else < 0 {
+    return false
+  }
+  run := &ctx.session.script
+  if def := action_def(step.action.kind); def != nil && def.exit != nil {
+    def.exit(ctx, step)
+  }
+  run.steps_done += 1
+  script_goto(run, step.jump_else)
+  script_trace(ctx.session, step.id, .Note, "failed -> fail wire to node %d", u32(step.else_id))
+  return true
 }
 
 script_arm_event :: proc(ctx: ^Behaviour_Context, ev: Script_Event, st: ^Event_State) {
@@ -193,6 +249,38 @@ script_event_fired :: proc(ctx: ^Behaviour_Context, ev: Script_Event, st: ^Event
   return ev.negate ? !res : res
 }
 
+// --- conditions (one or more events, all-of or any-of) --------------------------------------------
+
+// Arm every row. Each gets its OWN baseline: `kills 20 and elapsed 5` has to count kills from here and
+// minutes from here, and one shared Event_State would let whichever row armed second inherit the
+// other's clock.
+script_arm_condition :: proc(ctx: ^Behaviour_Context, condition: Script_Condition, state: ^Condition_State) {
+  latched := state.latched // the latch belongs to the condition and survives a re-arm of its rows
+  state^ = {}
+  state.latched = latched
+  for row in 0 ..< condition_row_count(condition) {
+    script_arm_event(ctx, condition_row(condition, row), &state.rows[row])
+  }
+}
+
+// Evaluate the whole condition. EVERY row is evaluated, even once the answer is known: a row like
+// `kills 20` updates its own state as a side effect of being asked, and short-circuiting would leave
+// the rows after the deciding one frozen at whatever they last saw.
+script_condition_holds :: proc(ctx: ^Behaviour_Context, condition: Script_Condition, state: ^Condition_State) -> bool {
+  rows := condition_row_count(condition)
+  holding := 0
+  for row in 0 ..< rows {
+    if script_event_fired(ctx, condition_row(condition, row), &state.rows[row]) {
+      holding += 1
+    }
+  }
+  return condition.match_any ? holding > 0 : holding == rows
+}
+
+script_condition_armed :: proc(state: Condition_State) -> bool {
+  return state.rows[0].armed
+}
+
 // Run up to SCRIPT_MAX_STEPS_PER_TICK instructions. The budget matters: a program that is all
 // if/var/end would otherwise spin the watcher tick forever without ever yielding.
 script_walk :: proc(ctx: ^Behaviour_Context) {
@@ -212,10 +300,10 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
     }
     // The main program ends at main_len, not at the end of the array: everything past that point is
     // interrupt-region code, which is only reachable by an interrupt firing.
-    off_end := run.pc < 0 || run.pc >= len(run.steps) || (run.irq_depth == 0 && run.pc >= run.main_len)
+    off_end := run.pc < 0 || run.pc >= len(run.steps) || (run.watcher_depth == 0 && run.pc >= run.main_len)
     if off_end {
-      if run.irq_depth > 0 {
-        script_irq_return(run) // a region that ran off its end - resume as if it had returned
+      if run.watcher_depth > 0 {
+        script_watcher_return(ctx) // a region that ran off its end - resume as if it had returned
         continue
       }
       if !script_program_end(ctx) {
@@ -227,7 +315,7 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
     // Every op below that reaches its end in ONE visit counts as an instruction retired; .Action and
     // .Wait_For do it themselves, because they can yield and be revisited many times before they finish.
     #partial switch step.op {
-    case .On, .If, .Else, .Repeat, .While, .End, .Goto, .Branch, .Return:
+    case .On, .If, .Else, .Repeat, .While, .End, .Loop, .Goto, .Branch, .Return:
       run.steps_done += 1
     }
     switch step.op {
@@ -242,9 +330,9 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
           started_at = ctx.now,
         }
         if step.has_until {
-          script_arm_event(ctx, step.until, &step.ev_state)
+          script_arm_condition(ctx, step.until, &step.condition_state)
         }
-        script_note_line(run, step.src)
+        script_note_line(ctx, step)
         def := action_def(step.action.kind)
         if def == nil || def.start == nil {
           script_fail(ctx, step, "block has no implementation")
@@ -252,6 +340,9 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
         }
         switch def.start(ctx, step) {
         case .Failed:
+          if script_take_fail_edge(ctx, step) {
+            continue
+          }
           script_fail(ctx, step, "failed to start")
           return
         case .Done:
@@ -266,7 +357,7 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
         continue
       }
       // Already started: the `until` event can end it early, otherwise poll it.
-      if step.has_until && script_event_fired(ctx, step.until, &step.ev_state) {
+      if step.has_until && script_condition_holds(ctx, step.until, &step.condition_state) {
         script_advance(ctx, step)
         continue
       }
@@ -279,6 +370,9 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
       case .Done:
         script_advance(ctx, step)
       case .Failed:
+        if script_take_fail_edge(ctx, step) {
+          continue
+        }
         script_fail(ctx, step, "failed")
         return
       case .Running:
@@ -286,11 +380,13 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
       }
 
     case .If:
-      script_arm_event(ctx, step.cond, &step.ev_state)
-      script_note_line(run, step.src)
-      if script_event_fired(ctx, step.cond, &step.ev_state) {
+      script_arm_condition(ctx, step.condition, &step.condition_state)
+      script_note_line(ctx, step)
+      if script_condition_holds(ctx, step.condition, &step.condition_state) {
+        script_trace(ctx.session, step.id, .Step, "-> yes")
         script_goto(run, run.pc + 1)
       } else {
+        script_trace(ctx.session, step.id, .Step, "-> no")
         script_goto(run, step.jump)
       }
 
@@ -312,7 +408,7 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
         // Arm a while-condition once, when the loop is first entered - not per iteration, so
         // `while <event>` measures from the loop's start rather than resetting its own baseline.
         if step.op == .While {
-          script_arm_event(ctx, step.cond, &step.ev_state)
+          script_arm_condition(ctx, step.condition, &step.condition_state)
         }
       }
       frame := &run.loops[run.nloop - 1]
@@ -323,7 +419,7 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
           frame.remaining -= 1
         }
       } else {
-        keep = script_event_fired(ctx, step.cond, &step.ev_state)
+        keep = script_condition_holds(ctx, step.condition, &step.condition_state)
       }
       if keep {
         script_goto(run, run.pc + 1)
@@ -343,10 +439,10 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
       if !run.entered {
         run.entered = true
         run.step_at = ctx.now
-        script_arm_event(ctx, step.cond, &step.ev_state)
-        script_note_line(run, step.src)
+        script_arm_condition(ctx, step.condition, &step.condition_state)
+        script_note_line(ctx, step)
       }
-      if script_event_fired(ctx, step.cond, &step.ev_state) {
+      if script_condition_holds(ctx, step.condition, &step.condition_state) {
         run.steps_done += 1
         script_goto(run, script_next_pc(run, step))
         continue
@@ -355,8 +451,28 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
 
     // --- graph ops (the node editor's control flow) ---
 
+    case .Loop:
+      // The graph twin of .Repeat/.End, with the count on the node instead of the run's loop stack.
+      // Control leaves a graph loop by an EDGE, which need not come back through the head, so a stack
+      // frame pushed here could never be reliably popped - and two loops entered in the "wrong" order
+      // would unwind each other's. Per-node state has neither problem and costs two words.
+      if !step.scratch.loop_active {
+        step.scratch.loop_active = true
+        step.scratch.loop_remaining = step.count
+      }
+      script_note_line(ctx, step)
+      if step.scratch.loop_remaining > 0 {
+        step.scratch.loop_remaining -= 1
+        script_trace(ctx.session, step.id, .Step, "-> each pass (%d left after this)", step.scratch.loop_remaining)
+        script_goto(run, step.jump) // another pass over the body
+      } else {
+        step.scratch.loop_active = false // re-arm, so re-entering it later loops again
+        script_trace(ctx.session, step.id, .Step, "-> when done")
+        script_goto(run, step.jump_else)
+      }
+
     case .Goto:
-      script_note_line(run, step.src)
+      script_note_line(ctx, step)
       script_goto(run, step.jump)
 
     case .Branch:
@@ -365,21 +481,29 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
       // `elapsed`/`kills` baselines every pass and the exit could never be reached. This is the same
       // rule .While follows for its condition, for the same reason. (.If keeps re-arming: it is a
       // point-in-time test that control passes through once.)
-      if !step.ev_state.armed {
-        script_arm_event(ctx, step.cond, &step.ev_state)
+      if !script_condition_armed(step.condition_state) {
+        script_arm_condition(ctx, step.condition, &step.condition_state)
       }
-      script_note_line(run, step.src)
-      script_goto(run, script_event_fired(ctx, step.cond, &step.ev_state) ? step.jump : step.jump_else)
+      script_note_line(ctx, step)
+      yes := script_condition_holds(ctx, step.condition, &step.condition_state)
+      // Name the arm AND whether it goes anywhere. An unwired arm is a jump to -1, i.e. the end of the
+      // run, and "-> no (nothing wired, run ends)" is the row that explains a chart stopping at a branch.
+      dest := yes ? step.jump : step.jump_else
+      script_trace(
+        ctx.session, step.id, dest < 0 ? .Error : .Step,
+        "-> %s%s", yes ? "yes" : "no", dest < 0 ? " (nothing wired, run ends)" : "",
+      )
+      script_goto(run, dest)
 
     case .Return:
-      if run.irq_depth == 0 {
+      if run.watcher_depth == 0 {
         // A `return` reached in the main program is simply the end of it - a graph's terminator.
         if !script_program_end(ctx) {
           return
         }
         continue
       }
-      script_irq_return(run)
+      script_watcher_return(ctx)
     }
   }
 }
@@ -387,12 +511,15 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
 // Resume the main program where the interrupt suspended it. pc is restored DIRECTLY rather than through
 // script_goto because `entered` must come back too: the suspended step may have been mid-flight (a walk
 // that is still walking), and re-entering it would re-issue its start.
-script_irq_return :: proc(run: ^Script_Run) {
-  run.pc = run.irq_save.pc
-  run.entered = run.irq_save.entered
-  run.nloop = run.irq_save.nloop
-  run.loops = run.irq_save.loops
-  run.irq_depth = 0
+script_watcher_return :: proc(ctx: ^Behaviour_Context) {
+  run := &ctx.session.script
+  run.pc = run.suspended.pc
+  run.entered = run.suspended.entered
+  run.nloop = run.suspended.nloop
+  run.loops = run.suspended.loops
+  run.watcher_depth = 0
+  run.active_watcher = -1
+  script_trace(ctx.session, 0, .Note, "watcher done - back to step %d", run.pc + 1)
 }
 // The pc ran off the end. Returns true if the walker should keep going (the program looped), false
 // if the run is over. There is no sub-script return path any more: sub-scripts were a stand-in for
@@ -442,14 +569,51 @@ script_kills_of :: proc(run: ^Script_Run, name: string) -> int {
   return n
 }
 
-script_note_line :: proc(run: ^Script_Run, src: string) {
+// --- the trace ring --------------------------------------------------------------------------------
+//
+// Append one row. Allocation-free (fmt.bprintf into the row's own fixed buffer, which truncates rather
+// than growing), so this is safe to call from anywhere on the watcher tick including inside a block.
+//
+// Every caller ALSO keeps whatever it printed to the console. The trace is an additional surface, not a
+// replacement: the console is the copyable record and the ring is what the editor can show.
+script_trace :: proc(session: ^Session, node: Node_Id, level: Script_Trace_Level, format: string, args: ..builtin.any) {
+  t := &session.script_trace
+  row := &t.rows[t.next]
+  row^ = Script_Trace_Row {
+    at    = time.now()._nsec,
+    node  = node,
+    level = level,
+  }
+  row.count = u8(len(fmt.bprintf(row.text[:], format, ..args)))
+  t.next = (t.next + 1) % SCRIPT_TRACE_ROWS
+  t.written += 1
+}
+
+// The node the run is sitting on, for a trace row raised from INSIDE a block - a block proc gets the
+// step it is running but the helpers it calls (script_arg) get only the context.
+script_current_node :: proc(ctx: ^Behaviour_Context) -> Node_Id {
+  run := &ctx.session.script
+  if !run.active || run.pc < 0 || run.pc >= len(run.steps) {
+    return 0
+  }
+  return run.steps[run.pc].id
+}
+
+// Now takes the STEP rather than its source text, because it is also the single place control-arrived-
+// here is traced. Every op that can be entered calls it, so one call site per op covers the narration.
+script_note_line :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
+  run := &ctx.session.script
   delete(run.last_line)
-  run.last_line = strings.clone(src)
+  run.last_line = strings.clone(step.src)
+  script_trace(ctx.session, step.id, .Step, "%s", step.src)
 }
 
 script_fail :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, why: string) {
   fmt.printf("\n[script] step %d (%s) - %s. run stopped.\n", u32(step.id), step.src, why)
   fmt.print("memscan> ")
+  // Say WHY the run is over here rather than leaving it to script_finish's "failed": the fail edge is
+  // the thing an author forgot, and naming it is what turns "the chart stops on node 2" into a fix.
+  script_trace(ctx.session, step.id, .Error, "%s - run ends (no fail wire on this node)", why)
   script_finish(ctx, "failed")
 }
 
@@ -457,9 +621,14 @@ script_finish :: proc(ctx: ^Behaviour_Context, how: string) {
   run := &ctx.session.script
   el := ctx.now - run.started_at
   name := run.name
+  steps_done := run.steps_done
   script_teardown(ctx) // runs the in-flight step's exit; also clears active
-  fmt.printf("\n[script] %s - '%s' %s after %s (%d steps)\n", how, name, how == "complete" ? "finished" : "ended", fmt_elapsed(el), run.steps_done)
+  fmt.printf("\n[script] %s - '%s' %s after %s (%d steps)\n", how, name, how == "complete" ? "finished" : "ended", fmt_elapsed(el), steps_done)
   fmt.print("memscan> ")
+  script_trace(
+    ctx.session, 0, how == "failed" ? .Error : .Note,
+    "run %s after %s (%d steps)", how, fmt_elapsed(el), steps_done,
+  )
 }
 
 // --- starting / stopping ------------------------------------------------------------------------------
@@ -476,7 +645,17 @@ script_check_avail :: proc(session: ^Session, steps: []Script_Step) -> [dynamic]
       return
     }
     seen^ += {act.kind}
-    if def := action_def(act.kind); def != nil && def.avail != nil {
+    def := action_def(act.kind)
+    if def == nil {
+      return
+    }
+    // not_built first: "there is no code behind this" outranks "the process isn't attached", and it is
+    // the answer that stays true after you attach.
+    if def.not_built {
+      append(out, fmt.tprintf("%s: %s", def.name, def.not_built_why))
+      return
+    }
+    if def.avail != nil {
       if ok, why := def.avail(session); !ok {
         append(out, fmt.tprintf("%s: %s", def.name, why))
       }
@@ -487,7 +666,15 @@ script_check_avail :: proc(session: ^Session, steps: []Script_Step) -> [dynamic]
       return
     }
     seen^ += {ev.kind}
-    if def := event_def(ev.kind); def != nil && def.avail != nil {
+    def := event_def(ev.kind)
+    if def == nil {
+      return
+    }
+    if def.not_built {
+      append(out, fmt.tprintf("%s: %s", def.name, def.not_built_why))
+      return
+    }
+    if def.avail != nil {
       if ok, why := def.avail(session); !ok {
         append(out, fmt.tprintf("%s: %s", def.name, why))
       }
@@ -495,7 +682,7 @@ script_check_avail :: proc(session: ^Session, steps: []Script_Step) -> [dynamic]
   }
   for s in steps {
     check_action(session, s.action, &seen_a, &out)
-    check_event(session, s.cond, &seen_e, &out)
+    check_event(session, s.condition, &seen_e, &out)
     if s.has_until {
       check_event(session, s.until, &seen_e, &out)
     }
@@ -516,19 +703,39 @@ script_begin :: proc(
   mode: Script_Mode,
   entry: Node_Id = 0,
   kind: Behaviour_Kind = .Chart,
+  uses: []string = nil,
 ) {
   script_run_free(&session.script)
   run := &session.script
   run.steps = steps
-  // The main program is everything the caller handed us; interrupt regions are appended AFTER this
-  // mark, so the walker knows where to stop even though the array keeps going.
-  run.main_len = len(run.steps)
   run.watchers = make([dynamic]Script_Watcher)
-  script_build_irq_regions(run)
-  // Then the GLOBAL interrupts, after the chart's own `on` lines so the chart's win a tie (first
-  // match wins). Skipped when the thing being run IS an interrupt: you do not want your escape
-  // interrupted by the same escape, and irq_depth only caps nesting within a single run.
-  if kind != .Interrupt {
+  // "Is this a hunt chart" - see hunt_steering_on. Asked of the steps once, here, rather than per pick.
+  run.sidestep_chart = false
+  for step in run.steps {
+    if step.op == .Action && step.action.kind == .Approach && step.action.nums[2] != 0 {
+      run.sidestep_chart = true
+      break
+    }
+  }
+  if kind == .Interrupt {
+    // A watcher's body, run on its own because its trigger fired. NOTHING is armed for it: not the
+    // globals, not what the host borrowed, and not even the document's own `on` nodes. <entry> already
+    // names the body, so the body IS the main program here - hoisting it into a region as well would
+    // mean the run started by falling off the end of an empty program and only worked because the
+    // watcher happened to fire on the first tick. And an escape that can be interrupted by the same
+    // escape re-fires on its own still-true trigger forever; watcher_depth only caps nesting once inside.
+    run.main_len = len(run.steps)
+  } else {
+    // The main program ends where the inline watcher bodies begin; regions are appended after that, so
+    // the walker knows where to stop even though the array keeps going.
+    run.main_len = script_partition_watcher_bodies(&run.steps, entry)
+    script_build_irq_regions(run)
+    // Then the borrowed ones, in the order the chart lists them, and the GLOBAL ones last - so a
+    // chart's own `on` beats one it borrowed, which beats one that is simply always on. First match
+    // wins, which is the rule script_interrupts already followed.
+    for u in uses {
+      script_attach_doc_watchers(session, run, u, "")
+    }
     script_attach_global_irqs(session, run)
   }
   // Identity -> position, once, here, AFTER the regions exist so their ids are in the map too.
@@ -561,7 +768,8 @@ script_begin :: proc(
   run.entry_pc = start // where a Loop-mode wrap and `script reset` go back to
   run.entered = false
   run.paused = false
-  run.irq_depth = 0
+  run.watcher_depth = 0
+  run.active_watcher = -1
   run.started_at = time.now()._nsec
   run.step_at = run.started_at
 
@@ -571,18 +779,27 @@ script_begin :: proc(
     board   = &session.bh_board,
   }
   for &w in run.watchers {
-    script_arm_event(&ctx, w.cond, &w.ev_state)
+    script_arm_condition(&ctx, w.condition, &w.condition_state)
     // Latch handover, half one. A hoisted global interrupt has been watching since it was enabled; if
     // its condition is currently true AND it has already been serviced, arming it fresh here would
     // fire it again the moment this chart starts. Carrying the latch makes the Session-level watcher
-    // and this one behave as a single watcher that never stopped watching. (irq_tick's own pass does
+    // and this one behave as a single watcher that never stopped watching. (armed_watcher_tick's own pass does
     // nothing while a run is active, so there is exactly one evaluator at a time.)
-    if w.global != "" {
-      if g := irq_find(session, w.global); g != nil {
-        w.ev_state.latched = g.ev_state.latched
+    if w.global_source != "" {
+      if g := armed_watcher_find(session, w.global_source, w.global_body_id); g != nil {
+        w.condition_state.latched = g.condition_state.latched
       }
     }
   }
+  // A fresh run starts a fresh story. Without the clear you cannot tell last run's failure rows from
+  // this run's, which is exactly the confusion the ring exists to remove.
+  session.script_trace = {}
+  script_trace(
+    session, run.steps[start].id, .Note,
+    "RUN '%s' (%s) - %d nodes, %d watcher(s)",
+    name, mode == .Loop ? "loop" : "once", run.main_len, len(run.watchers),
+  )
+
   engine.ensure_hotkey_thread(&session.eng) // the walker only advances on the watcher tick
   behaviour_goto(session, .Script)
 }
@@ -592,102 +809,366 @@ script_begin :: proc(
 // one interrupt mechanism, and "global" only describes where the definition came from.
 @(private = "file")
 script_attach_global_irqs :: proc(session: ^Session, run: ^Script_Run) {
-  for i in 0 ..< session.irq_n {
-    g := &session.irq[i]
-    if !g.ok {
+  seen := make(map[string]bool, 8, context.temp_allocator)
+  defer delete(seen)
+  for i in 0 ..< session.armed_watcher_count {
+    g := &session.armed_watchers[i]
+    if !g.ok || seen[g.doc] {
+      continue // one hoist per DOCUMENT: its watchers all come across together
+    }
+    seen[g.doc] = true
+    script_attach_doc_watchers(session, run, g.doc, g.doc)
+  }
+}
+
+// Copy <name>'s watchers - every `.On` node it holds, with the body each one points at - into <run>.
+//
+// ONE PROC FOR TWO SCOPES. `uses` (this chart borrows them) passes global="" and global arming passes
+// the document name, and that string is the only difference between them: it is what makes the latch
+// handover in script_begin / script_teardown find its Session-level twin. Everything else - the id
+// remap, the availability gate, the watcher cap - is the same question either way, and having asked it
+// twice in two places is how the two scopes would drift apart.
+@(private = "file")
+script_attach_doc_watchers :: proc(session: ^Session, run: ^Script_Run, name: string, global_source: string) {
+  if name == run.name {
+    return // a chart cannot borrow itself; its own watchers are already hoisted
+  }
+  doc, dok := bhv_open(name)
+  if !dok {
+    return // armed_watcher_reload / the editor already reported it; do not spam once per run
+  }
+  defer behaviour_doc_free(&doc)
+  // A gated block in the body would die mid-region and take the chart down with it. Refuse the hoist
+  // and say so once - the chart itself is still fine to run.
+  if problems := script_check_avail(session, doc.steps[:]); len(problems) > 0 {
+    fmt.eprintfln("script: watchers from '%s' are not armed for this run - %s", name, problems[0])
+    return
+  }
+  base, ok := script_append_irq_region(run, &doc)
+  if !ok {
+    return
+  }
+  n := 0
+  for s in doc.steps {
+    if s.op != .On || s.goto_id == 0 {
       continue
     }
     if len(run.watchers) >= SCRIPT_MAX_WATCHERS {
-      fmt.eprintfln("script: no room for global interrupt '%s' (%d watchers is the cap).", g.name, SCRIPT_MAX_WATCHERS)
+      fmt.eprintfln("script: no room for the watchers in '%s' (%d is the cap).", name, SCRIPT_MAX_WATCHERS)
       break
     }
-    doc, dok := bhv_open(g.name)
-    if !dok {
-      continue // irq_reload already reported it; do not spam once per run
+    entry := -1
+    for rs, i in run.steps {
+      if rs.id == s.goto_id + base {
+        entry = i
+        break
+      }
     }
-    defer behaviour_doc_free(&doc)
-    // A gated block in the interrupt would die mid-region and take the chart down with it. Refuse the
-    // hoist and say so once - the chart itself is still fine to run.
-    if problems := script_check_avail(session, doc.steps[:]); len(problems) > 0 {
-      fmt.eprintfln("script: global interrupt '%s' is not armed for this run - %s", g.name, problems[0])
-      continue
-    }
-    entry := script_append_irq_region(run, &doc)
     if entry < 0 {
       continue
     }
     w := Script_Watcher {
-      cond   = script_event_clone(g.cond),
-      src    = strings.clone(fmt.tprintf("interrupt %s", g.name)),
-      global = strings.clone(g.name),
-      entry  = entry,
+      condition      = script_condition_clone(s.condition),
+      src            = strings.clone(fmt.tprintf("%s: %s", name, s.src)),
+      global_source = global_source == "" ? "" : strings.clone(global_source),
+      global_body_id = s.goto_id, // the PRE-remap id, which is what Session.armed_watchers rows carry
+      entry          = entry,
     }
     append(&run.watchers, w)
+    n += 1
+  }
+  if n == 0 {
+    fmt.eprintfln("script: '%s' has no watchers to borrow (it needs an 'on' node wired to a body).", name)
   }
 }
 
-// Append <doc>'s program to <run> as an interrupt region and return the index control enters at.
+// Append <doc>'s program to <run> as interrupt-region code, and return the id OFFSET it was pasted at.
 //
 // The ids have to be REMAPPED. Two independently authored charts both start numbering at 1, so
 // pasting one into the other verbatim would give duplicate ids - and script_resolve_ids maps id ->
 // index, so the second copy's edges would silently retarget onto the first's nodes. Offsetting every
 // id (and every edge that names one) by the host's high-water mark keeps each region's edges pointing
-// inside itself.
+// inside itself. The caller adds the same offset to find a watcher's entry.
+//
+// The doc is PARTITIONED on the way in, by the same proc a run's own steps go through, so each of its
+// watcher bodies arrives as its own terminated block. Without that, one borrowed watcher's body would
+// walk off its end straight into the next one's.
 @(private = "file")
-script_append_irq_region :: proc(run: ^Script_Run, doc: ^Behaviour_Doc) -> int {
+script_append_irq_region :: proc(run: ^Script_Run, doc: ^Behaviour_Doc) -> (base: Node_Id, ok: bool) {
   if len(doc.steps) == 0 {
-    return -1
+    return 0, false
   }
-  base := Node_Id(0)
+  script_partition_watcher_bodies(&doc.steps, doc.entry)
   for s in run.steps {
     base = max(base, s.id)
   }
-  start := len(run.steps)
-  enter := start
   for s in doc.steps {
     c := s
     c.id = s.id + base
     c.goto_id = s.goto_id != 0 ? s.goto_id + base : 0
     c.else_id = s.else_id != 0 ? s.else_id + base : 0
     c.action = script_action_clone(s.action)
-    c.cond = script_event_clone(s.cond)
-    c.until = script_event_clone(s.until)
+    c.condition = script_condition_clone(s.condition)
+    c.until = script_condition_clone(s.until)
     c.src = strings.clone(s.src)
     c.scratch = {}
-    c.ev_state = {}
+    c.condition_state = {}
     append(&run.steps, c)
   }
-  // A chart may name a start node that is not its first slot (a canvas has no natural top).
-  if doc.entry != 0 {
-    for s, i in run.steps[start:] {
-      if s.id == doc.entry + base {
-        enter = start + i
-        break
+  // The terminator is not optional. Without it a region that runs off its own end would fall into
+  // whatever was appended next - which is the NEXT borrowed document's code.
+  top := Node_Id(0)
+  for s in run.steps {
+    top = max(top, s.id)
+  }
+  append(&run.steps, Script_Step{id = top + 1, op = .Return, src = strings.clone("return")})
+  return base, true
+}
+
+// --- graph reachability, shared by the partitioner and the "is this a chart?" question -------------
+
+// Where control can go from step <i>. `.On` contributes only its FALL-THROUGH: its goto_id is a body,
+// which is reached by the trigger firing and never by walking into it.
+//
+// <assume_fallthrough> is for the ONE caller that runs before the document has been materialised -
+// script_materialize_fallthrough itself, which has to see the graph the way the walker used to in order
+// to work out which nodes belong to a watcher body. Everything else asks after materialisation, where
+// an .Action that continues somewhere says so.
+@(private = "file")
+script_step_successors :: proc(
+  steps: []Script_Step,
+  index_of: map[Node_Id]int,
+  i: int,
+  out: ^[3]int,
+  assume_fallthrough := false,
+) -> int {
+  s := steps[i]
+  m := 0
+  push :: proc(out: ^[3]int, m: ^int, v: int) {
+    if v >= 0 && m^ < 3 {
+      out[m^] = v
+      m^ += 1
+    }
+  }
+  idx :: proc(index_of: map[Node_Id]int, id: Node_Id) -> int {
+    if id == 0 {
+      return -1
+    }
+    v, ok := index_of[id]
+    return ok ? v : -1
+  }
+  fall := i + 1 < len(steps) ? i + 1 : -1
+  #partial switch s.op {
+  case .Return:
+  // ends the region; nothing follows
+  case .On:
+    push(out, &m, fall)
+  case .Goto:
+    push(out, &m, idx(index_of, s.goto_id))
+  case .Branch, .Loop:
+    push(out, &m, idx(index_of, s.goto_id))
+    push(out, &m, idx(index_of, s.else_id))
+  case:
+    // .Action / .Wait_For and anything structured that survived lowering: an explicit successor, or
+    // the next slot for the ops that still fall through, plus a fail arm when one is wired.
+    if s.goto_id != 0 {
+      push(out, &m, idx(index_of, s.goto_id))
+    } else if assume_fallthrough || script_op_falls_through(s.op) {
+      push(out, &m, fall)
+    }
+    push(out, &m, idx(index_of, s.else_id))
+  }
+  return m
+}
+
+// Flood <seen> with everything reachable from <from>. <walls> is an optional set of indices the walk
+// refuses to enter, which is how the main program is kept out of the watcher bodies.
+@(private = "file")
+script_mark_reachable :: proc(
+  steps: []Script_Step,
+  index_of: map[Node_Id]int,
+  from: int,
+  walls: []bool,
+  seen: []bool,
+  assume_fallthrough := false,
+) {
+  if from < 0 || from >= len(steps) {
+    return
+  }
+  stack := make([dynamic]int, 0, len(steps), context.temp_allocator)
+  append(&stack, from)
+  for len(stack) > 0 {
+    i := pop(&stack)
+    if i < 0 || i >= len(steps) || seen[i] {
+      continue
+    }
+    if walls != nil && walls[i] {
+      continue
+    }
+    seen[i] = true
+    out: [3]int
+    m := script_step_successors(steps, index_of, i, &out, assume_fallthrough)
+    for k in 0 ..< m {
+      append(&stack, out[k])
+    }
+  }
+}
+
+// Which steps belong to a watcher's BODY - reachable from some `.On` node's edge. The `.On` nodes
+// themselves are excluded: the walker steps over them and the canvas draws them above the chart, so
+// they are part of the main program's array even though they are not part of its flow.
+//
+// Shared with the node editor, which needs the same answer to draw the watchers in their own band and
+// to refuse to make one of them the start node. Deriving it twice is how the picture and the program
+// would come to disagree.
+script_watcher_body_mask :: proc(steps: []Script_Step, is_body: []bool, assume_fallthrough := false) {
+  index_of := make(map[Node_Id]int, len(steps), context.temp_allocator)
+  defer delete(index_of)
+  for s, i in steps {
+    if s.id != 0 {
+      index_of[s.id] = i
+    }
+  }
+  for s in steps {
+    if s.op == .On && s.goto_id != 0 {
+      if start, ok := index_of[s.goto_id]; ok {
+        script_mark_reachable(steps, index_of, start, nil, is_body, assume_fallthrough)
       }
     }
   }
-  // The terminator is not optional. Without it a region that runs off its own end would fall into
-  // whatever was appended next - which is the NEXT interrupt's region.
-  base2 := Node_Id(0)
-  for s in run.steps {
-    base2 = max(base2, s.id)
+  for s, i in steps {
+    if s.op == .On {
+      is_body[i] = false
+    }
   }
-  append(&run.steps, Script_Step{id = base2 + 1, op = .Return, src = strings.clone("return")})
-  return enter
 }
 
-// Hoist every `on <event> -> <action>` out of the instruction stream and give it a REGION: a copy of its
-// body appended past main_len, terminated by .Return. Position in the program therefore has no effect on
-// when a watcher arms, and - the point of the region - the body is ordinary program text, so it polls
-// across ticks and its exit runs like any other step.
+// Move every INLINE WATCHER BODY behind the main program, and return where the main program ends.
 //
-// A single-action `on` produces a two-step region. That is the same machinery a multi-step interrupt
-// CHART will use; it just supplies a longer body.
+// A watcher is an `.On` node plus the subgraph its edge points at. That subgraph lives in the same
+// array as the chart, which leaves one hazard: fall-through. Control that walks off the last node of
+// the main program would land on the first node of a body it was never triggered into.
+//
+// Partitioning removes the hazard instead of guarding against it, and does so using machinery that
+// already exists. Edges are resolved by IDENTITY after this runs, so reordering costs nothing; only
+// fall-through is positional, and relative order is preserved inside each partition. Then:
+//
+//   - main runs off its end   -> pc >= main_len -> script_program_end. Exactly right.
+//   - a body runs off its end -> watcher_depth > 0  -> script_watcher_return. Also exactly right.
+//
+// which is the same pair of rules that already governed the regions appended past main_len. Each body
+// still gets an explicit .Return terminator, because two adjacent bodies would otherwise run into each
+// other - the same reason script_append_irq_region appends one.
+//
+// A body that jumps BACK into the main program classifies those nodes as body. That is a broken chart
+// either way (control would arrive there with an interrupt frame that never gets returned), and the
+// editor warns about it at save time; the runtime just has to be deterministic about it.
+@(private = "file")
+script_partition_watcher_bodies :: proc(steps: ^[dynamic]Script_Step, entry: Node_Id) -> int {
+  n := len(steps)
+  if n == 0 {
+    return 0
+  }
+  index_of := make(map[Node_Id]int, n, context.temp_allocator)
+  defer delete(index_of)
+  for s, i in steps {
+    if s.id != 0 {
+      index_of[s.id] = i
+    }
+  }
+  has_on := false
+  for s in steps {
+    if s.op == .On && s.goto_id != 0 {
+      has_on = true
+      break
+    }
+  }
+  if !has_on {
+    return n // nothing to separate; every step is main, as before
+  }
+
+  // Bodies first, then main with the bodies as walls. Order matters: a watcher usually sits directly
+  // above the body it triggers, so letting main fall through the `.On` node into it would swallow the
+  // whole body - which is precisely the case an upgraded interrupt file produces.
+  body := make([]bool, n, context.temp_allocator)
+  script_watcher_body_mask(steps[:], body)
+  main := make([]bool, n, context.temp_allocator)
+  start := 0
+  if entry != 0 {
+    if v, ok := index_of[entry]; ok {
+      start = v
+    }
+  }
+  script_mark_reachable(steps[:], index_of, start, body, main)
+
+  next_id := Node_Id(0)
+  for s in steps {
+    next_id = max(next_id, s.id)
+  }
+  emitted := make([]bool, n, context.temp_allocator)
+  out := make([dynamic]Script_Step, 0, n + 8, context.temp_allocator)
+  for s, i in steps {
+    if !body[i] {
+      append(&out, s) // main and orphans alike - an unreachable node is not a watcher body
+      emitted[i] = true
+    }
+  }
+  main_len := len(out)
+
+  // One CONTIGUOUS, TERMINATED block per watcher, rather than one block for all of them. Two bodies
+  // laid end to end would let the first run into the second the moment it walked off its own last
+  // node - the exact failure the .Return after each region exists to prevent.
+  for s in steps {
+    if s.op != .On || s.goto_id == 0 {
+      continue
+    }
+    head, sok := index_of[s.goto_id]
+    if !sok {
+      continue
+    }
+    mine := make([]bool, n, context.temp_allocator)
+    script_mark_reachable(steps[:], index_of, head, nil, mine)
+    added := false
+    for j in 0 ..< n {
+      if mine[j] && body[j] && !emitted[j] {
+        append(&out, steps[j])
+        emitted[j] = true
+        added = true
+      }
+    }
+    if added {
+      next_id += 1
+      append(&out, Script_Step{id = next_id, op = .Return, src = strings.clone("return")})
+    }
+  }
+  clear(steps)
+  for s in out {
+    append(steps, s)
+  }
+  return main_len
+}
+
+// Hoist every `on` out of the instruction stream and give it a REGION: program text past main_len,
+// terminated by .Return. Position in the file therefore has no effect on when a watcher arms, and -
+// the point of the region - the body is ordinary program text, so it polls across ticks and its exit
+// runs like any other step.
+//
+// TWO SHAPES OF BODY, one mechanism. An `.On` that NAMES one (goto_id) already has its subgraph sitting
+// past main_len, put there by script_partition_watcher_bodies; the watcher just points at it. An `.On`
+// that carries a single action instead - which is what builder.on() emits, and what every `on` was
+// before bodies existed - gets a two-step region synthesized here. Everything downstream sees a region.
 @(private = "file")
 script_build_irq_regions :: proc(run: ^Script_Run) {
   next_id := Node_Id(0)
   for s in run.steps {
     next_id = max(next_id, s.id)
+  }
+  index_of := make(map[Node_Id]int, len(run.steps), context.temp_allocator)
+  defer delete(index_of)
+  for s, i in run.steps {
+    if s.id != 0 {
+      index_of[s.id] = i
+    }
   }
   for i in 0 ..< run.main_len {
     if run.steps[i].op != .On {
@@ -699,12 +1180,16 @@ script_build_irq_regions :: proc(run: ^Script_Run) {
     }
     s := run.steps[i]
     w := Script_Watcher {
-      cond   = script_event_clone(s.cond),
+      condition      = script_condition_clone(s.condition),
       action = script_action_clone(s.action),
       src    = strings.clone(s.src),
       entry  = -1,
     }
-    if s.action.kind != .None {
+    if s.goto_id != 0 {
+      if e, ok := index_of[s.goto_id]; ok {
+        w.entry = e
+      }
+    } else if s.action.kind != .None {
       w.entry = len(run.steps)
       next_id += 1
       body := Script_Step {
@@ -733,6 +1218,25 @@ script_event_clone :: proc(ev: Script_Event) -> Script_Event {
   out.strs[0] = strings.clone(ev.strs[0])
   out.strs[1] = strings.clone(ev.strs[1])
   return out
+}
+
+// Every ROW's strings, so a condition can be copied and freed as one thing. Rows past condition_row_count are
+// left as the zero value rather than cloned: they hold no strings, and cloning "" would allocate.
+script_condition_clone :: proc(condition: Script_Condition) -> Script_Condition {
+  out := condition
+  for row in 0 ..< condition_row_count(condition) {
+    condition_row_ptr(&out, row)^ = script_event_clone(condition_row(condition, row))
+  }
+  return out
+}
+
+script_condition_free :: proc(condition: ^Script_Condition) {
+  for index in 0 ..< condition_row_count(condition^) {
+    row := condition_row_ptr(condition, index)
+    delete(row.strs[0])
+    delete(row.strs[1])
+    row.strs = {}
+  }
 }
 
 script_action_clone :: proc(act: Script_Action) -> Script_Action {
@@ -769,9 +1273,10 @@ script_reset :: proc(session: ^Session) -> bool {
     board   = &session.bh_board,
   }
   script_exit_current(&ctx)
+  keys_release_all(ctx.session) // a key held from the previous pass must not survive the rewind
 
-  run.irq_depth = 0
-  run.irq_save = {}
+  run.watcher_depth = 0
+  run.suspended = {}
   run.nloop = 0
   run.steps_done = 0
   run.stop_requested = false
@@ -785,13 +1290,13 @@ script_reset :: proc(session: ^Session) -> bool {
   clear(&run.kills_by_name)
   for &w in run.watchers {
     w.fires = 0
-    script_arm_event(&ctx, w.cond, &w.ev_state)
+    script_arm_condition(&ctx, w.condition, &w.condition_state)
   }
   // Disarm every per-site baseline. A .Branch arms once and keeps its baseline for the whole run (see
   // the walker), so without this a rewound program would inherit the previous run's clock and take its
   // loop exit immediately.
   for &s in run.steps {
-    s.ev_state = {}
+    s.condition_state = {}
   }
   script_goto(run, run.entry_pc)
   return true
@@ -820,7 +1325,7 @@ cli_script :: proc(session: ^Session, args: []string) {
   case "blocks", "catalog":
     script_print_blocks(session)
   case "selftest":
-    script_cmd_selftest()
+    script_cmd_selftest(session)
   case "list":
     script_cmd_list(session)
   case "show":
@@ -829,6 +1334,10 @@ cli_script :: proc(session: ^Session, args: []string) {
     script_cmd_run(session, args[1:])
   case "step":
     script_cmd_step(session, args[1:])
+  case "trace", "log":
+    script_cmd_trace(session, args[1:])
+  case "lint", "check":
+    script_cmd_lint(session, args[1:])
   case "pause":
     if !session.script.active {
       fmt.eprintln("script pause: nothing running.")
@@ -870,7 +1379,7 @@ cli_script :: proc(session: ^Session, args: []string) {
   case:
     fmt.eprintfln("script: unknown subcommand '%s'", args[0])
     fmt.eprintln("  status | blocks | list | show <name> | run <name> [once|loop] | stop")
-    fmt.eprintln("  pause | resume | reset | step [off]")
+    fmt.eprintln("  pause | resume | reset | step [off] | trace [n|all|clear] | lint [name]")
     fmt.eprintln("  export <builtin> [as] | save <name> | delete <name> | rename <old> <new>")
   }
 }
@@ -882,6 +1391,11 @@ cli_status_behaviour :: proc(session: ^Session) {
   fmt.println("BEHAVIOUR (scripts + the state machine that will replace the hardcoded 'auto'):")
   fmt.printfln("  machine  : %s%s", behaviour_state_name(session.bh_state), session.bh_entered ? "" : "  (not entered yet)")
   fmt.printfln("  script   : %s", script_status_line(session))
+  // Only when something IS held: a key the tool is holding down is invisible otherwise, and it is the
+  // one piece of state here that keeps acting on the game with nothing on screen to say so.
+  if n := keys_held_count(session); n > 0 {
+    fmt.printfln("  keys held: %s   ('key release' lets go of all %d)", keys_held_text(session), n)
+  }
   saved := bhv_list_names()
   fmt.printfln(
     "  behaviours: %d in Odin (flyff/behaviours.odin) + %d saved in %s - 'script list'",
@@ -890,26 +1404,20 @@ cli_status_behaviour :: proc(session: ^Session) {
   cli_status_interrupts(session)
   gated := 0
   for def in ACTIONS {
-    if def.avail == nil {
-      continue
-    }
-    if ok, why := def.avail(session); !ok {
+    if ok, why := script_block_gate(session, def.avail, def.not_built, def.not_built_why); !ok {
       if gated == 0 {
         fmt.println("  blocks not usable right now:")
       }
-      fmt.printfln("    [--] %-18s %s", def.name, why)
+      fmt.printfln("    %s %-18s %s", def.not_built ? "[xx]" : "[--]", def.name, why)
       gated += 1
     }
   }
   for def in EVENTS {
-    if def.avail == nil {
-      continue
-    }
-    if ok, why := def.avail(session); !ok {
+    if ok, why := script_block_gate(session, def.avail, def.not_built, def.not_built_why); !ok {
       if gated == 0 {
         fmt.println("  blocks not usable right now:")
       }
-      fmt.printfln("    [--] %-18s %s", def.name, why)
+      fmt.printfln("    %s %-18s %s", def.not_built ? "[xx]" : "[--]", def.name, why)
       gated += 1
     }
   }
@@ -925,22 +1433,18 @@ script_status_line :: proc(session: ^Session) -> string {
   gated := 0
   total := len(ACTIONS) + len(EVENTS)
   for def in ACTIONS {
-    if def.avail != nil {
-      if ok, _ := def.avail(session); !ok {
-        gated += 1
-      }
+    if ok, _ := script_block_gate(session, def.avail, def.not_built, def.not_built_why); !ok {
+      gated += 1
     }
   }
   for def in EVENTS {
-    if def.avail != nil {
-      if ok, _ := def.avail(session); !ok {
-        gated += 1
-      }
+    if ok, _ := script_block_gate(session, def.avail, def.not_built, def.not_built_why); !ok {
+      gated += 1
     }
   }
   state := "idle"
   if run := &session.script; run.active {
-    what := run.paused ? "PAUSED" : (run.irq_depth > 0 ? "INTERRUPT" : "RUNNING")
+    what := run.paused ? "PAUSED" : (run.watcher_depth > 0 ? "INTERRUPT" : "RUNNING")
     state = fmt.tprintf("%s '%s' step %d/%d", what, run.name, min(run.pc + 1, run.main_len), run.main_len)
   }
   sensing := session.bh_sense_on ? ", sensing on" : ""
@@ -962,8 +1466,8 @@ script_print_status :: proc(session: ^Session) {
   if run.last_line != "" {
     fmt.printfln("  current: %s", run.last_line)
   }
-  if run.irq_depth > 0 {
-    fmt.printfln("  ^ inside an INTERRUPT; the main program is suspended at step %d and resumes when it returns.", run.irq_save.pc + 1)
+  if run.watcher_depth > 0 {
+    fmt.printfln("  ^ inside an INTERRUPT; the main program is suspended at step %d and resumes when it returns.", run.suspended.pc + 1)
   }
   if len(run.watchers) > 0 {
     fmt.printfln("  %d interrupt(s) armed (first match wins):", len(run.watchers))
@@ -978,12 +1482,12 @@ script_print_blocks :: proc(session: ^Session) {
   fmt.println("=== behaviour blocks ===")
   fmt.println("ACTIONS (things a script does):")
   for def in ACTIONS {
-    mark, why := script_avail_mark(session, def.avail)
+    mark, why := script_avail_mark(session, def.avail, def.not_built, def.not_built_why)
     fmt.printfln("  %s %-16s %s%s", mark, script_sig(def.name, def.params), def.blurb, why)
   }
   fmt.println("EVENTS (things a script can wait for / react to):")
   for def in EVENTS {
-    mark, why := script_avail_mark(session, def.avail)
+    mark, why := script_avail_mark(session, def.avail, def.not_built, def.not_built_why)
     fmt.printfln("  %s %-16s %s%s", mark, script_sig(def.name, def.params), def.blurb, why)
   }
   fmt.println("STRUCTURE (nesting - what Odin authoring emits):")
@@ -994,18 +1498,45 @@ script_print_blocks :: proc(session: ^Session) {
   fmt.println("           an edge may point BACKWARDS - that is how a loop is drawn rather than declared.")
   fmt.println("           'on' is an INTERRUPT: checked before every step, first match wins, and its body")
   fmt.println("           is a full region (it can walk and wait, then control resumes where it was).")
-  fmt.println("[--] means the block exists but isn't usable yet - the reason says what it needs.")
+  fmt.println("[--] means the block is built but not usable right NOW - the reason says what it needs")
+  fmt.println("     (an attach, a finder). You can still put it in a chart; the run is what gets refused.")
+  fmt.println("[xx] means the block is not built yet - the reason names the recon that would unblock it.")
+  fmt.println("     These are the only blocks the editor will not let you place.")
 }
 
-script_avail_mark :: proc(session: ^Session, avail: proc(session: ^Session) -> (ok: bool, why: string)) -> (mark: string, why: string) {
-  if avail == nil {
-    return "[OK]", ""
+// "Can this block run right now, and if not, why not" - the ONE place the two refusals are combined,
+// so `script blocks`, `script status`, `status` and the editor's greying can never disagree about which
+// blocks are live. Note this is RUNNABILITY, not placeability: the editor gates placing a node on
+// def.not_built alone (see Action_Def.not_built), and uses this only to decide how to draw it.
+script_block_gate :: proc(
+  session: ^Session,
+  avail: proc(session: ^Session) -> (ok: bool, why: string),
+  not_built: bool,
+  not_built_why: string,
+) -> (ok: bool, why: string) {
+  if not_built {
+    return false, not_built_why
   }
-  ok, w := avail(session)
+  if avail == nil {
+    return true, ""
+  }
+  return avail(session)
+}
+
+// The mark for one catalog row. Two different "no" answers, deliberately spelled differently: [xx] is a
+// property of the tool and will read the same tomorrow, [--] is a property of this moment and clears
+// the instant you attach or run the finder it names.
+script_avail_mark :: proc(
+  session: ^Session,
+  avail: proc(session: ^Session) -> (ok: bool, why: string),
+  not_built: bool,
+  not_built_why: string,
+) -> (mark: string, why: string) {
+  ok, w := script_block_gate(session, avail, not_built, not_built_why)
   if ok {
     return "[OK]", ""
   }
-  return "[--]", fmt.tprintf("   -> %s", w)
+  return not_built ? "[xx]" : "[--]", fmt.tprintf("   -> %s", w)
 }
 
 script_sig :: proc(name: string, params: []Param_Spec) -> string {
@@ -1032,7 +1563,7 @@ script_sig :: proc(name: string, params: []Param_Spec) -> string {
 // after it. This builds a real nested program, records where each edge lands, inserts a node at the
 // FRONT (the worst case - every position shifts), re-resolves, and checks each edge still lands on
 // the same NODE. Cheap, exact, and it fails loudly if the resolver ever regresses.
-script_cmd_selftest :: proc() {
+script_cmd_selftest :: proc(session: ^Session) {
   fmt.println("=== behaviour data self-test ===")
   b := builder_begin("selftest", .Once)
   bh_test_nesting(b)
@@ -1105,6 +1636,11 @@ script_cmd_selftest :: proc() {
     fmt.eprintfln("  %d edge(s) broke", fails)
   }
   script_selftest_roundtrip()
+  ed_selftest_insert()
+  name_list_selftest()
+  // Last, and called from here rather than chained off the end of the others, because it is the one
+  // section that needs the SESSION - it writes and reads real variables.
+  script_selftest_coord(session)
 }
 
 // Prove the file format is lossless: build every Odin behaviour, serialize it, parse it back, and
@@ -1115,7 +1651,12 @@ script_cmd_selftest :: proc() {
 script_selftest_roundtrip :: proc() {
   fmt.println("  --- save/load round-trip ---")
   fails := 0
-  for &d in BEHAVIOURS {
+  // BOTH registries: the hidden test set is most of the coverage here (it is the only thing that
+  // exercises structured blocks, interrupt regions and back-edge loops in one place).
+  all := make([dynamic]Behaviour_Def, 0, len(BEHAVIOURS) + len(TEST_BEHAVIOURS), context.temp_allocator)
+  append(&all, ..BEHAVIOURS[:])
+  append(&all, ..TEST_BEHAVIOURS[:])
+  for &d in all {
     doc, ok := bhv_from_builtin(&d)
     if !ok {
       fmt.eprintfln("  FAIL: '%s' would not build", d.name)
@@ -1153,20 +1694,93 @@ script_selftest_roundtrip :: proc() {
       continue
     }
     // Edges must survive by IDENTITY, not just render the same.
+    //
+    // ui_pos and `group` have to be checked HERE too, and for the same reason: script_render prints
+    // neither, so a section name silently dropped by the writer or the reader would compare equal on
+    // both sides and the loss would only show up as an unlabelled canvas much later.
     for s, i in doc.steps {
       if back.steps[i].id != s.id || back.steps[i].goto_id != s.goto_id {
         fmt.eprintfln("  FAIL: '%s' step %d: id/goto %d/%d -> %d/%d", d.name, i, u32(s.id), u32(s.goto_id), u32(back.steps[i].id), u32(back.steps[i].goto_id))
         fails += 1
         break
       }
+      if back.steps[i].group != s.group {
+        fmt.eprintfln("  FAIL: '%s' step %d: section '%s' came back as '%s'", d.name, i, s.group, back.steps[i].group)
+        fails += 1
+        break
+      }
+      if back.steps[i].ui_pos != s.ui_pos {
+        fmt.eprintfln("  FAIL: '%s' step %d: ui_pos %v came back as %v", d.name, i, s.ui_pos, back.steps[i].ui_pos)
+        fails += 1
+        break
+      }
     }
   }
   if fails == 0 {
-    fmt.printfln("  PASS: all %d behaviours survive serialize -> parse -> render unchanged", len(BEHAVIOURS))
+    fmt.printfln("  PASS: all %d behaviours survive serialize -> parse -> render unchanged", len(all))
   } else {
     fmt.eprintfln("  %d behaviour(s) did not round-trip", fails)
   }
   script_selftest_payload()
+}
+
+// The Coord expression path, end to end and WITHOUT a client: script_coord touches only the variable
+// store, so the one part of "positions are variables" that needs a game attached is the walking.
+//
+// What it guards: a literal must keep ignoring the string slot (every chart written before this
+// change), an expression must beat the literal sitting underneath it, a composite must work because
+// expansion is textual and `@x,@z` is a perfectly good way to write one, and a miss must FAIL rather
+// than resolve to 0,0 - which would send the character across the map instead of refusing.
+@(private = "file")
+script_selftest_coord :: proc(session: ^Session) {
+  fmt.println("  --- coordinate expressions ---")
+  fails := 0
+  board: Behaviour_Board
+  ctx := Behaviour_Context {
+    session = session,
+    board   = &board,
+  }
+  spec := PARAMS_WALK_TO[:]
+
+  engine.session_var_set(&session.eng, "st_spot", "6800,3300")
+  engine.session_var_set(&session.eng, "st_x", "120")
+  engine.session_var_set(&session.eng, "st_z", "-45.5")
+  defer {
+    for name in ([?]string{"st_spot", "st_x", "st_z"}) {
+      engine.session_var_set(&session.eng, name, "")
+    }
+  }
+
+  check :: proc(what: string, got_x, got_z: f32, got_ok: bool, want_x, want_z: f32, want_ok: bool, fails: ^int) {
+    if got_ok != want_ok || (want_ok && (got_x != want_x || got_z != want_z)) {
+      fmt.eprintfln("  FAIL: %s: got (%v, %v) ok=%v, wanted (%v, %v) ok=%v", what, got_x, got_z, got_ok, want_x, want_z, want_ok)
+      fails^ += 1
+    }
+  }
+
+  x, z, ok := script_coord(&ctx, {10, 20, 0, 0}, {"", ""}, spec, 0)
+  check("literal", x, z, ok, 10, 20, true, &fails)
+
+  x, z, ok = script_coord(&ctx, {10, 20, 0, 0}, {"@st_spot", ""}, spec, 0)
+  check("expression wins over the literal", x, z, ok, 6800, 3300, true, &fails)
+
+  x, z, ok = script_coord(&ctx, {}, {"@st_x,@st_z", ""}, spec, 0)
+  check("one variable per axis", x, z, ok, 120, -45.5, true, &fails)
+
+  _, _, ok = script_coord(&ctx, {10, 20, 0, 0}, {"@st_nothing", ""}, spec, 0)
+  if ok {
+    fmt.eprintfln("  FAIL: an unset variable resolved instead of failing")
+    fails += 1
+  }
+  _, _, ok = script_coord(&ctx, {10, 20, 0, 0}, {"@st_x", ""}, spec, 0)
+  if ok {
+    fmt.eprintfln("  FAIL: '120' is one number, not a position, and was accepted as one")
+    fails += 1
+  }
+
+  if fails == 0 {
+    fmt.println("  PASS: coordinates resolve from literals, variables and per-axis variables; a miss fails")
+  }
 }
 
 // Prove that the three things which decide WHERE an argument lives agree, for every row in the
@@ -1192,15 +1806,26 @@ probe_str :: proc(i: int) -> string {return fmt.tprintf("p%d", i)}
 @(private = "file")
 probe_fill :: proc(spec: []Param_Spec, nums: ^[4]f64, strs: ^[2]string, blank: bool) {
   for p, i in spec {
-    slot := param_slot(spec, i)
+    num_slot, str_slot := param_slots(spec, i)
     switch p.kind {
     case .Num, .Duration, .Percent:
-      nums[slot] = probe_num(i)
+      nums[num_slot] = probe_num(i)
     case .Coord:
-      nums[slot] = probe_num(i)
-      nums[slot + 1] = probe_num(i) + 1
-    case .Str, .Names:
-      strs[slot] = blank ? "" : probe_str(i)
+      // Both halves, in both passes: <blank> exercises the LITERAL (empty expression, real numbers),
+      // and the filled pass exercises the EXPRESSION, whose numbers must come back zeroed because the
+      // file only carried the text. Those are the two states a Coord can be in, and neither is
+      // covered by the other.
+      if blank {
+        nums[num_slot] = probe_num(i)
+        nums[num_slot + 1] = probe_num(i) + 1
+        strs[str_slot] = ""
+      } else {
+        nums[num_slot] = 0
+        nums[num_slot + 1] = 0
+        strs[str_slot] = fmt.tprintf("@p%d", i)
+      }
+    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+      strs[str_slot] = blank ? "" : probe_str(i)
     }
   }
 }
@@ -1209,14 +1834,19 @@ probe_fill :: proc(spec: []Param_Spec, nums: ^[4]f64, strs: ^[2]string, blank: b
 @(private = "file")
 probe_check :: proc(what: string, spec: []Param_Spec, want_n, got_n: [4]f64, want_s, got_s: [2]string, fails: ^int) {
   for p, i in spec {
-    slot := param_slot(spec, i)
+    num_slot, str_slot := param_slots(spec, i)
+    slot := num_slot
     bad := false
     switch p.kind {
     case .Num, .Duration, .Percent:
       bad = want_n[slot] != got_n[slot]
     case .Coord:
-      bad = want_n[slot] != got_n[slot] || want_n[slot + 1] != got_n[slot + 1]
-    case .Str, .Names:
+      bad =
+        want_n[slot] != got_n[slot] ||
+        want_n[slot + 1] != got_n[slot + 1] ||
+        want_s[str_slot] != got_s[str_slot]
+    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+      slot = str_slot
       bad = want_s[slot] != got_s[slot]
     }
     if bad {
@@ -1292,6 +1922,208 @@ script_selftest_payload :: proc() {
   } else {
     fmt.eprintfln("  %d argument(s) did not survive", fails)
   }
+  script_selftest_conditions()
+  script_selftest_meta()
+}
+
+// Prove a MULTI-ROW condition survives the file format, in both join modes.
+//
+// The format spells one out as repeated `if` lines plus a `match=` key, so the two failure modes are
+// specific and neither would crash: rows collapsing into one (the reader replacing instead of
+// appending, which is what it used to do) and the join mode being dropped (an `any of` coming back as
+// `all of`, silently turning a rescue that fires on either signal into one that needs both).
+@(private = "file")
+script_selftest_conditions :: proc() {
+  fmt.println("  --- multi-condition rows ---")
+  fails := 0
+  for mode in 0 ..< 2 {
+    for rows in 1 ..= SCRIPT_MAX_CONDITION_ROWS {
+      steps := make([dynamic]Script_Step, context.temp_allocator)
+      st := Script_Step {
+        id = 1,
+        op = .Branch,
+      }
+      st.condition.match_any = mode == 1
+      st.condition.row_count = rows
+      // Distinct rows, so a collapse or a reorder cannot pass by looking like the row it replaced.
+      for i in 0 ..< rows {
+        r := condition_row_ptr(&st.condition, i)
+        r^ = Script_Event {
+          kind = .Kills,
+        }
+        r.nums[0] = f64(10 + i)
+        r.negate = i % 2 == 1
+      }
+      st.src = step_label(st)
+      append(&steps, st)
+
+      doc := Behaviour_Doc {
+        name  = "condtest",
+        entry = 1,
+        steps = steps,
+      }
+      b := strings.builder_make(context.temp_allocator)
+      bhv_serialize(&doc, &b)
+      back, ok := bhv_deserialize("condtest", strings.to_string(b))
+      if !ok {
+        fmt.eprintfln("  FAIL: %d-row '%s' condition would not parse back:\n%s", rows, mode == 1 ? "any" : "all", strings.to_string(b))
+        fails += 1
+        continue
+      }
+      defer behaviour_doc_free(&back)
+      got := back.steps[0].condition
+      if condition_row_count(got) != rows {
+        fmt.eprintfln("  FAIL: %d rows came back as %d", rows, condition_row_count(got))
+        fails += 1
+        continue
+      }
+      if got.match_any != st.condition.match_any {
+        fmt.eprintfln("  FAIL: %d-row join mode came back as '%s'", rows, got.match_any ? "any" : "all")
+        fails += 1
+        continue
+      }
+      for i in 0 ..< rows {
+        w, g := condition_row(st.condition, i), condition_row(got, i)
+        if w.kind != g.kind || w.nums[0] != g.nums[0] || w.negate != g.negate {
+          fmt.eprintfln("  FAIL: row %d of %d changed (%v %v %v -> %v %v %v)", i, rows, w.kind, w.nums[0], w.negate, g.kind, g.nums[0], g.negate)
+          fails += 1
+          break
+        }
+      }
+    }
+  }
+  if fails == 0 {
+    fmt.printfln("  PASS: conditions of 1..%d rows survive a save/load in both join modes", SCRIPT_MAX_CONDITION_ROWS)
+  } else {
+    fmt.eprintfln("  %d condition(s) did not round-trip", fails)
+  }
+}
+
+// Prove every block and every ARGUMENT is documented.
+//
+// This is a lint, not a behaviour test, and it is here rather than in a code review because the chart
+// options panel is GENERATED from this metadata: a Param_Spec with no title is an unlabelled box in
+// the UI and one with no help is a number you have to read script_blocks.odin to set. Neither fails
+// anything at runtime, so nothing else would ever catch it - the block just quietly ships unusable to
+// anyone who did not write it. Adding a block to the catalog now fails the test suite until it is
+// described, which is the only enforcement that actually holds up over time.
+//
+// `name` is deliberately NOT accepted as a substitute for `title`. prose_title_of_name does prettify
+// it, and the editor still falls back to that so a half-finished block is drawn rather than blank,
+// but "min gain" is not a label - it is a variable name with the underscore taken out.
+@(private = "file")
+script_selftest_meta :: proc() {
+  fmt.println("  --- block documentation ---")
+  fails := 0
+
+  check_params :: proc(what: string, spec: []Param_Spec, fails: ^int) {
+    for p in spec {
+      if p.title == "" {
+        fmt.eprintfln("  FAIL: %s: argument '%s' has no title", what, p.name)
+        fails^ += 1
+      }
+      if p.help == "" {
+        fmt.eprintfln("  FAIL: %s: argument '%s' has no help text", what, p.name)
+        fails^ += 1
+      }
+      // A .Choice with no values is worse than a .Str: the picker offers nothing and the linter
+      // warns about every value it ever sees, because none of them is in the empty set. Anything
+      // whose values are only known at run time (a saved path, a character name) is a .Str.
+      if p.kind == .Choice && len(p.choices) == 0 {
+        fmt.eprintfln("  FAIL: %s: argument '%s' is a Choice with no choices", what, p.name)
+        fails^ += 1
+      }
+      // An optional numeric argument whose default is 0 reads as "off" in the options panel unless the
+      // help says otherwise, and for every ladder tunable 0 means the OPPOSITE - "use the configured
+      // value". Requiring the word is crude but it has to be said somewhere, and here is the only
+      // place that can insist.
+      // A "bool" is exempt: it is drawn as a checkbox, and an unticked box already says what 0 means.
+      if p.optional && p.def == 0 && p.help != "" && p.unit != "bool" {
+        switch p.kind {
+        case .Num, .Duration, .Percent:
+          if !strings.contains(p.help, "0 ") {
+            fmt.eprintfln("  FAIL: %s: argument '%s' defaults to 0 but its help never says what 0 means", what, p.name)
+            fails^ += 1
+          }
+        case .Coord, .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+        }
+      }
+    }
+  }
+
+  for def in ACTIONS {
+    if def.title == "" {
+      fmt.eprintfln("  FAIL: action '%s' has no title", def.name)
+      fails += 1
+    }
+    if def.blurb == "" {
+      fmt.eprintfln("  FAIL: action '%s' has no blurb", def.name)
+      fails += 1
+    }
+    check_params(def.name, def.params, &fails)
+  }
+  for def in EVENTS {
+    if def.title == "" {
+      fmt.eprintfln("  FAIL: event '%s' has no title", def.name)
+      fails += 1
+    }
+    if def.blurb == "" {
+      fmt.eprintfln("  FAIL: event '%s' has no blurb", def.name)
+      fails += 1
+    }
+    check_params(def.name, def.params, &fails)
+  }
+
+  if fails == 0 {
+    fmt.printfln("  PASS: all %d blocks and every argument carry a title and a description", len(ACTIONS) + len(EVENTS))
+  } else {
+    fmt.eprintfln("  %d piece(s) of metadata missing - the options panel would draw them unlabelled", fails)
+  }
+  script_selftest_lint()
+}
+
+// Every SHIPPED behaviour must lint clean of errors and warnings.
+//
+// The regression this guards: `auto`, `hunt` and `sweep` are generated from a config (bh_auto walks
+// Auto_Cfg and decides which nodes exist), so a change to the ladder's shape can leave a rung wired to a
+// node that is no longer emitted - a dangling edge that nothing notices until the run refuses to start.
+// The linter answers exactly that question, and asking it here means a broken built-in fails the suite
+// rather than failing a farm. Notes are excluded on purpose: they are true and deliberate on these
+// charts (the last rung of the ladder has nowhere to fall back to), and a test that failed on them would
+// be a test somebody turns off.
+@(private = "file")
+script_selftest_lint :: proc() {
+  fmt.println("  --- chart lint ---")
+  fails := 0
+  checked := 0
+  one :: proc(def: ^Behaviour_Def, checked: ^int, fails: ^int) {
+    doc, ok := bhv_from_builtin(def)
+    if !ok {
+      fmt.eprintfln("  FAIL: '%s' would not build", def.name)
+      fails^ += 1
+      return
+    }
+    defer behaviour_doc_free(&doc)
+    checked^ += 1
+    for p in script_lint(&doc) {
+      if p.level == .Note {
+        continue
+      }
+      fmt.eprintfln("  FAIL: %s node #%d: %s", def.name, u32(p.node), p.text)
+      fails^ += 1
+    }
+  }
+  for &def in BEHAVIOURS {
+    one(&def, &checked, &fails)
+  }
+  for &def in TEST_BEHAVIOURS {
+    one(&def, &checked, &fails)
+  }
+  if fails == 0 {
+    fmt.printfln("  PASS: all %d built-in charts lint clean (no dangling edges, no blank required arguments)", checked)
+  } else {
+    fmt.eprintfln("  %d lint problem(s) in the shipped charts", fails)
+  }
 }
 
 @(private = "file")
@@ -1335,14 +2167,16 @@ script_cmd_list :: proc(session: ^Session) {
   saved := bhv_list_names()
   fmt.println("behaviours:")
   for d in BEHAVIOURS {
-    mark := d.test ? "T " : "  " // T = runs detached, the verification set
     shadow := ""
     if slice.contains(saved, d.name) {
       shadow = "   <- shadowed by the saved copy of the same name"
     }
-    fmt.printfln("  %s%-14s %s%s", mark, d.name, d.blurb, shadow)
+    fmt.printfln("  %-14s %s%s", d.name, d.blurb, shadow)
   }
-  fmt.printfln("  ^ defined in Odin (flyff/behaviours.odin). T = runs with nothing attached.")
+  fmt.printfln("  ^ defined in Odin (flyff/behaviours.odin).")
+  // Named, not listed. They are runnable by name and `script selftest` exercises them; putting nine of
+  // them in front of the four you actually pick from is what made this list something to read past.
+  fmt.printfln("  (+%d verification charts, hidden - 'script selftest' runs them; 'script show t_flow' names one)", len(TEST_BEHAVIOURS))
   if len(saved) == 0 {
     fmt.printfln("saved behaviours: (none yet in %s)", bhv_dir_path())
   } else {
@@ -1474,6 +2308,54 @@ script_cmd_rename :: proc(args: []string) {
 // Runs the instruction here on the REPL thread (we already hold exec_mutex, the same lock the
 // watcher takes), which is what makes single-stepping meaningful: with stepping on, the watcher
 // still senses and still services interrupts, but it will not advance the program underneath you.
+// The console half of the trace strip. Reads the ring rather than the run, so it still answers after a
+// run has ended - which is the whole reason the ring is session-scoped.
+@(private = "file")
+script_cmd_trace :: proc(session: ^Session, args: []string) {
+  limit := 40
+  if len(args) >= 1 {
+    switch args[0] {
+    case "clear", "wipe":
+      // The ring also clears itself at script_begin, so this is for "I have read that, give me a clean
+      // slate" rather than for correctness. Both doors: the editor's strip enqueues this command.
+      n := min(session.script_trace.written, SCRIPT_TRACE_ROWS)
+      session.script_trace = {}
+      fmt.printfln("script trace: cleared (%d row(s)).", n)
+      return
+    case "all":
+      limit = 0
+    case:
+      if n, ok := strconv.parse_int(args[0]); ok && n > 0 {
+        limit = n
+      }
+    }
+  }
+  rows := script_trace_recent(&session.script_trace, limit)
+  if len(rows) == 0 {
+    fmt.println("script trace: nothing recorded yet - 'script run <name>' first.")
+    return
+  }
+  total := min(session.script_trace.written, SCRIPT_TRACE_ROWS)
+  fmt.printfln("last %d of %d trace row(s), oldest first:", len(rows), total)
+  // Relative to the FIRST row shown, not wall-clock: what you want to read off a trace is how long the
+  // chart sat on a step, and a run that started two hours ago makes absolute stamps unreadable.
+  base := rows[0].at
+  for &r in rows {
+    tag := ""
+    switch r.level {
+    case .Step:
+    case .Note:
+      tag = "note "
+    case .Warn:
+      tag = "WARN "
+    case .Error:
+      tag = "ERROR "
+    }
+    node := r.node == 0 ? "     " : fmt.tprintf("n%-4d", u32(r.node))
+    fmt.printfln("  %8.3fs  %s  %s%s", f64(r.at - base) / 1e9, node, tag, script_trace_text(&r))
+  }
+}
+
 script_cmd_step :: proc(session: ^Session, args: []string) {
   run := &session.script
   if !run.active {
@@ -1517,12 +2399,19 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
   }
   name := ""
   mode_override := -1
+  // Start STOPPED on the first node. A modifier rather than two commands (`script run x` then
+  // `script step`), because between two enqueued commands the watcher gets a tick and the chart is
+  // already somewhere else by the time the step lands - which is exactly what the editor's Step button
+  // needs not to happen.
+  start_stepping := false
   for a in args {
     switch a {
     case "once":
       mode_override = int(Script_Mode.Once)
     case "loop":
       mode_override = int(Script_Mode.Loop)
+    case "step", "stepping", "paused":
+      start_stepping = true
     case:
       if name == "" {
         name = a
@@ -1530,7 +2419,7 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
     }
   }
   if name == "" {
-    fmt.eprintln("usage: script run <name> [once|loop]   ('script list' shows what's available)")
+    fmt.eprintln("usage: script run <name> [once|loop] [step]   ('script list' shows what's available)")
     return
   }
   // A saved file wins over an Odin behaviour of the same name; an Odin one is rebuilt FRESH here, so
@@ -1543,6 +2432,15 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
   label := doc.name
   if len(doc.steps) == 0 {
     fmt.eprintln("script run: nothing to run (the behaviour has no blocks).")
+    behaviour_doc_free(&doc)
+    return
+  }
+  // A document made entirely of watchers has no main program - running it would start and stop in the
+  // same tick. That is not an error in the file, it is a different VERB: you arm it, or a chart borrows
+  // it. Saying so beats "started (5 steps)" followed instantly by "complete".
+  if script_doc_is_watchers_only(&doc) {
+    fmt.eprintfln("script run: '%s' is a set of watchers, not a chart - there is no start node to run from.", label)
+    fmt.eprintfln("  'interrupt on %s' arms it, a chart's options tab borrows it, or 'interrupt test %s' runs its body once.", label, label)
     behaviour_doc_free(&doc)
     return
   }
@@ -1562,7 +2460,39 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
   }
   n := len(doc.steps)
   // script_begin takes ownership of the steps; the doc's own name is all that is left to release.
-  script_begin(session, label, doc.steps, mode, doc.entry)
+  script_begin(session, label, doc.steps, mode, doc.entry, .Chart, doc.uses[:])
+  // AFTER script_begin, which zeroes the run. Setting it before would be silently discarded.
+  if start_stepping && session.script.active {
+    session.script.stepping = true
+    script_trace(session, script_current_node(&Behaviour_Context{session = session}), .Note, "stepping - the walker will not advance on its own")
+  }
   delete(doc.name)
-  fmt.printfln("script: '%s' started (%d steps, %s).", label, n, mode == .Loop ? "loop" : "once")
+  for u in doc.uses {
+    delete(u)
+  }
+  delete(doc.uses)
+  fmt.printfln(
+    "script: '%s' started (%d steps, %s%s).",
+    label, n, mode == .Loop ? "loop" : "once", start_stepping ? ", STEPPING - it will not advance until you step it" : "",
+  )
+}
+
+// Is this document nothing but watchers? True when every step is either an `.On` node or part of some
+// watcher's body - i.e. there is no main program for a start node to run.
+//
+// It is deliberately NOT "the entry step is an `.On`". A perfectly ordinary chart may declare a watcher
+// on its first line (builder.on() does, and bh_test_interrupt is exactly that), and refusing to run
+// that would break every chart with a timer on it.
+script_doc_is_watchers_only :: proc(doc: ^Behaviour_Doc) -> bool {
+  if len(doc.steps) == 0 {
+    return false
+  }
+  body := make([]bool, len(doc.steps), context.temp_allocator)
+  script_watcher_body_mask(doc.steps[:], body)
+  for s, i in doc.steps {
+    if s.op != .On && !body[i] {
+      return false
+    }
+  }
+  return true
 }

@@ -16,14 +16,21 @@ import imgui "../../lib/odin-imgui"
 // THE UI. Dear ImGui over the radar window - replaced raygui wholesale in the v1 redesign.
 //
 // Everything here is a floating overlay on top of the map; there is no side panel. The surface is
-// deliberately small: a toolbar (setup traffic light, zone editor, camera follow, no-walk overlay, mute),
-// a recenter puck that only exists while the camera is free, two gauges (penya, bag), and two dialogs
-// (attach, setup). Everything else the old panel carried - the auto section, the Options modal,
-// leaderboards - is REPL-only for now and comes back with the scripting UI.
+// deliberately small: a toolbar (setup traffic light, zone editor, camera follow, no-walk overlay, mute,
+// and the leaderboards trophy once a backend is configured), a recenter puck that only exists while the
+// camera is free, two gauges (penya, bag), and the dialogs behind those buttons. What the old panel
+// carried and this one still does not - the auto section and the Options modal - is REPL-only for now
+// and comes back as scripting-graph content, not as a re-port.
 //
 // Window convention: a dialog is closed by the X in its own titlebar and nothing else. No in-body Close
 // buttons, and ESC is not a close key anywhere (raylib's ESC-quits-the-window default is off - see
 // cli_radar), so a stray ESC can never take the map down with it.
+//
+// OFFLINE. With no process attached the window used to be the Attach dialog and nothing else, which
+// also walled off the chart surface behind it - and browsing, editing, linting and saving a chart are
+// document work that never touched the game. So the dialog offers "Work offline" (Panel_State.offline)
+// and the shell drops to an Attach button plus the behaviour dock. Running still needs a client, and
+// the editor's play button says which blocks are waiting on one.
 //
 // The contract from the raygui era is unchanged and load-bearing: this code runs in cli_radar's
 // exec_mutex-UNLOCKED draw phase, so it must never touch `session`. It reads a Gui_Frame snapshot taken
@@ -53,6 +60,7 @@ ICON_VOLUME_UP :: rune(0xe050) // volume_up    - sound on
 ICON_CAMERA :: rune(0xe04b) // videocam     - the map camera (follow the player / free)
 ICON_BLOCKED :: rune(0xe14b) // block        - the no-walk terrain overlay
 ICON_ZONE :: rune(0xe162) // select_all   - the zone editor (an area, not a pen)
+ICON_FLAG :: rune(0xe153) // flag         - the waypoint route editor (and the editor's import button)
 ICON_INVENTORY :: rune(0xf19c) // backpack     - bag gauge (0xe1a1 'inventory_2' read as an archive box)
 ICON_PENYA :: rune(0xe263) // monetization - penya gauge
 ICON_LOCATION :: rune(0xe55c) // my_location  - recenter on the player (the map convention)
@@ -72,6 +80,25 @@ ICON_CODE :: rune(0xe86f) // code         - a chart defined in Odin (read-only)
 // node editor (gui_nodes.odin)
 ICON_ADD :: rune(0xe145) // add          - the add-node palette / the browser's New tile
 ICON_SAVE :: rune(0xe161) // save         - write the edited chart to its .bhv
+ICON_ARRANGE :: rune(0xe871) // dashboard    - re-run the canvas layout
+ICON_UNDO :: rune(0xe166) // undo
+ICON_REDO :: rune(0xe15a) // redo
+ICON_TRACE :: rune(0xe873) // description  - the run log strip under the canvas
+ICON_PROBLEM :: rune(0xe002) // warning      - the chart-lint badge
+// leaderboards (gui_leaderboard.odin)
+ICON_TROPHY :: rune(0xea23) // emoji_events - the leaderboards button
+ICON_DOWNLOAD :: rune(0xe2c4) // file_download - pull an entry's farming setup down as a .cfg
+ICON_REFRESH :: rune(0xe5d5) // refresh      - re-fetch the board
+// One per Block_Cat, in enum order - see ed_cat_icon. A node's icon is the fastest read on the
+// canvas: at a zoom where the title is a grey smear the shape still says "this rung picks a target".
+ICON_CAT_FLOW :: rune(0xe0b6) // call_split
+ICON_CAT_SENSE :: rune(0xe8f4) // visibility
+ICON_CAT_TARGET :: rune(0xe1b3) // gps_fixed
+ICON_CAT_MOVE :: rune(0xe536) // directions_walk
+ICON_CAT_COMBAT :: rune(0xe3e7) // flash_on
+ICON_CAT_TIMING :: rune(0xe8b5) // schedule
+ICON_CAT_VARS :: rune(0xe24a) // functions
+ICON_CAT_SYSTEM :: rune(0xe869) // build
 
 // The single source of truth for what gets baked: icon_ranges is DERIVED from this at init, so adding an
 // icon above is the entire change - a glyph can never be referenced but missing from the atlas. gui_init
@@ -84,6 +111,7 @@ ICON_ALL := [?]rune {
   ICON_CAMERA,
   ICON_BLOCKED,
   ICON_ZONE,
+  ICON_FLAG,
   ICON_INVENTORY,
   ICON_PENYA,
   ICON_LOCATION,
@@ -101,6 +129,20 @@ ICON_ALL := [?]rune {
   ICON_CODE,
   ICON_ADD,
   ICON_SAVE,
+  ICON_ARRANGE,
+  ICON_UNDO,
+  ICON_REDO,
+  ICON_TROPHY,
+  ICON_DOWNLOAD,
+  ICON_REFRESH,
+  ICON_CAT_FLOW,
+  ICON_CAT_SENSE,
+  ICON_CAT_TARGET,
+  ICON_CAT_MOVE,
+  ICON_CAT_COMBAT,
+  ICON_CAT_TIMING,
+  ICON_CAT_VARS,
+  ICON_CAT_SYSTEM,
 }
 
 // Glyph ranges for the merge: inclusive pairs, zero-terminated (one degenerate pair per icon). MUST
@@ -170,6 +212,10 @@ PENYA_WARN :: PENYA_CAP - 25_000_000 // start screaming 25M short of it
 
 // Everything the (unlocked) draw needs, snapshotted under exec_mutex by cli_radar. Nothing in here is a
 // pointer into session-owned memory that the watcher can realloc.
+// How much of the trace ring the editor's log strip can show. Sized to be worth scrolling and small
+// enough that carrying it in every Gui_Frame stays free (64 * 128 bytes).
+GUI_TRACE_ROWS :: 64
+
 Gui_Frame :: struct {
   // process / session
   attached:      bool,
@@ -178,7 +224,7 @@ Gui_Frame :: struct {
   proc_name:     string,
   // setup checklist
   groups:        [10]Setup_Group,
-  opins:         [4]Setup_Group,
+  opins:         [5]Setup_Group,
   setup_running: bool,
   setup_step:    int,
   // gauges
@@ -195,16 +241,35 @@ Gui_Frame :: struct {
   // fence menu
   fence_active:  bool,
   fence_shapes:  int,
+
+  // Waypoint route (waypoints.odin). The rows are temp-allocated clones taken under the lock, for the
+  // same reason nearby_names are: the context menu draws a name that a deferred `waypoints delete`
+  // could otherwise free out from under it.
+  waypoint_rows:      []Gui_Waypoint_Row,
+  waypoint_count:     int,
+  waypoint_set_name:  string,
+  waypoint_map_known: bool,
+  waypoint_map_here:  bool, // the set was drawn on the map we are standing on (meaningless unless known)
+  waypoint_can_undo:  bool,
+  waypoint_can_redo:  bool,
   // behaviour run state (Script_Run, snapshotted - the watcher owns the real one)
   script_active: bool,
   script_paused: bool,
   script_step:   bool, // single-step debug mode is on
-  script_irq:    bool, // an interrupt region is executing
+  script_in_watcher:    bool, // an interrupt region is executing
   script_name:   string, // temp-allocated copies; they outlive the draw, not the frame
   script_pc:     int, // 1-based, for display
   script_len:    int, // main program length (regions are not part of the count)
   script_line:   string,
   script_node:   Node_Id, // the current step's identity - what the editor highlights
+
+  // The tail of the run trace (script.odin), for the editor's log strip. A fixed array of POD rows
+  // rather than temp-allocated strings, because Gui_Frame is copied BY VALUE and every string in it is
+  // a lifetime rule somebody has to remember; a row that owns nothing has none. GUI_TRACE_ROWS is the
+  // window, not the ring - the ring is 256 deep and `script trace` reads all of it.
+  trace:         [GUI_TRACE_ROWS]Script_Trace_Row,
+  trace_count:   int,
+  trace_total:   int, // how many rows the ring holds, so the strip can say "showing the last N of M"
 
   // Block availability, evaluated under the lock because def.avail reads the session. The node
   // editor's palette and inspector gate on this - same source as `script blocks`, so a block the
@@ -212,23 +277,54 @@ Gui_Frame :: struct {
   // rodata literals from the avail procs, so holding them past the frame is safe.
   // Enabled global interrupts (interrupt.odin), snapshotted so the browser's checkboxes and the
   // editor's arm/disarm button can read "is this one armed" without touching the session.
-  irq:           [FLYFF_MAX_INTERRUPTS]Gui_Irq_Row,
-  irq_n:         int,
+  // The RUNNING chart's watchers - its own, the ones it borrowed, and the globally armed ones, in the
+  // order they are checked. Separate from `armed` below, which is the persisted always-on set and exists
+  // whether anything is running or not.
+  watchers:      [SCRIPT_MAX_WATCHERS]Gui_Watcher_Row,
+  watcher_count:       int,
+  armed:         [FLYFF_MAX_ARMED_WATCHERS]Gui_Armed_Row,
+  armed_watcher_count:         int,
 
   // Where the character is standing, for the node editor's "Here" button on a Coord argument -
   // typing a waypoint by hand is exactly the thing you have the game open to avoid.
   player_have:   bool,
   player_pos:    [3]f32,
 
-  act_ok:        [Script_Action_Kind]bool,
-  act_why:       [Script_Action_Kind]string,
-  ev_ok:         [Script_Event_Kind]bool,
-  ev_why:        [Script_Event_Kind]string,
+  // Leaderboards (leaderboard.odin), for the toolbar trophy and the dialog behind it. The scalars are
+  // snapshotted every frame - the trophy carries the live run in its tooltip, so they are never
+  // dialog-gated. The last four allocate, so they are filled ONLY while the dialog is open.
+  leaderboard_configured:   bool, // leaderboard_url is set: the trophy exists at all
+  leaderboard_recording:    bool,
+  leaderboard_has_run:      bool, // recording, or a finished span still holding its numbers
+  leaderboard_elapsed_sec:  int,
+  leaderboard_kills:        int,
+  leaderboard_penya:        i64,
+  leaderboard_kpm:          f64,
+  leaderboard_peak_density: int,
+  leaderboard_species:      int,
+  leaderboard_busy:         bool, // a submit/fetch/getcfg worker is in flight
+  leaderboard_submitted:    bool, // this span is already on the board
+  leaderboard_sort:         int,  // which LB_SORTS index leaderboard_rows reflects
+  leaderboard_status:       string, // the async worker's last line ("submitted #42", "rejected ...")
+  leaderboard_url:          string,
+  leaderboard_rows:         []Lb_Row, // the fetched page; Lb_Row is POD, so this is a value clone
+  player_name:              string, // the character's own name, to seed the submit box
+
+  // The monster species on screen right now, deduped, for the mob-name picker. Same argument as
+  // player_pos above: the spelling the field wants is on the map in front of you, so the editor
+  // should not make you retype it. The offline half of the corpus is MOB_NAME_CORPUS. Temp-allocated
+  // under the lock like every other string here.
+  nearby_names:  []string,
+
+  action_usable:        [Script_Action_Kind]bool,
+  action_why_not:       [Script_Action_Kind]string,
+  event_usable:         [Script_Event_Kind]bool,
+  event_why_not:        [Script_Event_Kind]string,
 }
 
 // One armed global interrupt, as the draw phase sees it. Strings are temp-allocated clones taken
-// under the lock: the watcher owns the real ones and irq_reload frees them.
-Gui_Irq_Row :: struct {
+// under the lock: the watcher owns the real ones and armed_watcher_reload frees them.
+Gui_Armed_Row :: struct {
   name:    string,
   trigger: string,
   fires:   int,
@@ -236,14 +332,37 @@ Gui_Irq_Row :: struct {
   why:     string,
 }
 
+// One watcher of the RUNNING chart, for the dock. It exists because "an interrupt fired" used to be a
+// single boolean on the transport strip: you could tell that something had taken over, never what, and
+// never that a watcher was armed at all until the moment it fired.
+Gui_Watcher_Row :: struct {
+  label:   string, // the watcher's own one-line description
+  fires:   int,
+  live:    bool, // this one has control right now
+  borrowed: bool, // came from another document (uses, or globally armed) rather than this chart
+}
+
+// One waypoint as the draw phase sees it. The name is a temp-allocated clone taken under the lock.
+Gui_Waypoint_Row :: struct {
+  name:     string, // "" when unnamed; the panel shows the ordinal instead
+  position: [2]f32,
+}
+
 // Radar-local view state the toolbar drives directly (these are cli_radar stack locals, not session
 // state, so the draw phase may write them - the watcher never sees them).
 Gui_View :: struct {
-  edit:     ^bool,
+  mode:     ^Radar_Mode, // which tool owns the map (View / Fence / Inspect / Waypoint)
   cam_lock: ^bool,
   recenter: ^bool, // set to true by the recenter button; cli_radar consumes + clears it
   tool:     ^Radar_Tool,
   tag:      ^int, // fence draw tag: 0 = include(+), 1 = exclude(-), 2 = avoid(!)
+}
+
+// Toggle a radar mode from a toolbar button: on when it is not already current, back to View when it
+// is. The keyboard shortcuts do the same thing, and BOTH have to exist - synthetic key presses never
+// reach this window, so a mode with no button cannot be exercised without a person at the keyboard.
+gui_view_toggle_mode :: proc(view: Gui_View, want: Radar_Mode) {
+  view.mode^ = view.mode^ == want ? .View : want
 }
 
 // Per-window UI state: the deferred command queue plus the widget buffers. A cli_radar LOCAL (like
@@ -253,6 +372,11 @@ Panel_State :: struct {
   pending:          [dynamic]string, // deferred CLI commands, drained under exec_mutex after each frame
 
   // attach dialog
+  // offline: the user chose to work with no process. The window then drops to a shell that is just an
+  // Attach button and the behaviour dock, because everything the chart surface does - browse, edit,
+  // lint, save - is file and document work that never needed the game. A window-local view bool like
+  // browser_open, NOT session state: nothing outside this window has an opinion about it.
+  offline:          bool,
   attach_filter:    [64]u8,
   attach_seeded:    bool,
   attach_rows:      [dynamic]Gui_Proc_Row,
@@ -277,6 +401,23 @@ Panel_State :: struct {
   rename_buf:       [64]u8,
   dup_from:         string, // heap-owned; "" = the duplicate prompt is closed
   dup_buf:          [64]u8,
+
+  // leaderboards (gui_leaderboard.odin)
+  leaderboard_open:   bool,
+  leaderboard_seeded: bool, // one-shot on open: seed the name box + fire the first fetch
+  leaderboard_name:   [25]u8, // the server caps a name at 24 chars (server/handlers.go validName)
+  leaderboard_sort:   int, // the tab the user has selected (index into LB_SORTS)
+
+  // waypoint route editor (waypoints.odin; radar mode W). The context menu's target is LATCHED rather
+  // than read from the live hover: the popup draws on later frames, and by then the cursor has left the
+  // flag for the menu. Same reason the node editor keeps ctx_edge_from.
+  waypoint_context:        int, // which waypoint the context menu is about (-1 = none)
+  waypoint_context_open:   bool, // a right-click asked for the menu; consumed into an OpenPopup
+  waypoint_context_seeded: bool, // one-shot: fill the text/index boxes from the latched waypoint
+  waypoint_name:           [64]u8,
+  waypoint_order:          i32, // the 1-based position box
+  waypoint_save_name:      [64]u8,
+  waypoint_save_open:      bool,
 
   // node editor (gui_nodes.odin) - owns a Behaviour_Doc while it is open
   ed:               Gui_Editor,
@@ -485,6 +626,18 @@ tint :: proc(v: imgui.Vec4, a: f32) -> imgui.Vec4 {
   return {v.x, v.y, v.z, v.w * a}
 }
 
+// <base> pulled <k> of the way toward <toward>, at an explicit alpha. For tinting a dark surface with
+// an accent WITHOUT making it translucent - `tint` can only make a colour thinner, and a control that
+// sits on the map needs to stay opaque while still reading as accented.
+blend :: proc(base, toward: imgui.Vec4, k: f32, alpha: f32) -> imgui.Vec4 {
+  return {
+    base.x + (toward.x - base.x) * k,
+    base.y + (toward.y - base.y) * k,
+    base.z + (toward.z - base.z) * k,
+    alpha,
+  }
+}
+
 // Draw one icon glyph centred on (cx,cy).
 //
 // This exists because ImGui centres a button's label by its ADVANCE width and draws it from the text
@@ -513,6 +666,24 @@ gui_draw_icon :: proc(dl: ^imgui.DrawList, cx, cy: f32, icon: rune, col: imgui.V
     math.round(cy - (icon_ink_y0 + icon_ink_y1) * 0.5 + px(ICON_NUDGE_Y)),
   }
   imgui.DrawList_AddText(dl, pen, u32_of(col), fmt.ctprintf("%r", icon))
+}
+
+// The same centring at an ARBITRARY pixel size, for the node canvas - whose text scales with the zoom
+// rather than sitting at the UI font size. The glyph's ink rect is measured at the baked size, so it
+// scales with it; no rounding here, because a canvas icon lands on a fractional position anyway and
+// snapping it would make it jitter against the node it sits in as you pan.
+gui_draw_icon_sized :: proc(dl: ^imgui.DrawList, cx, cy, size: f32, icon: rune, col: imgui.Vec4) {
+  if size < 5 {
+    return // matches ed_text: below this it is a smudge, and a smudge reads as dirt on the screen
+  }
+  font := imgui.GetFont()
+  g := imgui.Font_FindGlyph(font, imgui.Wchar(icon))
+  if g == nil {
+    return
+  }
+  k := size / imgui.GetFontSize()
+  pen := imgui.Vec2{cx - (g.X0 + g.X1) * 0.5 * k, cy - (icon_ink_y0 + icon_ink_y1) * 0.5 * k}
+  imgui.DrawList_AddTextImFontPtr(dl, font, size, pen, u32_of(col), fmt.ctprintf("%r", icon))
 }
 
 // A square icon button, rounded into a pill. `active` gives it the accent fill (used for toggles that
@@ -553,6 +724,51 @@ gui_icon_button :: proc(id: cstring, icon: rune, active: bool, tip: cstring, col
     imgui.SetTooltip("%s", tip)
   }
   return clicked
+}
+
+// The same widget as gui_icon_button with a WORD instead of a glyph: same colour contract, same `active`
+// accent fill, but a rounded RECTANGLE rather than a pill - a label needs a bar around it, and a
+// side/2 radius on something this wide reads as a stadium, not as a button. `h` and `pad_x` are authored
+// at scale 1; the width is the label plus pad_x on each side, so the caller can size it by its text.
+gui_text_button :: proc(id: cstring, label: cstring, h, pad_x: f32, active: bool, tip: cstring, col: Maybe(imgui.Vec4) = nil) -> bool {
+  side := px(h)
+  accent := col.? or_else COL_ACCENT
+
+  if active {
+    // A NEARLY OPAQUE dark fill carrying an accent tint, rather than a translucent wash of the accent
+    // itself. This button sits directly on the map - the same problem the status line under it solves
+    // with a drop shadow - and at 22% alpha whatever terrain happened to be behind it came through and
+    // ate the label. The fill has to stay DARK because the text is the accent colour; raising the
+    // accent's own alpha instead would end with accent text on an accent pill.
+    imgui.PushStyleColorImVec4(.Button, blend(COL_TRACK, accent, 0.18, 0.92))
+    imgui.PushStyleColorImVec4(.ButtonHovered, blend(COL_TRACK, accent, 0.30, 0.96))
+    imgui.PushStyleColorImVec4(.ButtonActive, blend(COL_TRACK, accent, 0.42, 1.0))
+    imgui.PushStyleColorImVec4(.Border, tint(accent, 0.75))
+    imgui.PushStyleColorImVec4(.Text, accent)
+  } else {
+    imgui.PushStyleColorImVec4(.Button, tint(COL_TRACK, 0.85))
+    imgui.PushStyleColorImVec4(.ButtonHovered, {0.184, 0.239, 0.310, 1.0})
+    imgui.PushStyleColorImVec4(.ButtonActive, {0.235, 0.310, 0.400, 1.0})
+    imgui.PushStyleColorImVec4(.Border, COL_BORDER)
+    imgui.PushStyleColorImVec4(.Text, COL_TEXT)
+  }
+  imgui.PushStyleVar(.FrameRounding, side * 0.28)
+  imgui.PushID(id)
+  clicked := imgui.Button(label, {gui_text_button_w(label, pad_x), side})
+  imgui.PopID()
+  imgui.PopStyleVar(1)
+  imgui.PopStyleColor(5)
+
+  if tip != nil && imgui.IsItemHovered() {
+    imgui.SetTooltip("%s", tip)
+  }
+  return clicked
+}
+
+// What gui_text_button will measure, WITHOUT drawing it. The behaviour dock centres a whole row of
+// controls by hand, so it has to know the width of every one of them before the first is placed.
+gui_text_button_w :: proc(label: cstring, pad_x: f32) -> f32 {
+  return imgui.CalcTextSize(label).x + px(pad_x) * 2
 }
 
 // A filled bar with its value printed INSIDE. The text carries a 1px near-black shadow so it stays
@@ -648,10 +864,15 @@ gui_begin_dialog :: proc(title: cstring, w, h: f32, open: ^bool = nil) -> bool {
 // Draw the whole UI for one frame. Runs in cli_radar's UNLOCKED draw phase - reads `f` (the snapshot),
 // writes only `ps` (widget state + the deferred queue) and `view` (radar-local view bools).
 gui_frame :: proc(session: ^Session, ps: ^Panel_State, f: ^Gui_Frame, view: Gui_View) {
+  // Attached: offline is over, and a LATER detach offers the dialog again rather than silently
+  // dropping you into the offline shell with a map that has quietly stopped meaning anything.
+  if f.attached {
+    ps.offline = false
+  }
   // Both dialogs are genuinely modal: they return instead of falling through, so the toolbar and the
   // fence menu are not merely dimmed behind them but absent. (The dim is drawn on the BACKGROUND draw
   // list, which is behind every window - leaving the HUD up would also leave it clickable.)
-  if !f.attached {
+  if !f.attached && !ps.offline {
     gui_attach_dialog(ps, f)
     return
   }
@@ -669,20 +890,43 @@ gui_frame :: proc(session: ^Session, ps: ^Panel_State, f: ^Gui_Frame, view: Gui_
     gui_behaviour_browser(ps, f)
     return
   }
+  if ps.leaderboard_open {
+    gui_leaderboard_dialog(ps, f)
+    return
+  }
+
+  // OFFLINE SHELL. Only the two things that still mean something: the way back to a process, and the
+  // chart surface. Deliberately not the normal toolbar dimmed out - a red traffic light over a Setup
+  // dialog that cannot run, a zone editor for a world we cannot see and a mute button for sounds
+  // nothing will play are five controls whose only remaining job is to explain why they do nothing.
+  if !f.attached {
+    gui_offline_toolbar(ps)
+    gui_behaviour_dock(ps, f)
+    return
+  }
 
   gui_toolbar(ps, f, view)
   gui_gauges(f)
   gui_recenter_fab(view)
-  gui_behaviour_transport(ps, f)
-  if view.edit^ {
+  gui_behaviour_dock(ps, f)
+  switch view.mode^ {
+  case .Fence:
     gui_fence_menu(ps, f, view)
+  case .Waypoint:
+    gui_waypoint_menu(ps, f)
+  case .View, .Inspect:
+  // no panel: View has nothing to configure, and the inspector's readout is a cursor-anchored tooltip
+  // drawn on the map itself (radar.odin), not a panel.
   }
+  // Drawn outside the switch: the context menu is opened by a right-click in Waypoint mode but must keep
+  // drawing for as long as ImGui says the popup is open, including the frames after the mode is left.
+  gui_waypoint_context_menu(ps, f)
 }
 
 // Is a dialog swallowing input this frame? cli_radar ORs this with io.WantCaptureMouse to gate map
 // input, so a click that lands NEXT TO (not on) an open dialog can't also target a mob behind it.
 gui_modal_up :: proc(ps: ^Panel_State, attached: bool) -> bool {
-  return !attached || ps.setup_open || ps.browser_open || ps.ed.open
+  return (!attached && !ps.offline) || ps.setup_open || ps.browser_open || ps.ed.open || ps.leaderboard_open
 }
 
 // ===========================================================================
@@ -709,16 +953,23 @@ gui_toolbar :: proc(ps: ^Panel_State, f: ^Gui_Frame, view: Gui_View) {
     }
     imgui.SameLine(0, px(6))
 
-    // Behaviours. Highlighted while something is running, so the toolbar answers "is the bot doing
-    // anything" without the transport strip having to be read.
-    if gui_icon_button("charts", ICON_CHARTS, f.script_active, f.script_active ? fmt.ctprintf("Running '%s' - click for the chart browser", f.script_name) : "Behaviour charts  ('script list')") {
-      ps.browser_open = true
-      ps.browser_rescan = true
+    // NOTE: behaviours are NOT here. They live in the bottom-centre dock (gui_behaviour_dock) with the
+    // transport, because "which chart is loaded" and "pause it" are one thought and belong in one place -
+    // and that place is under the map, not in a strip of view toggles.
+
+    if gui_icon_button("edit", ICON_ZONE, view.mode^ == .Fence, view.mode^ == .Fence ? "Zone editor: ON  (E)" : "Zone editor - draw where farming is allowed  (E)") {
+      gui_view_toggle_mode(view, .Fence)
     }
     imgui.SameLine(0, px(6))
 
-    if gui_icon_button("edit", ICON_ZONE, view.edit^, view.edit^ ? "Zone editor: ON  (E)" : "Zone editor - draw where farming is allowed  (E)") {
-      view.edit^ = !view.edit^
+    // The clickable twin of the W shortcut. Not optional: synthetic key presses never reach this window,
+    // so a mode reachable only by keyboard cannot be exercised or verified without a person at it.
+    waypoint_tip: cstring = view.mode^ == .Waypoint ? "Waypoints: ON  (W)" : "Waypoints - draw a route to walk  (W)"
+    if f.waypoint_count > 0 && view.mode^ != .Waypoint {
+      waypoint_tip = fmt.ctprintf("Waypoints: %d placed  (W)", f.waypoint_count)
+    }
+    if gui_icon_button("waypoints", ICON_FLAG, view.mode^ == .Waypoint, waypoint_tip) {
+      gui_view_toggle_mode(view, .Waypoint)
     }
     imgui.SameLine(0, px(6))
 
@@ -737,6 +988,44 @@ gui_toolbar :: proc(ps: ^Panel_State, f: ^Gui_Frame, view: Gui_View) {
     if gui_icon_button("mute", f.sfx_on ? ICON_VOLUME_UP : ICON_VOLUME_OFF, f.sfx_on, f.sfx_on ? "Sound: on  (chime on penya, zap on kill)" : "Sound: muted") {
       panel_enqueue(ps, f.sfx_on ? "sfx off" : "sfx on")
     }
+
+    // --- leaderboards. Gated on a configured backend, like the raygui sidebar button before it: with no
+    // `leaderboard_url` there is nothing behind this button, and a control that only ever explains why it
+    // does nothing is worse than no control. The trophy doubles as the recording light - see
+    // gui_leaderboard_button_state for the three states it can be in.
+    if f.leaderboard_configured {
+      imgui.SameLine(0, px(6))
+      leaderboard_col, leaderboard_tip := gui_leaderboard_button_state(f)
+      if gui_icon_button("lb", ICON_TROPHY, f.leaderboard_has_run, leaderboard_tip, leaderboard_col) {
+        ps.leaderboard_open = true
+        ps.leaderboard_seeded = false
+      }
+    }
+  }
+  imgui.End()
+  imgui.PopStyleVar(1)
+}
+
+// ===========================================================================
+// Offline toolbar (top-left; the detached shell's only chrome)
+// ===========================================================================
+
+// One button, in the slot the traffic light normally occupies: the way back to a process. It is a WORD
+// rather than an icon because it is the only control on screen and there is nothing for its shape to
+// contrast against - a lone glyph on an empty map reads as decoration.
+@(private = "file")
+gui_offline_toolbar :: proc(ps: ^Panel_State) {
+  vp := imgui.GetMainViewport()
+  imgui.SetNextWindowPos({vp.Pos.x + px(TOOLBAR_PAD), vp.Pos.y + px(TOOLBAR_PAD)}, .Always)
+  imgui.PushStyleVarImVec2(.WindowPadding, {px(8), px(8)})
+  if imgui.Begin("##offlinebar", nil, {.NoTitleBar, .NoResize, .NoMove, .NoScrollbar, .NoSavedSettings, .AlwaysAutoResize, .NoNavInputs, .NoDocking}) {
+    if gui_text_button("attachbtn", "Attach", ICON_BTN, 14, true, "Pick a game client to control - back to the process list") {
+      ps.offline = false
+    }
+    imgui.SameLine(0, px(10))
+    imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
+    imgui.TextUnformatted("Offline - charts only. Nothing here can run until a client is attached.")
+    imgui.PopStyleColor(1)
   }
   imgui.End()
   imgui.PopStyleVar(1)
@@ -973,7 +1262,8 @@ gui_attach_dialog :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
     )
     imgui.Dummy({0, 2})
 
-    if imgui.BeginChild("##procs", {0, -px(36)}, {.Borders}) {
+    // Reserves the footer row, which is a BUTTON tall now (Work offline) rather than a line of text.
+    if imgui.BeginChild("##procs", {0, -px(48)}, {.Borders}) {
       if len(ps.attach_rows) == 0 {
         imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
         imgui.TextUnformatted(filter == "" ? "no processes found" : fmt.ctprintf("nothing matches '%s'", filter))
@@ -1003,6 +1293,17 @@ gui_attach_dialog :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
     }
     imgui.EndChild()
 
+    // The way out that is not attaching. Everything the chart surface does - browse, edit, lint, save -
+    // is document work, so needing the game open to draw a chart was a restriction with nothing behind
+    // it. Not the titlebar X (this dialog has none, on purpose): an X reads as "cancel", and this is a
+    // mode you are choosing. The Attach button in the offline toolbar brings this dialog back.
+    if imgui.Button("Work offline", {px(130), 0}) {
+      ps.offline = true
+    }
+    if imgui.IsItemHovered() {
+      imgui.SetTooltip("Open the behaviour browser and the chart editor with no game running. Nothing can RUN until you attach.")
+    }
+    imgui.SameLine(0, px(10))
     imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
     imgui.TextUnformatted("Flyff automation needs the 32-bit Neuz.exe.")
     imgui.PopStyleColor(1)

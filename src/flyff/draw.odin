@@ -347,16 +347,6 @@ Mover_Hit :: struct {
   model_ok: bool, // has a mapped model -> tc/auto would target it
 }
 
-// First warm type from prefs, or (0,false) if none are initialised.
-pick_warm_type :: proc(session: ^Session, prefs: []int) -> (int, bool) {
-  for t in prefs {
-    if particle_type_active(session, t) {
-      return t, true
-    }
-  }
-  return 0, false
-}
-
 // Enumerate every type-5 mover whose inline name case-insensitively EQUALS `name` (empty = all) -
 // same name gate as `auto`/`tc` (strings.equal_fold, not substring), so markmobs marks exactly the
 // set those commands would target. Same scan `mobs`/`tc` use: read the world ptr, scan all writable

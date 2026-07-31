@@ -52,6 +52,8 @@ run_module_ui :: proc(session: ^Session) -> bool {
     )
     return false
   }
+  // Only ever SEEN in a debug main-module build: the release one is linked -subsystem:windows and has
+  // no console at all, so this (and every other print in it) goes to a dead handle. See build.bat.
   fmt.printfln("memscan - main module '%s' (no REPL in this build; this console keeps the log).", session.module_name)
   // The watcher thread is what drives module_tick - the auto-farm, the overlays, the global
   // interrupts. Normally a command starts it lazily (ensure_hotkey_thread), but here there is no REPL

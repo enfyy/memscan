@@ -40,9 +40,16 @@ LB_USER_AGENT :: "memscan-leaderboard/1.0"
 LB_HTTP_TIMEOUT_MS :: 15000
 LB_CONNECT_TIMEOUT_MS :: 8000
 
-// The sortable board columns. Index 0 is the default. The string is the backend `sort` query value;
-// kept in sync with the Go server's allowed sorts and the radar dialog's sort toggle.
-LB_SORTS := [5]string{"penya", "kpm", "kills", "monsters", "density"}
+// The sortable board columns. Index 0 is the default. The string is the backend `sort` query value.
+// Three columns, because those are the three things a farm run IS: how much you made, how much you
+// killed, and how fast. The server (server/db.go sortColumn) still answers `monsters` and `density`
+// too - it is a superset, and it falls back to penya for anything it does not know - so trimming here
+// needs no redeploy. Both the `leaderboard top` CLI and the dialog's sort tabs read this array.
+LB_SORTS := [3]string{"penya", "kills", "kpm"}
+
+// What the dialog's sort tabs say, one per LB_SORTS entry (the query keys above are wire values, not
+// labels). Same index space, so the tab that is lit and the board that is fetched cannot disagree.
+LB_SORT_LABELS := [3]cstring{"Penya", "Kills", "Kills / min"}
 
 // ===========================================================================
 // Types
@@ -776,7 +783,7 @@ cli_leaderboard :: proc(session: ^Session, args: []string) {
 			if idx, found := lb_sort_index(args[1]); found {
 				sort = idx
 			} else {
-				fmt.eprintfln("unknown sort '%s' (want: penya|kpm|kills|monsters|density)", args[1])
+				fmt.eprintfln("unknown sort '%s' (want: penya|kills|kpm)", args[1])
 				return
 			}
 		}
@@ -803,7 +810,7 @@ cli_leaderboard :: proc(session: ^Session, args: []string) {
 		}
 		cli_set(session, {"leaderboard_url", args[1]}) // reuse the config path (validates attach + saves)
 	case:
-		fmt.eprintln("usage: leaderboard [status|start|stop|submit <name>|top [sort]|getcfg <id> [path]|url [value]]")
+		fmt.eprintln("usage: leaderboard [status|start|stop|submit <name>|top [penya|kills|kpm]|getcfg <id> [path]|url [value]]")
 	}
 }
 

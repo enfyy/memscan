@@ -14,18 +14,16 @@ import "../engine"
 // Enter/Update/Exit) and engine/events.odin (a Board: one latched signal per kind, cleared
 // at the top of every tick). Both were ported from the author's RTS engine; see those files.
 //
-// WHY: auto_tick (autofarm.odin) is already a state machine, it just isn't declared - its
-// states are a precedence chain over booleans spread across ~30 Session fields
-// (auto_paused -> sweep_on -> la_approach_on -> focus-live -> advance). Because there is no
-// Exit phase, teardown is re-written by hand at every site that leaves a state
-// (auto_skip_blocked, clear_focus, sweep_clear, auto_stop), and a cross-cutting mode has to be
-// threaded through by hand (hunt_steering_on is consulted in four places). This file is the
-// declared version of the same shape, so behaviour becomes authorable instead of compiled in.
+// WHY IT EXISTS: `auto` used to be auto_tick - a state machine that was never declared, its states
+// a precedence chain over booleans spread across ~30 Session fields
+// (auto_paused -> sweep_on -> la_approach_on -> focus-live -> advance). With no Exit phase, teardown
+// had to be re-written by hand at every site that left a state, and a cross-cutting mode had to be
+// threaded through by hand (hunt_steering_on was consulted in four places). That whole tick is gone:
+// `auto` now builds and runs a chart (bh_auto), so the ladder is a graph and "never drop the target"
+// is one edge instead of a flag checked in four places.
 //
-// TICK ORDER: behaviour_tick runs FIRST in module_tick, ahead of auto_tick, which is where it
-// needs to be once it owns routing. Today it only observes, so running first costs it one tick
-// (~20ms) of latency on the kill/penya counters auto_tick and penya_tick bump later in the same
-// tick. That is deliberate: the call-site order does not have to change when it takes over.
+// TICK ORDER: behaviour_tick is the ONLY farm tick in module_tick now - it owns routing. penya_tick
+// and range_ring_tick still run after it; they only observe.
 //
 // SENSE DISCIPLINE - two hard rules, because breaking either is how this feature would regress
 // the farm it is supposed to replace:
@@ -84,21 +82,14 @@ signal_name :: proc(sig: ^Behaviour_Signal) -> string {
   return string(sig.name[:n])
 }
 
-// Copy <name> into a signal's fixed buffer (truncating past capacity). The setter counterpart to
-// signal_name - senses that report a mover name go through this rather than storing a borrowed
-// temp-allocator string that would dangle once the Board outlives the tick.
-signal_set_name :: proc(sig: ^Behaviour_Signal, name: string) {
-  n := min(len(name), len(sig.name))
-  copy(sig.name[:n], name[:n])
-  sig.name_len = n
-}
-
 // --- states -------------------------------------------------------------------------------
 
 // The durable state tag. Serializable and printable; the live proc is rebuilt from it each tick
 // via behaviour_state_function (the RTS convention - see movement_state_function there).
-// Stage 1 adds Script_Step; Stage 4 adds Paused/Sweeping/Approaching/Fighting/Advancing as the
-// auto states are ported over.
+// Two states is the whole machine, and deliberately so: farming did NOT become
+// Paused/Sweeping/Approaching/Fighting/Advancing states here. Those turned out to be steps in a
+// program rather than modes of the host, so they live in the chart (bh_auto) and this level only has
+// to know whether a chart is running.
 Behaviour_State :: enum {
   Idle,
   Script,
@@ -469,7 +460,7 @@ behaviour_tick :: proc(session: ^Session) {
   // Deliberately NOT gated on `attached`: a script built from pure-VM blocks (wait/repeat/if/var) is
   // meant to run with no game at all, which is also how the whole walker gets tested headlessly. The
   // sense pass does its own attach check.
-  if !session.bh_sense_on && !session.script.active && !irq_any_armed(session) {
+  if !session.bh_sense_on && !session.script.active && !armed_watcher_any(session) {
     return
   }
   // Point temp at the machine's own arena for this whole tick, and reset it here. Everything below -
@@ -487,7 +478,7 @@ behaviour_tick :: proc(session: ^Session) {
   // BEFORE the state machine (so an interrupt that fires takes effect on the tick it fired rather
   // than after one more step of whatever was happening). It is a no-op while a chart is running -
   // that run's hoisted watchers are the evaluator then. See interrupt.odin.
-  irq_tick(&ctx)
+  armed_watcher_tick(&ctx)
   // First engagement: run the initial state's Enter, once. The per-tick rebuild below constructs the
   // machine literally instead of via state_machine_create precisely so Enter does NOT re-run every
   // tick - but that means nothing would ever enter the STARTING state (a state returning itself is
@@ -523,91 +514,6 @@ behaviour_reset :: proc(session: ^Session) {
 }
 
 // --- CLI ----------------------------------------------------------------------------------
-
-// sense           -> one-shot sense pass + print the board (works with the watcher stopped)
-// sense on|off    -> continuous sensing on the watcher tick
-// sense list      -> the sense table with cost + availability
-cli_sense :: proc(session: ^Session, args: []string) {
-  if len(args) >= 1 {
-    switch args[0] {
-    case "on":
-      session.bh_sense_on = true
-      engine.ensure_hotkey_thread(&session.eng) // the board is only refreshed by the watcher tick
-      fmt.println("sense: ON - the behaviour board refreshes every watcher tick (~20ms).")
-      return
-    case "off":
-      session.bh_sense_on = false
-      fmt.println("sense: off. 'sense' still does a one-shot pass on demand.")
-      return
-    case "list":
-      cli_sense_list(session)
-      return
-    case:
-      fmt.eprintfln("sense: unknown subcommand '%s' (on|off|list, or bare 'sense' for a one-shot read)", args[0])
-      return
-    }
-  }
-  if !session.attached {
-    fmt.eprintln("not attached. attach a 32-bit Neuz first.")
-    return
-  }
-  // One-shot: sense right here on the REPL thread (we already hold exec_mutex), so this works
-  // whether or not continuous sensing is on.
-  ctx := Behaviour_Context {
-    session = session,
-    now     = time.now()._nsec,
-    board   = &session.bh_board,
-  }
-  behaviour_sense_pass(&ctx)
-  age := ctx.now - session.bh_state_at
-  fmt.printfln("=== behaviour ===")
-  fmt.printfln(
-    "state   : %s%s",
-    behaviour_state_name(session.bh_state),
-    session.bh_state_at == 0 ? "  (never entered - the machine is idle)" : fmt.tprintf("  (%s)", fmt_elapsed(age)),
-  )
-  fmt.printfln("sensing : %s", session.bh_sense_on ? "continuous (every watcher tick)" : "on demand only ('sense on' for continuous)")
-  fmt.println("board (this pass):")
-  any := false
-  // Over the EVENT enum, not the sense table: some events are raised by an action rather than polled
-  // (Stuck), so they have no Sense_Def and would be invisible if this walked SENSES.
-  for ev in Behaviour_Event {
-    def := sense_def(ev)
-    label := def != nil ? def.name : behaviour_event_name(ev)
-    if def != nil && def.avail != nil {
-      if ok, why := def.avail(session); !ok {
-        fmt.printfln("  [--] %-14s %s", label, why)
-        continue
-      }
-    }
-    sig, posted := engine.board_get(&session.bh_board, ev)
-    if !posted {
-      fmt.printfln("  [ ]  %-14s%s", label, def == nil ? "   (raised by an action, not polled)" : "")
-      continue
-    }
-    any = true
-    detail := ""
-    switch ev {
-    case .Focus_Live, .Focus_Lost:
-      detail = fmt.tprintf("obj 0x%X", sig.obj)
-    case .Kill_Confirmed:
-      detail = fmt.tprintf("+%.0f kill(s)", sig.num)
-    case .Penya_Gain:
-      detail = fmt.tprintf("+%.0f penya", sig.num)
-    case .Hp_Fell:
-      detail = fmt.tprintf("hp now %.0f", sig.num)
-    case .Inv_Full:
-      detail = "bag full"
-    case .Stuck:
-      detail = fmt.tprintf("%.0f units short", sig.num)
-    }
-    fmt.printfln("  [X]  %-14s %s", label, detail)
-  }
-  if !any {
-    fmt.println("  (nothing posted this pass - that is normal when standing idle with no target)")
-  }
-  fmt.println("'sense list' explains each one + its polling cost.")
-}
 
 @(private = "file")
 cli_sense_list :: proc(session: ^Session) {

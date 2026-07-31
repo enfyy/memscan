@@ -40,9 +40,11 @@ import tracy "../../lib/odin-tracy"
 // never race the picker (which reads session.fence under the same mutex). The text command channel stays
 // the headless/scripting interface (the fence is also fully authorable via the `fence` commands).
 //
-// It does NOT require an attached process: with none, gui.odin puts up the Attach dialog and every
-// game read is skipped (`live`). handle/base/layout are therefore re-read per frame rather than hoisted
-// out of the loop - you can attach, detach and re-attach without closing the window.
+// It does NOT require an attached process: with none, gui.odin puts up the Attach dialog - or, if you
+// take its "Work offline" way out, the chart-editing shell - and every game read is skipped (`live`).
+// handle/base/layout are therefore re-read per frame rather than hoisted out of the loop; you can
+// attach, detach and re-attach without closing the window. `live` gates the world INPUT too, not just
+// the reads: offline the map is genuinely reachable, so nothing may assume a world is there.
 // ===========================================================================
 
 OT_MOVER_IDX :: 5 // m_apObject[] index for OT_MOVER (mobs / players / pets)
@@ -102,6 +104,20 @@ PAINT_LINE_W :: f32(2.0)                 // centreline thickness (px)
 // floor only widens what counts as a grab; the painted swath itself is always exactly attack_range wide,
 // because the swath IS the ground that gets killed.
 PAINT_GRAB_PX :: f32(14)
+
+// Waypoint route flags (waypoints.odin; radar mode W). Like PAINT_GRAB_PX the grab radius is a SCREEN
+// size divided by the zoom, so a flag stays as easy to hit at any scale - the alternative, a world-space
+// radius, is unclickable zoomed out and swallows its neighbours zoomed in. The route is drawn whenever
+// the set is non-empty, dimmed outside the editor: a route you are farming along is worth seeing without
+// having to be editing it, and worth getting out of the way while you are not.
+WAYPOINT_GRAB_PX :: f32(15)
+WAYPOINT_POLE_PX :: f32(13) // flag pole height in screen px
+WAYPOINT_FLAG_PX :: f32(9) // pennant width
+WAYPOINT_DOT_R :: f32(3.5) // the base dot that marks the actual world point
+WAYPOINT_DIM_A :: 110 // alpha outside waypoint mode
+WAYPOINT_COL :: rl.Color{255, 196, 64, 255} // amber: unclaimed by mobs (red/green), fences (cyan) or sweep
+WAYPOINT_SEL_COL :: rl.Color{255, 255, 255, 255}
+WAYPOINT_LINE_COL :: rl.Color{255, 196, 64, 150}
 
 // Player-path trail (radar juice; toggle: `trail`). A faint fading breadcrumb line behind the player,
 // sampled into a radar-local ring each frame when the player has moved >= TRAIL_MIN_STEP world units
@@ -667,6 +683,17 @@ radar_reach_pass :: proc(session: ^Session, world: uintptr, ppos: [3]f32, mobs: 
   }
 }
 
+// Which tool owns the map's mouse and keyboard this frame. Exactly one at a time, which is why it is an
+// enum and not a bool per mode: these used to be two booleans that each toggle site had to remember to
+// cross-clear, and "plain view" was spelled `!edit && !inspect` - a phrase that has to be extended by
+// hand every time a mode is added, in every place it appears.
+Radar_Mode :: enum {
+  View, // click to target, shift-click to walk, right-drag to paint a sweep lane
+  Fence, // draw the geo-fence (E)
+  Inspect, // read-only obstacle identification (I)
+  Waypoint, // place and order route flags (W)
+}
+
 // Radar editor tool. The three draw tools map 1:1 to Fence_Kind; Eraser deletes the shape under the cursor.
 Radar_Tool :: enum {
   Circle,
@@ -991,6 +1018,59 @@ radar_draw_arrow :: proc(sp: rl.Vector2, a_deg, length, half: f32, col: rl.Color
   rl.DrawTriangleLines(tip, bl, br, col)
 }
 
+
+// The waypoint route: the path first, then a numbered flag per point. Order is the whole content of a
+// waypoint set, so the drawing leads with it - the connecting line with a mid-segment arrow says which
+// way round the route goes, which a scatter of numbered pins does not. Dimmed to WAYPOINT_DIM_A outside
+// the editor so a route stays readable while farming without competing with the mob dots.
+radar_draw_waypoints :: proc(set: Waypoint_Set, editing: bool, hover: int, cam: [2]f32, scale: f32, center: rl.Vector2) {
+  if len(set.waypoints) == 0 {
+    return
+  }
+  alpha := u8(editing ? 255 : WAYPOINT_DIM_A)
+  line_col := WAYPOINT_LINE_COL
+  line_col.a = u8(f32(WAYPOINT_LINE_COL.a) * f32(alpha) / 255)
+
+  for i in 1 ..< len(set.waypoints) {
+    a := radar_w2s(cam, scale, center, set.waypoints[i - 1].position[0], set.waypoints[i - 1].position[1])
+    b := radar_w2s(cam, scale, center, set.waypoints[i].position[0], set.waypoints[i].position[1])
+    rl.DrawLineEx(a, b, 1.5, line_col)
+    // A direction arrow at the midpoint. Skipped on a very short leg, where the head would be bigger
+    // than the segment it is meant to describe.
+    dx := b.x - a.x
+    dy := b.y - a.y
+    length := math.sqrt(dx * dx + dy * dy)
+    if length >= 18 {
+      ux := dx / length
+      uy := dy / length
+      mid := rl.Vector2{(a.x + b.x) / 2, (a.y + b.y) / 2}
+      tip := rl.Vector2{mid.x + ux * 5, mid.y + uy * 5}
+      rl.DrawTriangle(tip, {mid.x - ux * 3 + uy * 4, mid.y - uy * 3 - ux * 4}, {mid.x - ux * 3 - uy * 4, mid.y - uy * 3 + ux * 4}, line_col)
+      rl.DrawTriangleLines(tip, {mid.x - ux * 3 + uy * 4, mid.y - uy * 3 - ux * 4}, {mid.x - ux * 3 - uy * 4, mid.y - uy * 3 + ux * 4}, line_col)
+    }
+  }
+
+  for point, i in set.waypoints {
+    sp := radar_w2s(cam, scale, center, point.position[0], point.position[1])
+    highlighted := editing && i == hover
+    col := highlighted ? WAYPOINT_SEL_COL : WAYPOINT_COL
+    col.a = alpha
+    // The dot marks the actual world point; the pole rises from it, so the flag reads as "planted here"
+    // rather than floating near here.
+    rl.DrawCircleV(sp, WAYPOINT_DOT_R, col)
+    top := rl.Vector2{sp.x, sp.y - WAYPOINT_POLE_PX}
+    rl.DrawLineEx(sp, top, 1.5, col)
+    rl.DrawTriangle(top, {top.x + WAYPOINT_FLAG_PX, top.y + 3}, {top.x, top.y + 6}, col)
+    rl.DrawTriangleLines(top, {top.x + WAYPOINT_FLAG_PX, top.y + 3}, {top.x, top.y + 6}, col)
+    if highlighted {
+      radar_ring(sp, WAYPOINT_GRAB_PX, col, 1.5)
+    }
+    // The ordinal always; the name only while editing, where it is the thing being edited. Outside the
+    // editor a name per flag is clutter on a map whose job is showing monsters.
+    label := editing ? fmt.ctprintf("%d %s", i + 1, waypoint_label(set, i)) : fmt.ctprintf("%d", i + 1)
+    radar_label(top.x + WAYPOINT_FLAG_PX + 3, top.y - 3, label, col)
+  }
+}
 
 // Fence editor draw-tag <-> (include, avoid, label). Tab cycles 0->1->2 (include+ / exclude- / avoid!).
 radar_fence_tag :: proc(i: int) -> (include, avoid: bool, label: cstring) {
@@ -1456,14 +1536,38 @@ cli_radar :: proc(session: ^Session, args: []string) {
       )
     }
   } else {
-    fmt.printfln("radar: not attached - opening the window on the Attach dialog%s...", dur > 0 ? fmt.tprintf(" for %.0fs", dur) : "")
+    fmt.printfln(
+      "radar: not attached - opening on the Attach dialog ('Work offline' there gets you the chart editor)%s...",
+      dur > 0 ? fmt.tprintf(" for %.0fs", dur) : "",
+    )
   }
   free_all(context.temp_allocator)
 
+  // Sized for the NODE EDITOR, which is the widest thing in here: a canvas that can hold a farm chart
+  // at a readable zoom plus a ~330px inspector beside it. The old 1000x820 predates the editor and left
+  // the canvas about half the width it wants - `auto` opened at 51% zoom, which is roughly where node
+  // titles stop being readable.
+  RADAR_WIN_W :: i32(1500)
+  RADAR_WIN_H :: i32(1000)
   rl.SetConfigFlags({.WINDOW_RESIZABLE})
-  rl.InitWindow(1000, 820, "memscan")
+  rl.InitWindow(RADAR_WIN_W, RADAR_WIN_H, "memscan")
   defer rl.CloseWindow() // raylib's own (via /WHOLEARCHIVE:raylib.lib) - see note atop this file
   rl.SetWindowMinSize(520, 420)
+  // Shrink to fit a small display, and re-centre - the monitor can only be asked AFTER InitWindow,
+  // since it is GLFW that answers.
+  {
+    m := rl.GetCurrentMonitor()
+    mw, mh := rl.GetMonitorWidth(m), rl.GetMonitorHeight(m)
+    if mw > 0 && mh > 0 {
+      w := min(RADAR_WIN_W, i32(f32(mw) * 0.9))
+      h := min(RADAR_WIN_H, i32(f32(mh) * 0.9))
+      if w != RADAR_WIN_W || h != RADAR_WIN_H {
+        mp := rl.GetMonitorPosition(m)
+        rl.SetWindowSize(w, h)
+        rl.SetWindowPosition(i32(mp.x) + (mw - w) / 2, i32(mp.y) + (mh - h) / 2)
+      }
+    }
+  }
   rl.SetTargetFPS(30)
   // Kill raylib's default ESC-quits-the-window binding. ESC is a dialog/cancel key everywhere else in
   // this UI, and having it also tear down the whole window (mid-fence-edit, mid-setup) was a trap. The
@@ -1501,8 +1605,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
   // Fence editor state - all local. session.fence is mutated only here (and by the `fence` commands),
   // always under the REPL's exec_mutex, so it never races the watcher's picker. poly_wip is heap-owned
   // (it lives across frames while the temp allocator is reclaimed each frame).
-  edit := false
-  inspect := false // I toggles read-only obstacle inspect mode; mutually exclusive with the fence editor
+  mode := Radar_Mode.View
   tool := Radar_Tool.Circle
   tag_i := 0 // fence draw tag: 0 = include(+), 1 = exclude(-), 2 = avoid(!). Tab cycles.
   drag_active := false
@@ -1562,6 +1665,11 @@ cli_radar :: proc(session: ^Session, args: []string) {
   hover_pos: [3]f32
   insp_pick := -1 // inspect mode: index into obbs of the box under the cursor this frame (-1 = none)
   insp_lines: []cstring // its identity tooltip lines (temp-allocated each frame; drawn after unlock)
+  // Waypoint mode (see waypoints.odin). The hover is recomputed per frame; the grab survives across
+  // frames because a drag does. -1 = none. session.waypoint_set is mutated only from the locked input
+  // phase below, so the draw phase can read it after the unlock for the same reason session.fence can.
+  waypoint_hover := -1
+  waypoint_grab := -1
   // Bottom-left bag readout (free/total). read_inventory_counts is a ~100KB read, so throttle it (the
   // count barely moves) and persist the last result across frames; inv_have gates the whole HUD element.
   inv_used, inv_cap := 0, 0
@@ -1599,6 +1707,14 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // layout are re-read EVERY frame, never captured before the loop: you can attach (and re-attach) from
     // inside this window, which would leave a hoisted copy pointing at a closed handle forever.
     live := session.attached && session.ptr_size == 4
+    // Every editing mode is a tool ON a world. Detaching with one open used to be impossible to reach
+    // (the Attach dialog covered everything); offline it is one click, and a half-drawn polygon - or a
+    // half-placed route - left armed over a blank map is a gesture waiting to land somewhere arbitrary.
+    if !live && mode != .View {
+      mode = .View
+      clear(&poly_wip)
+      waypoint_grab = -1
+    }
     handle := session.proc_info.handle
     base := session.proc_info.base
     // Re-snapshot the layout every frame (under the lock): setup/findpenya from the UI and an external
@@ -1662,6 +1778,13 @@ cli_radar :: proc(session: ^Session, args: []string) {
     }
 
     // --- input: view controls + fence editor (both modes). Gated so the UI wins any click it wants. ---
+    //
+    // Two gates, not one. `!ui_owns_mouse && !typing` is "the UI does not want this input"; `live` is
+    // "there is a world for it to mean something in". The second used to be free: with no process the
+    // Attach dialog made gui_modal_up true and swallowed everything. Working OFFLINE is a real state
+    // now, so anything that touches the game or the world - the fence, the inspector, jump, the
+    // overlays, the sweep brush - has to say so itself. Pure view controls (zoom, pan, camera lock,
+    // recenter, the two debug overlays) stay ungated: panning an empty map is harmless.
     if !ui_owns_mouse && !typing {
     scale += rl.GetMouseWheelMove() * 0.5
     if scale < 0.5 {scale = 0.5}
@@ -1674,7 +1797,9 @@ cli_radar :: proc(session: ^Session, args: []string) {
     //   3. anything else -> pan, exactly as before.
     // Sampling + the release-arm live in a later block (they need the CWorld* for validation); only the
     // decision and the pan suppression happen here. Inert while attack_range is 0 - it IS the brush width.
-    if rl.IsMouseButtonPressed(.RIGHT) && !paint_active && L.attack_range > 0 {
+    // Not in waypoint mode: there, right-click opens a flag's context menu, and a sweep stroke started
+    // from the same press would arm a lane behind the menu.
+    if live && mode != .Waypoint && rl.IsMouseButtonPressed(.RIGHT) && !paint_active && L.attack_range > 0 {
       grab := max(L.attack_range, PAINT_GRAB_PX / scale) // keep a melee-sized ring clickable at any zoom
       if session.sweep_on {
         if sweep_hit_path(session, mw[0], mw[1], grab) {
@@ -1696,19 +1821,28 @@ cli_radar :: proc(session: ^Session, args: []string) {
       cam[0] -= d.x / scale
       cam[1] += d.y / scale // north-up projection: screen-y is inverted vs world z (see radar_w2s)
     }
-    if rl.IsKeyPressed(.E) {edit = !edit;if edit {inspect = false}} // fence editor + inspect are mutually exclusive
-    if rl.IsKeyPressed(.I) {inspect = !inspect;if inspect {edit = false}} // read-only obstacle inspector
     if rl.IsKeyPressed(.F) {show_cam = !show_cam}
     if rl.IsKeyPressed(.R) {show_reach = !show_reach}
     if rl.IsKeyPressed(.L) {cam_lock = !cam_lock}
-    if rl.IsKeyPressed(.M) {panel_enqueue(&ps, "collmem")} // remember obstacles you have walked past
     if rl.IsKeyPressed(.C) || rl.IsKeyPressed(.HOME) {cam = {ppos[0], ppos[2]}}
-    if rl.IsKeyPressed(.H) {panel_enqueue(&ps, "hillshade")} // toggle terrain relief (deferred like jump)
-    if rl.IsKeyPressed(.N) {panel_enqueue(&ps, "nowalk")} // toggle the no-walk overlay (same, deferred)
-    if rl.IsKeyPressed(.SPACE) && !edit {panel_enqueue(&ps, "jump")} // jump (deferred like every UI action)
+    if live {
+      // Each key toggles its own mode and drops back to View when pressed again - one assignment, no
+      // cross-clearing, and adding a fifth mode cannot forget to turn a fourth one off.
+      if rl.IsKeyPressed(.E) {mode = mode == .Fence ? .View : .Fence} // geo-fence editor
+      if rl.IsKeyPressed(.I) {mode = mode == .Inspect ? .View : .Inspect} // read-only obstacle inspector
+      if rl.IsKeyPressed(.W) {mode = mode == .Waypoint ? .View : .Waypoint} // route flag editor
+      if rl.IsKeyPressed(.ESCAPE) && mode != .View {mode = .View} // one way out of every mode
+      if rl.IsKeyPressed(.M) {panel_enqueue(&ps, "collmem")} // remember obstacles you have walked past
+      if rl.IsKeyPressed(.H) {panel_enqueue(&ps, "hillshade")} // toggle terrain relief (deferred like jump)
+      if rl.IsKeyPressed(.N) {panel_enqueue(&ps, "nowalk")} // toggle the no-walk overlay (same, deferred)
+      if rl.IsKeyPressed(.SPACE) && mode != .Fence {panel_enqueue(&ps, "jump")} // jump (deferred like every UI action)
+      if mode != .Waypoint {
+        waypoint_grab = -1 // leaving the mode mid-drag must not leave a flag stuck to the cursor
+      }
+    }
 
-    // --- input: fence editor (edit mode) ---
-    if edit {
+    // --- input: fence editor (Fence mode) ---
+    if mode == .Fence {
       if rl.IsKeyPressed(.ONE) {tool = .Circle}
       if rl.IsKeyPressed(.TWO) {tool = .Rect}
       if rl.IsKeyPressed(.THREE) {tool = .Polygon}
@@ -1780,6 +1914,57 @@ cli_radar :: proc(session: ^Session, args: []string) {
           fence_pop_shape(&session.fence)
         }
       }
+    }
+
+    // --- input: waypoint flag editor (Waypoint mode; see waypoints.odin) ---
+    //
+    // A left PRESS places and grabs in the same motion: press on empty ground appends a flag there and
+    // picks it up, press on an existing flag just picks that one up, and either way the drag that may
+    // follow nudges it. Placing on the press rather than the release is what makes it feel snappy - the
+    // flag is under the cursor the instant the button goes down - and grabbing what you just placed
+    // means a click that landed slightly off is fixed by continuing the same gesture rather than by
+    // undoing. One snapshot per press, so one Ctrl+Z takes back one flag.
+    if mode == .Waypoint {
+      grab_radius := WAYPOINT_GRAB_PX / scale // a constant SCREEN size: zoomed out, flags are still grabbable
+      waypoint_hover, _ = waypoint_pick_at(session.waypoint_set, mw[0], mw[1], grab_radius)
+      if rl.IsMouseButtonPressed(.LEFT) {
+        if waypoint_hover >= 0 {
+          waypoint_snapshot(session) // the drag about to start is one edit
+          waypoint_grab = waypoint_hover
+        } else {
+          waypoint_grab = waypoint_place(session, mw)
+          waypoint_hover = waypoint_grab
+        }
+      }
+      if waypoint_grab >= 0 {
+        if rl.IsMouseButtonDown(.LEFT) {
+          // snapshot = false: the press above already took one, and a drag is one edit, not one per frame.
+          waypoint_reposition(session, waypoint_grab, mw, snapshot = false)
+          waypoint_hover = waypoint_grab
+        } else {
+          waypoint_grab = -1
+        }
+      }
+      // Right-click latches WHICH flag the context menu is about. It has to be latched rather than read
+      // from the live hover, because the popup draws on later frames and by then the cursor has moved
+      // off the flag and onto the menu - the same reason the node editor keeps ctx_edge_from.
+      if rl.IsMouseButtonPressed(.RIGHT) && waypoint_hover >= 0 {
+        ps.waypoint_context = waypoint_hover
+        ps.waypoint_context_open = true
+        ps.waypoint_context_seeded = false
+      }
+      if rl.IsKeyPressed(.BACKSPACE) && len(session.waypoint_set.waypoints) > 0 {
+        waypoint_delete(session, len(session.waypoint_set.waypoints) - 1)
+      }
+      ctrl_down := rl.IsKeyDown(.LEFT_CONTROL) || rl.IsKeyDown(.RIGHT_CONTROL)
+      if ctrl_down && rl.IsKeyPressed(.Z) {
+        waypoint_undo(session)
+      }
+      if ctrl_down && rl.IsKeyPressed(.Y) {
+        waypoint_redo(session)
+      }
+    } else {
+      waypoint_hover = -1
     }
     } // end input gate (the UI has the cursor / keyboard)
 
@@ -1859,13 +2044,13 @@ cli_radar :: proc(session: ^Session, args: []string) {
     tracy.PlotI("Radar_Remembered", i64(len(session.collider_memory)))
 
     // --- Phase 4 click interaction (still locked): plain-click = target the mob under the cursor;
-    // Shift+click = walk to the ground point. Only in view mode (edit owns left-click for fences) and
-    // not over a widget. focus_set_obj / write_dest_pos need exec_mutex, which we still hold here. ---
+    // Shift+click = walk to the ground point. Only in View mode (the editors own left-click for their
+    // own gestures) and not over a widget. focus_set_obj / write_dest_pos need exec_mutex, held here. ---
     shift_down := rl.IsKeyDown(.LEFT_SHIFT) || rl.IsKeyDown(.RIGHT_SHIFT)
     hover_obj = 0
     insp_pick = -1 // reset per-frame like hover_obj so a stale pick can't linger (obbs indices shift each frame)
     insp_lines = nil
-    if !ui_owns_mouse && !typing && !edit && !inspect {
+    if live && !ui_owns_mouse && !typing && mode == .View {
       best := HIT_R // nearest mob dot under the cursor (hover ring + plain-click target)
       for m in mobs {
         sp := radar_w2s(cam, scale, center, m.pos[0], m.pos[2])
@@ -1896,10 +2081,13 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // gesture because validation needs `w` (the CWorld*, read above) and the collider set. The release is
     // handled UNGATED - a drag that ends over a widget must still arm, or paint_active would stick. ---
     if paint_active {
-      if rl.IsMouseButtonDown(.RIGHT) && !ui_owns_mouse && !typing {
+      if live && rl.IsMouseButtonDown(.RIGHT) && !ui_owns_mouse && !typing {
         sweep_wip_extend(session, w, &paint_wip, mw[0], mw[1], ppos[1])
       }
-      if !rl.IsMouseButtonDown(.RIGHT) {
+      if !live { // detached mid-stroke: there is nothing left to validate the lane against
+        paint_active = false
+        sweep_wip_reset(&paint_wip)
+      } else if !rl.IsMouseButtonDown(.RIGHT) {
         paint_active = false
         // Only a real stroke gets armed (or told off for being short). A press that never moved is just
         // a right-click on your own dot - discard it silently instead of nagging.
@@ -1912,7 +2100,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // --- inspect mode (still locked): identify the collider box under the cursor. Read-only - it never
     // touches the reach filter. Pick the box (smallest footprint wins), read its identity live for the
     // tooltip, and on left-click echo the one-liner to the console (a persistent, copyable record). ---
-    if inspect && !ui_owns_mouse && !typing {
+    if mode == .Inspect && !ui_owns_mouse && !typing {
       insp_pick = obb_pick_at(obbs, mw[0], mw[1])
       if insp_pick >= 0 {
         o := obbs[insp_pick]
@@ -2024,13 +2212,79 @@ cli_radar :: proc(session: ^Session, args: []string) {
       player_have   = live && player != 0,
       player_pos    = ppos,
     }
+    // Waypoint route. Cheap (a handful of rows), and unconditional rather than mode-gated: the toolbar
+    // button carries the count in its tooltip whether or not the editor is open. Names are cloned into
+    // temp because the draw phase runs unlocked and a deferred `waypoints delete` frees the real ones.
+    {
+      rows := make([dynamic]Gui_Waypoint_Row, 0, len(session.waypoint_set.waypoints), context.temp_allocator)
+      for point in session.waypoint_set.waypoints {
+        append(&rows, Gui_Waypoint_Row{name = strings.clone(point.name, context.temp_allocator), position = point.position})
+      }
+      gf.waypoint_rows = rows[:]
+      gf.waypoint_count = len(rows)
+      gf.waypoint_set_name = strings.clone(session.waypoint_set.name, context.temp_allocator)
+      gf.waypoint_map_known = session.waypoint_set.map_known
+      gf.waypoint_map_here = true // "not here" needs a map id to disagree with; absent one, never warn
+      if session.waypoint_set.map_known {
+        if here, ok := waypoint_current_map(session); ok {
+          gf.waypoint_map_here = here == session.waypoint_set.map_id
+        }
+      }
+      gf.waypoint_can_undo = len(session.waypoint_undo) > 0
+      gf.waypoint_can_redo = len(session.waypoint_redo) > 0
+    }
+    // Leaderboards (leaderboard.odin). The scalars are unconditional - the toolbar trophy reports the
+    // live run in its tooltip whether or not the dialog is up - and cost nothing (they are already-held
+    // fields plus two arithmetic helpers). The allocating four are gated on the dialog: lb_board is
+    // mutated by the async fetch worker, so the draw phase must never see the live one.
+    gf.leaderboard_configured = L.leaderboard_url != ""
+    gf.leaderboard_recording = session.lb_run.active
+    gf.leaderboard_has_run = session.lb_run.active || session.lb_run.start_ns != 0
+    gf.leaderboard_elapsed_sec = lb_elapsed_sec(session)
+    gf.leaderboard_kills = session.lb_run.kills
+    gf.leaderboard_penya = lb_penya(session)
+    gf.leaderboard_kpm = lb_kpm(session)
+    gf.leaderboard_peak_density = session.lb_run.max_density
+    gf.leaderboard_species = len(session.lb_run.names)
+    gf.leaderboard_busy = session.lb_net_busy
+    gf.leaderboard_submitted = session.lb_run.submitted
+    gf.leaderboard_sort = session.lb_board_sort
+    if ps.leaderboard_open {
+      gf.leaderboard_status = strings.clone(lb_status_str(session), context.temp_allocator)
+      gf.leaderboard_url = strings.clone(L.leaderboard_url, context.temp_allocator)
+      gf.leaderboard_rows = slice.clone(session.lb_board[:], context.temp_allocator)
+      // The submit box defaults to the character's own name - it is the name everyone else on the board
+      // will know you by, and it is right there in memory. One name read per frame, dialog-only.
+      if live && player != 0 && L.name_off != 0 {
+        if nm, ok := engine.read_obj_name(handle, session.ptr_size, player, L.name_off); ok {
+          gf.player_name = strings.clone(nm, context.temp_allocator)
+        }
+      }
+    }
+    // Species names on screen, for the editor's mob-name picker. Free: the blips are already gathered
+    // and name_cache is already warm from the label pass, so this is a dedupe over what we have.
+    // Unclassified counts - it only means the AI gate is not pinned yet, not that it is not a monster.
+    {
+      names := make([dynamic]string, 0, 16, context.temp_allocator)
+      for m in mobs {
+        if m.kind != .Monster && m.kind != .Unclassified {
+          continue
+        }
+        nm, nok := radar_name_cached(&name_cache, session, m.obj, now_frame)
+        if !nok || nm == "" || name_list_contains(names[:], nm) {
+          continue
+        }
+        append(&names, strings.clone(nm, context.temp_allocator))
+      }
+      gf.nearby_names = names[:]
+    }
     // Behaviour run state. The strings are CLONED into temp: the watcher thread frees and replaces
     // run.name / run.last_line whenever the program moves on, and the draw phase runs unlocked.
     if run := &session.script; run.active {
       gf.script_active = true
       gf.script_paused = run.paused
       gf.script_step = run.stepping
-      gf.script_irq = run.irq_depth > 0
+      gf.script_in_watcher = run.watcher_depth > 0
       gf.script_name = strings.clone(run.name, context.temp_allocator)
       gf.script_pc = min(run.pc + 1, run.main_len)
       gf.script_len = run.main_len
@@ -2038,35 +2292,57 @@ cli_radar :: proc(session: ^Session, args: []string) {
       if run.pc >= 0 && run.pc < len(run.steps) {
         gf.script_node = run.steps[run.pc].id
       }
+      // The run's watchers, in the order they are checked. Same temp-clone rule as the strings above.
+      gf.watcher_count = min(len(run.watchers), SCRIPT_MAX_WATCHERS)
+      for i in 0 ..< gf.watcher_count {
+        w := &run.watchers[i]
+        gf.watchers[i] = Gui_Watcher_Row {
+          label    = strings.clone(w.src, context.temp_allocator),
+          fires    = w.fires,
+          live     = run.watcher_depth > 0 && run.active_watcher == i,
+          borrowed = w.global_source != "" || strings.contains(w.src, ": "),
+        }
+      }
     }
-    // Armed global interrupts. Cloned into temp for the same reason script_name is: irq_reload frees
+    // The run trace, OUTSIDE the `run.active` block on purpose: the whole point of a session-scoped ring
+    // is that the last rows survive the run ending, and that is exactly when the editor is being read.
+    // Copied by value - the rows own nothing, so there is no clone and no lifetime to get wrong.
+    {
+      rows := script_trace_recent(&session.script_trace, GUI_TRACE_ROWS)
+      gf.trace_count = len(rows)
+      gf.trace_total = min(session.script_trace.written, SCRIPT_TRACE_ROWS)
+      for r, i in rows {
+        gf.trace[i] = r
+      }
+    }
+    // Armed global interrupts. Cloned into temp for the same reason script_name is: armed_watcher_reload frees
     // and replaces these whenever the enabled set changes, and the draw runs unlocked.
-    gf.irq_n = session.irq_n
-    for i in 0 ..< session.irq_n {
-      g := &session.irq[i]
-      gf.irq[i] = Gui_Irq_Row {
-        name    = strings.clone(g.name, context.temp_allocator),
-        trigger = strings.clone(irq_trigger_text(g^, context.temp_allocator), context.temp_allocator),
+    gf.armed_watcher_count = session.armed_watcher_count
+    for i in 0 ..< session.armed_watcher_count {
+      g := &session.armed_watchers[i]
+      gf.armed[i] = Gui_Armed_Row {
+        name    = strings.clone(g.doc, context.temp_allocator),
+        trigger = strings.clone(armed_watcher_trigger_text(g^, context.temp_allocator), context.temp_allocator),
         fires   = g.fires,
         ok      = g.ok,
         why     = strings.clone(g.why, context.temp_allocator),
       }
     }
-    // Block availability for the node editor's palette + inspector. Evaluated HERE because every
+    // Block RUNNABILITY for the node editor's palette + inspector. Evaluated HERE because every
     // def.avail reads the session (attached? which offsets are pinned?), and the draw phase may not.
-    // Cheap - a few dozen field comparisons - and it keeps the palette's [--] marks in lockstep with
-    // what `script blocks` prints and what `script run` refuses to start.
+    // Cheap - a few dozen field comparisons - and going through script_block_gate keeps the palette's
+    // dim marks in lockstep with what `script blocks` prints and what `script run` refuses to start.
+    //
+    // This is NOT what decides whether a block can be PLACED - the editor gates that on def.not_built,
+    // which is static and readable from the draw phase directly. A block that only needs an attach or a
+    // finder is placeable and merely draws dimmed with its reason.
     for def in ACTIONS {
-      gf.act_ok[def.kind] = true
-      if def.avail != nil {
-        gf.act_ok[def.kind], gf.act_why[def.kind] = def.avail(session)
-      }
+      gf.action_usable[def.kind], gf.action_why_not[def.kind] =
+        script_block_gate(session, def.avail, def.not_built, def.not_built_why)
     }
     for def in EVENTS {
-      gf.ev_ok[def.kind] = true
-      if def.avail != nil {
-        gf.ev_ok[def.kind], gf.ev_why[def.kind] = def.avail(session)
-      }
+      gf.event_usable[def.kind], gf.event_why_not[def.kind] =
+        script_block_gate(session, def.avail, def.not_built, def.not_built_why)
     }
     jump_at_s := session.jump_fired_at // player-dot hop animation (set by cli_jump / look-alive)
     prop_ok_s := live ? prop_gate_ready(session) : false
@@ -2117,7 +2393,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
       radar_draw_obb(o, cam, scale, center)
     }
     // inspect mode: highlight the box under the cursor (its identity tooltip is drawn later, near the cursor)
-    if inspect && insp_pick >= 0 && insp_pick < len(obbs) {
+    if mode == .Inspect && insp_pick >= 0 && insp_pick < len(obbs) {
       radar_draw_obb_hi(obbs[insp_pick], cam, scale, center)
     }
 
@@ -2140,13 +2416,13 @@ cli_radar :: proc(session: ^Session, args: []string) {
       radar_draw_sweep(paint_wip.nodes[:], L.attack_range, cam, scale, center, fw, fh, now_frame)
     }
     // eraser hover: highlight the shape a click would delete
-    if edit && tool == .Eraser {
+    if mode == .Fence && tool == .Eraser {
       if hi := fence_shape_at(session.fence, mw[0], mw[1]); hi >= 0 {
         radar_draw_erase_hover(session.fence.shapes[hi], cam, scale, center)
       }
     }
-    // in-progress polygon (edit mode)
-    if edit && tool == .Polygon && len(poly_wip) > 0 {
+    // in-progress polygon (Fence mode)
+    if mode == .Fence && tool == .Polygon && len(poly_wip) > 0 {
       pinc, pavo, _ := radar_fence_tag(tag_i)
       col := fence_shape_color(pinc, pavo)
       for i in 0 ..< len(poly_wip) {
@@ -2160,8 +2436,8 @@ cli_radar :: proc(session: ^Session, args: []string) {
       last := radar_w2s(cam, scale, center, poly_wip[len(poly_wip) - 1][0], poly_wip[len(poly_wip) - 1][1])
       rl.DrawLineEx(last, mouse, 1, rl.Color{col.r, col.g, col.b, 120}) // rubber-band to cursor
     }
-    // in-progress circle/rect drag (edit mode)
-    if edit && drag_active && (tool == .Circle || tool == .Rect) {
+    // in-progress circle/rect drag (Fence mode)
+    if mode == .Fence && drag_active && (tool == .Circle || tool == .Rect) {
       dinc, davo, _ := radar_fence_tag(tag_i)
       col := fence_shape_color(dinc, davo)
       sp := radar_w2s(cam, scale, center, drag_start[0], drag_start[1])
@@ -2174,8 +2450,16 @@ cli_radar :: proc(session: ^Session, args: []string) {
       }
     }
 
-    // attack_range ring - your configured reach around the player (drives the picker; 'set attack_range')
-    if L.attack_range > 0 {
+    // waypoint route: the ordered flags and the path between them. Drawn in this layer - over the fence
+    // and the sweep lane, under the range ring, the trail and every blip - so a route never hides a mob.
+    // Reading session.waypoint_set unlocked is safe for the same reason session.fence.shapes is: the only
+    // writer is this window's own input phase, which ran above the unlock.
+    radar_draw_waypoints(session.waypoint_set, mode == .Waypoint, waypoint_hover, cam, scale, center)
+
+    // attack_range ring - your configured reach around the player (drives the picker; 'set attack_range').
+    // `live`-gated like the dot below: offline ppos is {0,0,0}, and a reach ring around a character who
+    // is not there is a drawing of a fact we do not have.
+    if live && L.attack_range > 0 {
       pc := radar_w2s(cam, scale, center, ppos[0], ppos[2])
       rl.DrawCircleLinesV(pc, L.attack_range * scale, RANGE_COL)
     }
@@ -2324,19 +2608,24 @@ cli_radar :: proc(session: ^Session, args: []string) {
     // player dot + facing arrow (m_fAngle; same convention as the tdbg HTML: on-screen dir = angle+180).
     // On a jump (cli_jump / look-alive), lift the dot along a 0.6s sine hump and drop a shrinking ground
     // shadow at the true position, so every confirmed jump reads on the radar.
-    pp := radar_w2s(cam, scale, center, ppos[0], ppos[2])
-    if jump_at_s != 0 {
-      jage := time.now()._nsec - jump_at_s
-      if jage >= 0 && jage <= JUMP_ANIM_NS {
-        arc := math.sin(f32(jage) / f32(JUMP_ANIM_NS) * math.PI) // 0 -> 1 -> 0 hump
-        rl.DrawCircleV(pp, 5 * (1 - arc * 0.5), rl.Color{0, 0, 0, 90}) // shrinking shadow at the ground
-        pp.y -= arc * JUMP_LIFT_PX // lift the dot + arrow drawn just below
+    //
+    // Not drawn at all while offline: ppos falls back to {0,0,0} with no process, and a white dot at the
+    // world origin is not "no data", it is a confident claim about where you are standing.
+    if live {
+      pp := radar_w2s(cam, scale, center, ppos[0], ppos[2])
+      if jump_at_s != 0 {
+        jage := time.now()._nsec - jump_at_s
+        if jage >= 0 && jage <= JUMP_ANIM_NS {
+          arc := math.sin(f32(jage) / f32(JUMP_ANIM_NS) * math.PI) // 0 -> 1 -> 0 hump
+          rl.DrawCircleV(pp, 5 * (1 - arc * 0.5), rl.Color{0, 0, 0, 90}) // shrinking shadow at the ground
+          pp.y -= arc * JUMP_LIFT_PX // lift the dot + arrow drawn just below
+        }
       }
+      if has_angle {
+        radar_draw_arrow(pp, pangle, 17, 6, rl.RAYWHITE)
+      }
+      rl.DrawCircleV(pp, 5, rl.WHITE)
     }
-    if has_angle {
-      radar_draw_arrow(pp, pangle, 17, 6, rl.RAYWHITE)
-    }
-    rl.DrawCircleV(pp, 5, rl.WHITE)
 
     // hover ring: the mob a plain left-click would target (view mode) + its name
     if hover_obj != 0 {
@@ -2398,7 +2687,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
 
     // inspect mode: the active-mode banner. The per-collider identity readout is an ImGui tooltip now
     // (gui_frame does not own it - it is cursor-anchored map data, so it is drawn here).
-    if inspect {
+    if mode == .Inspect {
       radar_label(10, fh - 26, insp_pick >= 0 ? "INSPECT - click to ignore this kind" : "INSPECT - hover a purple box", rl.Color{90, 220, 255, 255})
       if insp_lines != nil {
         imgui.SetNextWindowPos({mouse.x + 16, mouse.y + 12}, .Always)
@@ -2411,9 +2700,19 @@ cli_radar :: proc(session: ^Session, args: []string) {
       }
     }
 
+    // waypoint mode: the active-mode banner, same slot and same job as the inspector's above.
+    if mode == .Waypoint {
+      radar_label(
+        10,
+        fh - 26,
+        waypoint_hover >= 0 ? "WAYPOINTS - drag to move, right-click for details" : "WAYPOINTS - click to place a flag",
+        WAYPOINT_COL,
+      )
+    }
+
     // === UI === (see gui.odin). Built here in the UNLOCKED phase from the gf snapshot; every action it
     // wants lands in ps.pending and is drained under exec_mutex below, exactly like a typed REPL line.
-    gui_frame(session, &ps, &gf, Gui_View{edit = &edit, cam_lock = &cam_lock, recenter = &recenter_req, tool = &tool, tag = &tag_i})
+    gui_frame(session, &ps, &gf, Gui_View{mode = &mode, cam_lock = &cam_lock, recenter = &recenter_req, tool = &tool, tag = &tag_i})
     imgui_rl.end() // renders the ImGui draw data through rlgl - must be inside Begin/EndDrawing
 
     rl.EndDrawing()

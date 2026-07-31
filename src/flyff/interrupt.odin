@@ -17,7 +17,7 @@ import "../engine"
 //
 // TWO EVALUATION SITES, ONE WATCHER. This is the part worth understanding before changing anything.
 //
-//   1. NOTHING RUNNING (idle, or `auto` farming). This file's irq_tick evaluates the triggers on the
+//   1. NOTHING RUNNING (idle, or `auto` farming). This file's armed_watcher_tick evaluates the triggers on the
 //      behaviour tick and, on a rising edge, starts the interrupt's chart as an ordinary run.
 //   2. A CHART IS RUNNING. script_begin HOISTS every enabled interrupt into that run's watcher array,
 //      exactly like the chart's own `on` lines, with its body appended as a region past main_len. So
@@ -26,53 +26,59 @@ import "../engine"
 //
 // Two sites means two Event_States, and an edge latch that lived in only one of them would either
 // double-fire or miss a transition across the boundary. So the latch is HANDED OVER both ways:
-// script_begin seeds the hoisted watcher's latch from the Global_Irq, and script_teardown copies it
+// script_begin seeds the hoisted watcher's latch from the Armed_Watcher, and script_teardown copies it
 // back. The pair therefore behaves as one continuous watcher that never stops watching.
 //
 // WHY AN INTERRUPT DOES NOT HOIST INTERRUPTS. When an interrupt's own chart is the thing running,
 // script_begin skips the hoist. You do not want your escape interrupted by the same escape (it would
-// re-fire on its own still-true trigger, forever), and `irq_depth` only caps nesting WITHIN one run.
+// re-fire on its own still-true trigger, forever), and `watcher_depth` only caps nesting WITHIN one run.
 // ===========================================================================
 
-// One enabled interrupt, runtime half. The persisted half - just the name - lives in
-// Flyff_Layout.interrupts so it survives a restart; this is rebuilt from it by irq_reload.
-Global_Irq :: struct {
-  name:     string, // owned
-  cond:     Script_Event, // owned; the file's `trigger` line
-  ev_state: Event_State, // the edge latch - the reason this cannot be re-derived every tick
+// ONE WATCHER of an enabled document, runtime half. A document may hold several `on` nodes, so what is
+// ENABLED is a document and what is WATCHED is a row - the list is flattened here rather than nested,
+// because every consumer (the tick, the status line, the latch handover) works one watcher at a time.
+//
+// The persisted half - just the document name - lives in Flyff_Layout.interrupts so it survives a
+// restart; this is rebuilt from it by armed_watcher_reload.
+Armed_Watcher :: struct {
+  doc:      string, // owned - the behaviour this watcher came out of
+  label:    string, // owned - the watcher's own one-line description, for lists
+  condition:     Script_Condition, // owned; the `.On` node's condition
+  body:     Node_Id, // the node its edge points at - where armed_watcher_launch starts
+  condition_state: Condition_State, // the edge latch - the reason this cannot be re-derived every tick
   fires:    int,
-  ok:       bool, // the file loaded and is a usable interrupt
+  ok:       bool, // the document loaded and this row is usable
   why:      string, // owned - why it is not, for `interrupt list` and `status`
 }
 
-irq_free_one :: proc(g: ^Global_Irq) {
-  delete(g.name)
-  delete(g.cond.strs[0])
-  delete(g.cond.strs[1])
+armed_watcher_free_one :: proc(g: ^Armed_Watcher) {
+  delete(g.doc)
+  delete(g.label)
+  script_condition_free(&g.condition)
   delete(g.why)
   g^ = {}
 }
 
-irq_free :: proc(session: ^Session) {
-  for i in 0 ..< session.irq_n {
-    irq_free_one(&session.irq[i])
+armed_watcher_free_all :: proc(session: ^Session) {
+  for i in 0 ..< session.armed_watcher_count {
+    armed_watcher_free_one(&session.armed_watchers[i])
   }
-  session.irq_n = 0
+  session.armed_watcher_count = 0
 }
 
 // --- the enabled set -----------------------------------------------------------------------------
 
-irq_layout_index :: proc(L: ^Flyff_Layout, name: string) -> int {
+armed_watcher_layout_index :: proc(L: ^Flyff_Layout, name: string) -> int {
   for i in 0 ..< int(L.interrupts_n) {
-    if irq_layout_name(L, i) == name {
+    if armed_watcher_layout_name(L, i) == name {
       return i
     }
   }
   return -1
 }
 
-irq_is_enabled :: proc(session: ^Session, name: string) -> bool {
-  return irq_layout_index(&session.layout, name) >= 0
+armed_watcher_behaviour_enabled :: proc(session: ^Session, name: string) -> bool {
+  return armed_watcher_layout_index(&session.layout, name) >= 0
 }
 
 // Rebuild the runtime list from the persisted names. Reads each file for its trigger and arms it.
@@ -80,10 +86,10 @@ irq_is_enabled :: proc(session: ^Session, name: string) -> bool {
 // PRESERVES THE LATCH of an interrupt that is still enabled and whose trigger is unchanged. Without
 // that, anything that reloads - toggling a second interrupt, `interrupt reload` - would re-arm a
 // watcher whose condition is currently TRUE and fire it again immediately.
-irq_reload :: proc(session: ^Session) {
-  old := session.irq
-  old_n := session.irq_n
-  session.irq_n = 0
+armed_watcher_reload :: proc(session: ^Session) {
+  old := session.armed_watchers
+  old_n := session.armed_watcher_count
+  session.armed_watcher_count = 0
 
   L := &session.layout
   ctx := Behaviour_Context {
@@ -92,78 +98,104 @@ irq_reload :: proc(session: ^Session) {
     board   = &session.bh_board,
   }
   for i in 0 ..< int(L.interrupts_n) {
-    if session.irq_n >= FLYFF_MAX_INTERRUPTS {
+    if session.armed_watcher_count >= FLYFF_MAX_ARMED_WATCHERS {
       break
     }
-    name := irq_layout_name(L, i)
-    g := Global_Irq {
-      name = strings.clone(name),
-    }
+    name := armed_watcher_layout_name(L, i)
     doc, dok := bhv_open(name)
-    switch {
-    case !dok:
-      g.why = strings.clone("no behaviour by that name (or it would not parse)")
-    case doc.kind != .Interrupt:
-      g.why = strings.clone("that behaviour is a chart, not an interrupt - it has no trigger")
-    case len(doc.steps) == 0:
-      g.why = strings.clone("it has no blocks, so there is nothing to run")
-    case:
-      g.ok = true
-      g.cond = script_event_clone(doc.trigger)
-    }
-    if dok {
+    defer if dok {
       behaviour_doc_free(&doc)
     }
-    script_arm_event(&ctx, g.cond, &g.ev_state)
-    // Carry the latch (and the fire tally) over from the entry this replaces, when it is the same
-    // watcher on the same condition. script_render_event is the cheap structural comparison - two
-    // triggers that print identically are the same trigger.
-    for k in 0 ..< old_n {
-      if old[k].name != g.name {
+
+    // Count first, so a document with nothing to watch produces ONE explanatory row rather than
+    // silently vanishing from `interrupt list` while still being enabled.
+    watchers := 0
+    if dok {
+      for s in doc.steps {
+        if s.op == .On && s.goto_id != 0 {
+          watchers += 1
+        }
+      }
+    }
+    if !dok || watchers == 0 {
+      g := Armed_Watcher {
+        doc = strings.clone(name),
+      }
+      g.why = !dok \
+      ? strings.clone("no behaviour by that name (or it would not parse)") \
+      : strings.clone("it has no watchers - it needs an 'on' node wired to a body")
+      session.armed_watchers[session.armed_watcher_count] = g
+      session.armed_watcher_count += 1
+      continue
+    }
+
+    for s in doc.steps {
+      if s.op != .On || s.goto_id == 0 {
         continue
       }
-      if old[k].ok && g.ok && irq_cond_text(old[k].cond) == irq_cond_text(g.cond) {
-        g.ev_state = old[k].ev_state
-        g.fires = old[k].fires
+      if session.armed_watcher_count >= FLYFF_MAX_ARMED_WATCHERS {
+        break
       }
-      break
+      g := Armed_Watcher {
+        doc   = strings.clone(name),
+        label = strings.clone(s.src),
+        condition = script_condition_clone(s.condition),
+        body  = s.goto_id,
+        ok    = true,
+      }
+      script_arm_condition(&ctx, g.condition, &g.condition_state)
+      // Carry the latch (and the fire tally) over from the row this replaces, when it is the same
+      // watcher on the same condition. The rendered condition is the cheap structural comparison - two
+      // triggers that print identically are the same trigger.
+      for k in 0 ..< old_n {
+        if old[k].doc != g.doc || !old[k].ok || old[k].body != g.body {
+          continue
+        }
+        if armed_watcher_condition_text(old[k].condition) == armed_watcher_condition_text(g.condition) {
+          g.condition_state = old[k].condition_state
+          g.fires = old[k].fires
+        }
+        break
+      }
+      session.armed_watchers[session.armed_watcher_count] = g
+      session.armed_watcher_count += 1
     }
-    session.irq[session.irq_n] = g
-    session.irq_n += 1
   }
   for k in 0 ..< old_n {
-    irq_free_one(&old[k])
+    armed_watcher_free_one(&old[k])
   }
 }
 
 @(private = "file")
-irq_cond_text :: proc(ev: Script_Event) -> string {
+armed_watcher_condition_text :: proc(ev: Script_Condition) -> string {
   b := strings.builder_make(context.temp_allocator)
-  script_write_event(&b, ev)
+  script_write_condition(&b, ev)
   return strings.to_string(b)
 }
 
 // The trigger as one readable line, for the UI snapshot. Takes an allocator because the radar's
 // snapshot runs under exec_mutex and needs the result to outlive this call.
-irq_trigger_text :: proc(g: Global_Irq, allocator := context.temp_allocator) -> string {
+armed_watcher_trigger_text :: proc(g: Armed_Watcher, allocator := context.temp_allocator) -> string {
   b := strings.builder_make(allocator)
-  script_write_event(&b, g.cond)
+  script_write_condition(&b, g.condition)
   return strings.to_string(b)
 }
 
-irq_find :: proc(session: ^Session, name: string) -> ^Global_Irq {
-  for i in 0 ..< session.irq_n {
-    if session.irq[i].name == name {
-      return &session.irq[i]
+// The row a hoisted watcher came from, for the latch handover. Matched on the document AND the body it
+// enters, because one document may contribute several rows and they must not share a latch.
+armed_watcher_find :: proc(session: ^Session, doc: string, body: Node_Id) -> ^Armed_Watcher {
+  for i in 0 ..< session.armed_watcher_count {
+    if session.armed_watchers[i].doc == doc && session.armed_watchers[i].body == body {
+      return &session.armed_watchers[i]
     }
   }
   return nil
 }
 
 // Enable / disable by name. Returns whether anything changed.
-irq_set :: proc(session: ^Session, name: string, on: bool) -> bool {
+armed_watcher_set_enabled :: proc(session: ^Session, name: string, on: bool) -> bool {
   L := &session.layout
-  idx := irq_layout_index(L, name)
+  idx := armed_watcher_layout_index(L, name)
   if on {
     if idx >= 0 {
       return false
@@ -186,7 +218,7 @@ irq_set :: proc(session: ^Session, name: string, on: bool) -> bool {
     L.interrupts[idx] = L.interrupts[L.interrupts_n - 1]
     L.interrupts_n -= 1
   }
-  irq_reload(session)
+  armed_watcher_reload(session)
   return true
 }
 
@@ -195,9 +227,9 @@ irq_set :: proc(session: ^Session, name: string, on: bool) -> bool {
 // Does anything need the behaviour tick to keep running on our account? Read by behaviour_tick's
 // gate: without this, a session with no chart and `sense off` would return before ever looking at an
 // interrupt, and the peace-out escape would be armed only while something else happened to be on.
-irq_any_armed :: proc(session: ^Session) -> bool {
-  for i in 0 ..< session.irq_n {
-    if session.irq[i].ok {
+armed_watcher_any :: proc(session: ^Session) -> bool {
+  for i in 0 ..< session.armed_watcher_count {
+    if session.armed_watchers[i].ok {
       return true
     }
   }
@@ -207,37 +239,39 @@ irq_any_armed :: proc(session: ^Session) -> bool {
 // Evaluate the enabled interrupts and start one if its trigger just went true. Called every behaviour
 // tick. Does nothing while a chart is running - the hoisted watchers own the evaluation then, and
 // evaluating here as well is exactly the double-fire the latch handover exists to prevent.
-irq_tick :: proc(ctx: ^Behaviour_Context) {
+armed_watcher_tick :: proc(ctx: ^Behaviour_Context) {
   session := ctx.session
   if session.script.active {
     return
   }
-  for i in 0 ..< session.irq_n {
-    g := &session.irq[i]
+  for i in 0 ..< session.armed_watcher_count {
+    g := &session.armed_watchers[i]
     if !g.ok {
       continue
     }
     // Through script_event_fired, not def.fired, so `trigger not <event>` negates like everywhere else.
-    if !script_event_fired(ctx, g.cond, &g.ev_state) {
-      g.ev_state.latched = false // condition went away - re-arm for the next edge
+    if !script_condition_holds(ctx, g.condition, &g.condition_state) {
+      g.condition_state.latched = false // condition went away - re-arm for the next edge
       continue
     }
-    if g.ev_state.latched {
+    if g.condition_state.latched {
       continue // still true from a previous fire; not a new edge
     }
-    g.ev_state.latched = true
+    g.condition_state.latched = true
     g.fires += 1
-    fmt.printf("\n[interrupt] %s fired\n", g.name)
+    fmt.printf("\n[interrupt] %s fired (%s)\n", g.doc, g.label)
     fmt.print("memscan> ")
-    irq_launch(session, g.name)
+    armed_watcher_launch(session, g.doc, g.body)
     return // one per tick, first match wins - same rule as a chart's own watchers
   }
 }
 
-// Run an interrupt's chart standalone. Separate from script_cmd_run because the refusal paths have to
-// be quiet-ish and non-fatal: this is fired by a condition, not typed, so a chart that cannot start
-// must say why once and leave the session alone rather than look like a crash.
-irq_launch :: proc(session: ^Session, name: string) {
+// Run ONE watcher's body standalone, starting at <body>. Separate from script_cmd_run because the
+// refusal paths have to be quiet-ish and non-fatal: this is fired by a condition, not typed, so a
+// document that cannot start must say why once and leave the session alone rather than look like a
+// crash. <body> = 0 means "the first watcher this document declares", which is what `interrupt test`
+// wants.
+armed_watcher_launch :: proc(session: ^Session, name: string, body: Node_Id = 0) {
   doc, ok := bhv_open(name)
   if !ok {
     fmt.eprintfln("[interrupt] '%s' would not load - disable it with 'interrupt off %s'.", name, name)
@@ -251,13 +285,31 @@ irq_launch :: proc(session: ^Session, name: string) {
     behaviour_doc_free(&doc)
     return
   }
-  entry := doc.entry
+  entry := body
+  if entry == 0 {
+    for s in doc.steps {
+      if s.op == .On && s.goto_id != 0 {
+        entry = s.goto_id
+        break
+      }
+    }
+  }
+  if entry == 0 {
+    fmt.eprintfln("[interrupt] '%s' has no watcher body to run.", name)
+    behaviour_doc_free(&doc)
+    return
+  }
   // .Once, and the doc's own mode is ignored: an interrupt that looped would never give control back,
-  // which is the one thing an interrupt must always do.
+  // which is the one thing an interrupt must always do. It also does NOT borrow anything - see the
+  // header note on why an escape must not be interruptible by itself.
   script_begin(session, name, doc.steps, .Once, entry, .Interrupt)
   delete(doc.name)
   delete(doc.trigger.strs[0])
   delete(doc.trigger.strs[1])
+  for u in doc.uses {
+    delete(u)
+  }
+  delete(doc.uses)
 }
 
 // --- CLI ------------------------------------------------------------------------------------------
@@ -269,7 +321,7 @@ irq_launch :: proc(session: ^Session, name: string) {
 // interrupt test <name>      -> run its body now, ignoring the trigger
 cli_interrupt :: proc(session: ^Session, args: []string) {
   if len(args) == 0 || args[0] == "list" {
-    irq_print_list(session)
+    armed_watcher_print_list(session)
     return
   }
   switch args[0] {
@@ -284,21 +336,29 @@ cli_interrupt :: proc(session: ^Session, args: []string) {
       fmt.eprintfln("interrupt on: no behaviour named '%s'. 'script list' shows what's available.", name)
       return
     }
-    kind := doc.kind
+    watchers := 0
+    for s in doc.steps {
+      if s.op == .On && s.goto_id != 0 {
+        watchers += 1
+      }
+    }
     behaviour_doc_free(&doc)
-    if kind != .Interrupt {
-      fmt.eprintfln("interrupt on: '%s' is a chart, not an interrupt - it has no trigger.", name)
-      fmt.eprintln("  open it in the node editor and switch its kind, or 'script run' it instead.")
+    if watchers == 0 {
+      fmt.eprintfln("interrupt on: '%s' has no watchers, so there is nothing to arm.", name)
+      fmt.eprintln("  open it in the node editor and add an 'on' node wired to what it should do.")
       return
     }
-    if !irq_set(session, name, true) {
+    if !armed_watcher_set_enabled(session, name, true) {
       fmt.printfln("interrupt: '%s' is already on.", name)
       return
     }
     flyff_save_cfg(session.layout, flyff_cfg_path())
     engine.ensure_hotkey_thread(&session.eng) // it is only evaluated on the watcher tick
-    if g := irq_find(session, name); g != nil && g.ok {
-      fmt.printfln("interrupt: '%s' ARMED on %s.", name, irq_cond_text(g.cond))
+    for i in 0 ..< session.armed_watcher_count {
+      g := &session.armed_watchers[i]
+      if g.doc == name && g.ok {
+        fmt.printfln("interrupt: '%s' ARMED on %s.", name, armed_watcher_condition_text(g.condition))
+      }
     }
 
   case "off", "disable":
@@ -306,7 +366,7 @@ cli_interrupt :: proc(session: ^Session, args: []string) {
       fmt.eprintln("usage: interrupt off <name>")
       return
     }
-    if !irq_set(session, args[1], false) {
+    if !armed_watcher_set_enabled(session, args[1], false) {
       fmt.eprintfln("interrupt off: '%s' is not on.", args[1])
       return
     }
@@ -314,9 +374,9 @@ cli_interrupt :: proc(session: ^Session, args: []string) {
     fmt.printfln("interrupt: '%s' off.", args[1])
 
   case "reload":
-    irq_reload(session)
-    fmt.printfln("interrupt: re-read %d file(s).", session.irq_n)
-    irq_print_list(session)
+    armed_watcher_reload(session)
+    fmt.printfln("interrupt: re-read %d file(s).", session.armed_watcher_count)
+    armed_watcher_print_list(session)
 
   case "test", "fire":
     if len(args) < 2 {
@@ -327,7 +387,7 @@ cli_interrupt :: proc(session: ^Session, args: []string) {
       fmt.eprintln("interrupt test: something is already running - 'script stop' first.")
       return
     }
-    irq_launch(session, args[1])
+    armed_watcher_launch(session, args[1])
 
   case:
     fmt.eprintfln("interrupt: unknown subcommand '%s'", args[0])
@@ -335,56 +395,69 @@ cli_interrupt :: proc(session: ^Session, args: []string) {
   }
 }
 
-irq_print_list :: proc(session: ^Session) {
-  fmt.println("global interrupts (armed whatever else is running):")
-  if session.irq_n == 0 {
-    fmt.println("  (none on)")
+// How many watchers a saved behaviour declares, without keeping the document. Used by the lists to
+// tell "this is a chart" from "this is something you arm" - which is now a property of the CONTENT, not
+// a header, because there is only one kind of document.
+bhv_watcher_count :: proc(name: string) -> int {
+  doc, ok := bhv_open(name)
+  if !ok {
+    return 0
   }
-  for i in 0 ..< session.irq_n {
-    g := &session.irq[i]
+  defer behaviour_doc_free(&doc)
+  n := 0
+  for s in doc.steps {
+    if s.op == .On && s.goto_id != 0 {
+      n += 1
+    }
+  }
+  return n
+}
+
+armed_watcher_print_list :: proc(session: ^Session) {
+  fmt.println("always watching (armed whatever else is running):")
+  if session.armed_watcher_count == 0 {
+    fmt.println("  (nothing armed)")
+  }
+  for i in 0 ..< session.armed_watcher_count {
+    g := &session.armed_watchers[i]
     if g.ok {
-      fmt.printfln("  ON   %-16s trigger %-28s fired %d time(s)", g.name, irq_cond_text(g.cond), g.fires)
+      fmt.printfln("  ON   %-16s on %-28s fired %d time(s)", g.doc, armed_watcher_condition_text(g.condition), g.fires)
     } else {
-      fmt.printfln("  BAD  %-16s %s", g.name, g.why)
+      fmt.printfln("  BAD  %-16s %s", g.doc, g.why)
     }
   }
   // Everything that COULD be turned on, so the list is a menu and not just a receipt.
   first := true
   for name in bhv_list_names() {
-    if irq_is_enabled(session, name) {
+    if armed_watcher_behaviour_enabled(session, name) {
       continue
     }
-    doc, ok := bhv_open(name)
-    if !ok {
-      continue
-    }
-    is_irq := doc.kind == .Interrupt
-    trig := is_irq ? strings.clone(irq_cond_text(doc.trigger), context.temp_allocator) : ""
-    behaviour_doc_free(&doc)
-    if !is_irq {
+    n := bhv_watcher_count(name)
+    if n == 0 {
       continue
     }
     if first {
       fmt.println("  --- off ---")
       first = false
     }
-    fmt.printfln("  off  %-16s trigger %s", name, trig)
+    fmt.printfln("  off  %-16s %d watcher(s)", name, n)
   }
-  fmt.println("  'interrupt on <name>' arms one. Make one in the node editor: set kind to interrupt.")
+  fmt.println("  'interrupt on <name>' arms one. Make one in the node editor: add an 'on' node and wire it.")
+  fmt.println("  A chart can also borrow one for itself - `uses <name>` in its file, or the editor's options tab.")
 }
 
 // The `status full` detail section (see cli_status_behaviour).
 cli_status_interrupts :: proc(session: ^Session) {
-  fmt.printfln("  global interrupts: %d on", session.irq_n)
-  for i in 0 ..< session.irq_n {
-    g := &session.irq[i]
+  fmt.printfln("  always watching: %d watcher(s)", session.armed_watcher_count)
+  for i in 0 ..< session.armed_watcher_count {
+    g := &session.armed_watchers[i]
     if g.ok {
-      fmt.printfln("    %-16s on %-28s fired %d", g.name, irq_cond_text(g.cond), g.fires)
+      fmt.printfln("    %-16s on %-28s fired %d", g.doc, armed_watcher_condition_text(g.condition), g.fires)
     } else {
-      fmt.printfln("    %-16s NOT USABLE - %s", g.name, g.why)
+      fmt.printfln("    %-16s NOT USABLE - %s", g.doc, g.why)
     }
   }
-  if session.irq_n > 0 && !session.bh_sense_on && !session.script.active {
+  if session.armed_watcher_count > 0 && !session.bh_sense_on && !session.script.active {
     fmt.println("    ^ evaluated on the watcher tick; they keep it running on their own.")
   }
 }

@@ -86,6 +86,26 @@ set "MODULE_FLAGS="
 if defined MAIN_MODULE set "MODULE_FLAGS=-define:MAIN_MODULE=%MAIN_MODULE%"
 
 REM ==============================================
+REM Subsystem: no console window on the SHIPPED exe
+REM ==============================================
+REM Odin defaults every Windows target to -subsystem:console, which is why launching a build pops a
+REM black text window. That window is load-bearing for three of the four variants and pure noise in
+REM the fourth, so the flag is scoped to exactly that one:
+REM
+REM   release + module  -> WINDOWS. The UI opens at startup and there is no REPL to type into, so the
+REM                        console was only ever carrying the log. This is the exe you ship.
+REM   release, no module-> console. It IS the REPL - a build you cannot type into is not a build.
+REM   debug   (either)  -> console. The log is the whole point while developing.
+REM
+REM Consequence, deliberately accepted: with no console there is no stdout, so every fmt.print in the
+REM shipped exe goes nowhere (writes to a NULL handle fail silently - nothing crashes or blocks). Use
+REM the debug main-module build, or the REPL build, when you need to watch the log.
+REM
+REM No WinMain is needed: Odin passes /ENTRY:mainCRTStartup regardless of the subsystem.
+set "SUBSYSTEM_FLAGS="
+if defined MAIN_MODULE if /i "%BUILD_MODE%"=="release" set "SUBSYSTEM_FLAGS=-subsystem:windows"
+
+REM ==============================================
 REM Executable name
 REM ==============================================
 REM Name the exe after exactly what it is - memscan-<version>-<mode>[-<module>][-tracy].exe - so the
@@ -119,11 +139,12 @@ if %ERRORLEVEL% neq 0 (
 )
 
 if defined MAIN_MODULE echo %BLUE%^> main module: %MAIN_MODULE% ^(opens its UI on start - no REPL^)%RESET%
-echo %BLUE%^> %COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS% %PROFILE_FLAGS% %MODULE_FLAGS%%RESET%
+if defined SUBSYSTEM_FLAGS echo %BLUE%^> subsystem: windows ^(no console window; the log has nowhere to go^)%RESET%
+echo %BLUE%^> %COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS% %PROFILE_FLAGS% %MODULE_FLAGS% %SUBSYSTEM_FLAGS%%RESET%
 REM Stream odin's output straight to the console (preserves newlines/indentation and any '!' in
 REM messages - the old redirect-into-a-delayed-expansion-variable approach mangled all three) and
 REM capture only its exit code.
-%COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS% %PROFILE_FLAGS% %MODULE_FLAGS%
+%COMPILER% build %SOURCE_DIR% -out:%BUILD_DIR%\%EXECUTABLE% %COMMON_FLAGS% %BUILD_FLAGS% %LINK_FLAGS% %PROFILE_FLAGS% %MODULE_FLAGS% %SUBSYSTEM_FLAGS%
 set "BUILD_ERROR=%ERRORLEVEL%"
 
 if not "%BUILD_ERROR%"=="0" (

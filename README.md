@@ -46,9 +46,15 @@ odin build src ... -define:MAIN_MODULE=flyff
 ```
 
 Leave the argument off for the normal REPL build - that is the fallback whenever the define is
-missing. An unknown module name fails the build rather than silently reverting to the REPL. The
-console still opens and keeps the log; everything the window can't do is still CLI-only, so keep a
-REPL build around for setup and recon. `tracy` and a module name can be given together, in any order.
+missing. An unknown module name fails the build rather than silently reverting to the REPL.
+Everything the window can't do is still CLI-only, so keep a REPL build around for setup and recon.
+`tracy` and a module name can be given together, in any order.
+
+**Console.** `release` + a module is the one build with no console window: it is the exe you ship, the
+UI opens at startup and there is no REPL to type into, so the console was only ever carrying the log
+(`-subsystem:windows`). The trade is that the log then has nowhere to go - every `fmt.print` writes to
+a dead handle and is discarded, which is harmless but silent. The other three builds keep their
+console: the debug ones because the log is the point, and the release REPL because it *is* the REPL.
 
 ## Run
 
@@ -72,6 +78,14 @@ Type `help` for the command list and `quit` to exit. Chain commands on one line 
 `radar` opens the UI (Dear ImGui over a raylib-drawn map). It does **not** need an attached process:
 with none it opens on the Attach dialog, which searches for `neuz` by default - clear the box to list
 everything, then click a tile to attach.
+
+That dialog also has a **Work offline** button, and behind it is the whole chart surface with no game
+running: the behaviour browser, the node editor, the linter, save/load. Browsing and authoring a
+chart is document work and never needed the client. What offline does not get you is a *run* - the
+editor's play button turns amber and its tooltip names the first block that is waiting on a process.
+Every block is placeable offline; the only ones that are not are the ones with no code behind them
+yet, which `script blocks` marks `[xx]` (as opposed to `[--]`, "built, but not usable right now").
+The **Attach** button in the top-left corner takes you back to the process list.
 
 Once attached the map fills the window and the chrome floats over it:
 
@@ -163,7 +177,7 @@ automation
   hotkey <command>    (hk)   bind a key (when prompted) to run <command>, even backgrounded;
                              also: hotkey list | hotkey clear
 
-============ FLYFF (Neuz.exe - offsets live in flyff.cfg, loaded on attach) ============
+====== FLYFF (Neuz.exe - offsets live in flyff.cfg, read at startup + fresh on every attach) ======
 typical use: attach Neuz -> auto -> hold your attack key.   after a patch: select a mob, calibrate.
 check the setup anytime with 'status'.
 

@@ -358,10 +358,17 @@ Collider_Kind :: struct {
 
 FLYFF_MAX_COLLIDER_IGNORE :: 32 // hand-curated list; fixed size so Flyff_Layout copies cleanly into snapshots
 
-// Global interrupts. Capped well under SCRIPT_MAX_WATCHERS (16) because a running chart's own `on`
-// lines are hoisted into the SAME watcher array - leaving headroom is what stops enabling interrupts
-// from silently dropping a chart's own watchers.
+// Globally armed behaviours. TWO caps, because one document can hold several watchers:
+//
+//   FLYFF_MAX_INTERRUPTS      how many DOCUMENTS may be enabled. It sizes the persisted, POD,
+//                             copied-by-value name array below, so it cannot be a dynamic list.
+//   FLYFF_MAX_ARMED_WATCHERS    how many WATCHER ROWS those documents may flatten into (Session.irq).
+//
+// Both stay under SCRIPT_MAX_WATCHERS (16), because a running chart's own `on` nodes are hoisted into
+// the SAME watcher array - the headroom is what stops arming things from silently dropping a chart's
+// own watchers off the end of it.
 FLYFF_MAX_INTERRUPTS :: 8
+FLYFF_MAX_ARMED_WATCHERS :: 12
 FLYFF_IRQ_NAME_MAX :: 64 // matches bhv_name_ok's length limit
 
 Flyff_Layout :: struct {
@@ -413,6 +420,10 @@ Flyff_Layout :: struct {
   la_step_spread:    f32,  // look-alive: max perpendicular waypoint offset (world units)
   la_max_range:      f32,  // look-alive: beyond this distance, approach in shrinking hops (world units)
   reach_gate_on:     bool, // cfg mirror of Session.reach_gate_on
+  // cfg mirror of Session.bgkeys_on. Defaults ON, which is safe because it is INERT until activeflag_rva is
+  // pinned: with no RVA there is nothing to write. Once you HAVE pinned it, "movement keys work" is the
+  // state you were after, and needing to type 'bgkeys on' every session reads as the feature being broken.
+  bgkeys_on:         bool,
   hunt_on:           bool, // cfg mirror of Session.hunt_on (commit-to-one-target hunt mode)
   combat_watch_on:   bool, // cfg mirror of Session.combat_watch_on (hold the drop-fallbacks while HP falls)
   combat_grace:      f32,  // seconds since the target's last HP drop that still count as "in a fight"
@@ -443,6 +454,9 @@ Flyff_Layout :: struct {
   sendactmsg_rva:    uintptr,
   actmover_off:      i64,
   jump_msg:          u32,
+  // RVA of CNeuz::m_bActiveNeuz inside g_Neuz - the flag gating the client's own input pass. Pinned by
+  // findactive (a differential scan across a focus change); 0 = not pinned, so bgkeys stays inert.
+  activeflag_rva:    uintptr,
   destpos_off:       i64,
   iddest_off:        i64,
   forward_off:       i64,
@@ -468,7 +482,7 @@ Flyff_Layout :: struct {
   collider_ignore:   [FLYFF_MAX_COLLIDER_IGNORE]Collider_Kind,
   collider_ignore_n: i32,
 
-  // Enabled GLOBAL interrupts, by behaviour name (see cli_interrupt / irq_reload in script_run.odin).
+  // Enabled GLOBAL interrupts, by behaviour name (see cli_interrupt / armed_watcher_reload in script_run.odin).
   // These are armed whatever the machine is doing - idle, farming under `auto`, or running a chart -
   // which is the whole point: an escape hatch you have to remember to paste into every chart is not
   // an escape hatch. Fixed NUL-padded name buffers rather than strings for the same reason
@@ -480,7 +494,7 @@ Flyff_Layout :: struct {
 
 // Read one enabled-interrupt name back out of its NUL-padded buffer. BORROWED - it points into the
 // layout, so clone it if it has to outlive the caller.
-irq_layout_name :: proc(L: ^Flyff_Layout, i: int) -> string {
+armed_watcher_layout_name :: proc(L: ^Flyff_Layout, i: int) -> string {
   if i < 0 || i >= int(L.interrupts_n) {
     return ""
   }
@@ -543,6 +557,7 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     la_step_spread    = FLYFF_LA_STEP_SPREAD,
     la_max_range      = FLYFF_LA_MAX_RANGE,
     reach_gate_on     = FLYFF_REACH_GATE_ON,
+    bgkeys_on         = true,
     hunt_on           = FLYFF_HUNT_ON,
     combat_watch_on   = FLYFF_COMBAT_WATCH_ON,
     combat_grace      = FLYFF_COMBAT_GRACE,

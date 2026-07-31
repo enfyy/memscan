@@ -102,6 +102,18 @@ build_font_atlas :: proc() {
     rl.UnloadTexture(font_texture)
   }
   font_texture = rl.LoadTextureFromImage(image)
+  // BILINEAR, and it is not about the glyphs.
+  //
+  // ImGui antialiases thin lines and borders by sampling a gradient it BAKES INTO THIS ATLAS
+  // (style.AntiAliasedLinesUseTex, on by default). Its own note on that field: "Require backend to
+  // render with bilinear filtering (NOT point/nearest filtering)". raylib's LoadTextureFromImage
+  // leaves a single-mipmap texture on GL_NEAREST, so that gradient was being sampled as hard steps and
+  // every 1px border came out stair-cased - which is what made the round toolbar buttons look faceted
+  // even after CircleTessellationMaxError had given them plenty of segments.
+  //
+  // Filtering the glyphs bilinearly is what every upstream backend does, and the atlas is built with
+  // TexGlyphPadding = 1 precisely so neighbouring glyphs cannot bleed into each other.
+  rl.SetTextureFilter(font_texture, .BILINEAR)
   rl.UnloadImage(image)
 
   // ImTextureID is a u64 that the renderer defines the meaning of. Ours IS the raylib/GL texture id,

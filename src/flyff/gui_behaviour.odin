@@ -21,8 +21,14 @@ import imgui "../../lib/odin-imgui"
 // ===========================================================================
 
 BROWSER_SCAN_INTERVAL :: 1.5 // seconds between directory scans while the browser is open
-TILE_W :: f32(210)
-TILE_H :: f32(76)
+
+// Tile metrics. A tile is a FULL-WIDTH row now, so the only fixed numbers are the inside padding and the
+// icon gutter - the height falls out of the two text lines, and the width out of the dialog. Every tile's
+// contents are placed from these two constants by gui_bhv_tile_body and nowhere else, which is the point:
+// the old per-call-site offsets are how "test" ended up hanging off the right edge on its own baseline.
+TILE_PAD :: f32(12) // inside padding, all four sides
+TILE_GUTTER :: f32(30) // the icon column, between the left padding and the text column
+TILE_LINE_GAP :: f32(4) // between the title line and the line under it
 
 // One row in the browser. Both kinds of behaviour appear here: the ones compiled into the exe and the
 // ones saved as files, because "which behaviours exist" is a single question with a single answer.
@@ -74,14 +80,25 @@ gui_scan_behaviours :: proc(ps: ^Panel_State) {
       name  = strings.clone(s),
       blurb = strings.clone(""),
     }
-    // Read the header to find out which section it belongs in. This is a file parse per saved chart
-    // per scan, which is why the scan is throttled to BROWSER_SCAN_INTERVAL - the same reasoning as
-    // the directory listing itself (see the note at the top of this file).
+    // Read the CONTENT to find out which section it belongs in - a document is "something you arm"
+    // when it is nothing but watchers, not because a header said so. This is a file parse per saved
+    // chart per scan, which is why the scan is throttled to BROWSER_SCAN_INTERVAL - the same reasoning
+    // as the directory listing itself (see the note at the top of this file).
     if doc, ok := bhv_open(s); ok {
-      row.interrupt = doc.kind == .Interrupt
+      row.interrupt = script_doc_is_watchers_only(&doc)
       if row.interrupt {
+        n := 0
         b := strings.builder_make(context.temp_allocator)
-        script_write_event(&b, doc.trigger)
+        for st in doc.steps {
+          if st.op != .On || st.goto_id == 0 {
+            continue
+          }
+          if n > 0 {
+            strings.write_string(&b, ", ")
+          }
+          script_write_event(&b, st.condition)
+          n += 1
+        }
         row.trigger = strings.clone(strings.to_string(b))
       }
       behaviour_doc_free(&doc)
@@ -96,68 +113,144 @@ gui_scan_behaviours :: proc(ps: ^Panel_State) {
 }
 
 // ===========================================================================
-// Transport strip (top-centre, over the map)
+// Behaviour dock (bottom-centre, over the map)
 // ===========================================================================
 
-// Only exists while something is running. There is no greyed-out transport sitting there with nothing to
-// transport, for the same reason the recenter puck does not exist while the camera is already centred.
-gui_behaviour_transport :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
-  if !f.script_active {
+DOCK_LOAD_H :: f32(38) // the idle Load button: the only thing down there, so it gets to be big
+DOCK_NAME_H :: f32(28) // once a chart is loaded the same button shrinks and yields the middle to the transport
+DOCK_GAP :: f32(6)
+
+// The behaviour surface's one permanent control, anchored bottom-centre rather than parked in the
+// top-left toolbar: "which chart is loaded" and "pause it" are a single thought, so they are a single
+// row, and that row belongs under the map next to nothing else.
+//
+// Idle it is one wide Load button. Running, the button shrinks to the chart's NAME and steps aside to
+// the left of the transport - the media controls take the middle, which is where the eye goes for them.
+// The row is centred by hand (measure everything, then indent) because ImGui has no "centre this row"
+// and an auto-resized window only centres itself, not its contents.
+gui_behaviour_dock :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
+  vp := imgui.GetMainViewport()
+  imgui.SetNextWindowPos(
+    {vp.Pos.x + vp.Size.x * 0.5, vp.Pos.y + vp.Size.y - px(TOOLBAR_PAD)},
+    .Always,
+    {0.5, 1}, // pivot: bottom-centre of the window onto the bottom-centre of the viewport
+  )
+  // The controls ARE the dock - no panel behind them, same as the recenter puck. A surface under a row
+  // of pills reads as a box inside a box, and the map is the thing the box would be covering.
+  imgui.PushStyleVarImVec2(.WindowPadding, {0, 0})
+  imgui.PushStyleVar(.WindowBorderSize, 0)
+  imgui.PushStyleColorImVec4(.WindowBg, {0, 0, 0, 0})
+  defer imgui.PopStyleColor(1)
+  defer imgui.PopStyleVar(2)
+  defer imgui.End()
+  if !imgui.Begin("##bhvdock", nil, {.NoTitleBar, .NoResize, .NoMove, .NoScrollbar, .NoSavedSettings, .AlwaysAutoResize, .NoNavInputs, .NoDocking}) {
     return
   }
-  vp := imgui.GetMainViewport()
-  imgui.SetNextWindowPos({vp.Pos.x + vp.Size.x * 0.5, vp.Pos.y + px(TOOLBAR_PAD)}, .Always, {0.5, 0})
-  imgui.PushStyleVarImVec2(.WindowPadding, {px(10), px(8)})
-  if imgui.Begin("##transport", nil, {.NoTitleBar, .NoResize, .NoMove, .NoScrollbar, .NoSavedSettings, .AlwaysAutoResize, .NoNavInputs, .NoDocking}) {
-    // One button that is play OR pause, never both - the control shows what pressing it will do.
-    if f.script_paused {
-      if gui_icon_button("tp_play", ICON_PLAY, true, "Resume  ('script resume')", COL_OK) {
-        panel_enqueue(ps, "script resume")
-      }
-    } else {
-      if gui_icon_button("tp_pause", ICON_PAUSE, false, "Pause - freezes the whole machine, interrupts included  ('script pause')") {
-        panel_enqueue(ps, "script pause")
-      }
-    }
-    imgui.SameLine(0, px(6))
-    if gui_icon_button("tp_reset", ICON_REPLAY, false, "Rewind to the start node  ('script reset')") {
-      panel_enqueue(ps, "script reset")
-    }
-    imgui.SameLine(0, px(6))
-    if gui_icon_button("tp_step", ICON_STEP, f.script_step, f.script_step ? "Execute one block  ('script step', 'script step off' to resume)" : "Single-step: freeze the walker and run one block at a time  ('script step')") {
-      panel_enqueue(ps, "script step")
-    }
-    imgui.SameLine(0, px(6))
-    if gui_icon_button("tp_stop", ICON_STOP, false, "Stop - anything in flight is torn down  ('script stop')", COL_BAD) {
-      panel_enqueue(ps, "script stop")
-    }
 
-    // --- the step indicator: name, position, and the block actually executing right now
-    imgui.SameLine(0, px(12))
-    imgui.BeginGroup()
-    imgui.TextUnformatted(fmt.ctprintf("%s", f.script_name))
-    imgui.SameLine(0, px(8))
-    imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
-    imgui.TextUnformatted(fmt.ctprintf("step %d/%d", f.script_pc, f.script_len))
-    imgui.PopStyleColor(1)
-
-    line := f.script_line
-    col := COL_ACCENT
-    if f.script_irq {
-      // Worth calling out loudly: the step counter is frozen on the SUSPENDED step while a region runs,
-      // so without this the strip looks stuck.
-      line = fmt.tprintf("interrupt: %s", line)
-      col = COL_WARN
-    } else if f.script_paused {
-      col = COL_TEXT_DIM
+  if !f.script_active {
+    if gui_text_button("dockload", "Load", DOCK_LOAD_H, 30, true, "Behaviour charts - pick one to run  ('script list')") {
+      ps.browser_open = true
+      ps.browser_rescan = true
     }
-    imgui.PushStyleColorImVec4(.Text, col)
-    imgui.TextUnformatted(fmt.ctprintf("%s", line == "" ? "(starting)" : line))
-    imgui.PopStyleColor(1)
-    imgui.EndGroup()
+    return
   }
-  imgui.End()
-  imgui.PopStyleVar(1)
+
+  // --- running: measure the whole row first, then place it
+  name := fmt.ctprintf("%s", gui_ellipsize(f.script_name, 22))
+  name_w := gui_text_button_w(name, 14)
+  gap := px(DOCK_GAP)
+  row_w := name_w + 4 * (gap + px(ICON_BTN))
+
+  // The step readout, above the controls: position plus the block actually executing right now.
+  line := f.script_line
+  col := COL_ACCENT
+  if f.script_in_watcher {
+    // Worth calling out loudly: the step counter is frozen on the SUSPENDED step while a region runs,
+    // so without this the dock looks stuck.
+    line = fmt.tprintf("interrupt: %s", line)
+    col = COL_WARN
+  } else if f.script_paused {
+    col = COL_TEXT_DIM
+  }
+  status := fmt.ctprintf("step %d/%d   %s", f.script_pc, f.script_len, line == "" ? "(starting)" : line)
+  status_w := imgui.CalcTextSize(status).x
+
+  // What is WATCHING, above the step line. An armed watcher used to be invisible until the instant it
+  // fired, and then only as the word "interrupt" in front of the step line - so "is my escape actually
+  // on?" had no answer short of running `interrupt list` in the REPL. One chip each, lit while it has
+  // control, with its fire tally.
+  watch_line := ""
+  if f.watcher_count > 0 {
+    b := strings.builder_make(context.temp_allocator)
+    for i in 0 ..< f.watcher_count {
+      if i > 0 {
+        strings.write_string(&b, "   ")
+      }
+      row := f.watchers[i]
+      strings.write_string(&b, row.live ? "> " : "- ")
+      strings.write_string(&b, gui_ellipsize(row.label, 28))
+      if row.fires > 0 {
+        fmt.sbprintf(&b, " x%d", row.fires)
+      }
+    }
+    watch_line = strings.to_string(b)
+  }
+  watch_c := fmt.ctprintf("%s", watch_line)
+  watch_w := watch_line == "" ? f32(0) : imgui.CalcTextSize(watch_c).x
+
+  w := max(row_w, status_w, watch_w)
+  x0 := imgui.GetCursorPosX()
+
+  if watch_line != "" {
+    imgui.SetCursorPosX(x0 + (w - watch_w) * 0.5)
+    wp := imgui.GetCursorScreenPos()
+    imgui.Dummy({watch_w, imgui.GetTextLineHeight()})
+    wdl := imgui.GetWindowDrawList()
+    imgui.DrawList_AddText(wdl, {wp.x + 1, wp.y + 1}, u32_of({0, 0, 0, 0.75}), watch_c)
+    imgui.DrawList_AddText(wdl, wp, u32_of(f.script_in_watcher ? COL_WARN : tint(COL_TEXT_DIM, 0.95)), watch_c)
+    if imgui.IsItemHovered() {
+      imgui.SetTooltip("Watchers armed for this run - its own, any it borrows, and anything set to always watch. Checked before every step, first match wins.")
+    }
+  }
+
+  // Drawn by hand with a 1px near-black shadow (same reasoning as the gauges' inline value): this line
+  // sits directly on the map, and the map is whatever colour the terrain happens to be.
+  imgui.SetCursorPosX(x0 + (w - status_w) * 0.5)
+  sp := imgui.GetCursorScreenPos()
+  imgui.Dummy({status_w, imgui.GetTextLineHeight()})
+  dl := imgui.GetWindowDrawList()
+  imgui.DrawList_AddText(dl, {sp.x + 1, sp.y + 1}, u32_of({0, 0, 0, 0.75}), status)
+  imgui.DrawList_AddText(dl, sp, u32_of(col), status)
+
+  imgui.SetCursorPosX(x0 + (w - row_w) * 0.5)
+  if gui_text_button("dockname", name, DOCK_NAME_H, 14, false, fmt.ctprintf("Running '%s' - click for the chart browser", f.script_name)) {
+    ps.browser_open = true
+    ps.browser_rescan = true
+  }
+  imgui.SameLine(0, gap)
+
+  // One button that is play OR pause, never both - the control shows what pressing it will do.
+  if f.script_paused {
+    if gui_icon_button("tp_play", ICON_PLAY, true, "Resume  ('script resume')", COL_OK) {
+      panel_enqueue(ps, "script resume")
+    }
+  } else {
+    if gui_icon_button("tp_pause", ICON_PAUSE, false, "Pause - freezes the whole machine, interrupts included  ('script pause')") {
+      panel_enqueue(ps, "script pause")
+    }
+  }
+  imgui.SameLine(0, gap)
+  if gui_icon_button("tp_reset", ICON_REPLAY, false, "Rewind to the start node  ('script reset')") {
+    panel_enqueue(ps, "script reset")
+  }
+  imgui.SameLine(0, gap)
+  if gui_icon_button("tp_step", ICON_STEP, f.script_step, f.script_step ? "Execute one block  ('script step', 'script step off' to resume)" : "Single-step: freeze the walker and run one block at a time  ('script step')") {
+    panel_enqueue(ps, "script step")
+  }
+  imgui.SameLine(0, gap)
+  if gui_icon_button("tp_stop", ICON_STOP, false, "Stop - anything in flight is torn down  ('script stop')", COL_BAD) {
+    panel_enqueue(ps, "script stop")
+  }
 }
 
 // ===========================================================================
@@ -186,27 +279,21 @@ gui_browser_window :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
   }
   defer imgui.End()
 
-  imgui.SetNextItemWidth(px(240))
-  imgui.InputTextWithHint("##bhvfilter", "search", cstring(raw_data(ps.browser_filter[:])), len(ps.browser_filter))
+  // Full width, and with no sentence beside it: the search is the only thing on this line, so anything
+  // sharing the row was just narrowing it. What a click does is on the tiles' own tooltips.
+  imgui.SetNextItemWidth(-1)
+  imgui.InputTextWithHint("##bhvfilter", "search behaviours", cstring(raw_data(ps.browser_filter[:])), len(ps.browser_filter))
   filter := strings.to_lower(strings.trim_space(panel_buf_str(ps.browser_filter[:])), context.temp_allocator)
-  imgui.SameLine(0, px(10))
-  imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
-  imgui.TextUnformatted("left-click runs, right-click for more")
-  imgui.PopStyleColor(1)
 
   imgui.Dummy({0, 2})
-  // The grid stops short of the bottom so the footer has a line; without the reservation the child
+  // The list stops short of the bottom so the footer has a line; without the reservation the child
   // takes the whole remaining height and the footer lands outside the window.
   footer := imgui.GetTextLineHeightWithSpacing()
   if imgui.BeginChild("##bhvgrid", {0, -footer}, {}) {
-    avail := imgui.GetContentRegionAvail().x
-    per_row := max(1, int(avail / px(TILE_W + 8)))
-    shown := 0
     // The New tile is first and is never filtered out: it is the way IN to the editor, and hiding it
     // behind a search that happens to match nothing is the moment you most want to make one.
     gui_bhv_new_tile(ps)
-    shown += 1
-    matched := 0 // grid position vs "did the filter find anything" - the New tile counts for one, not the other
+    matched := 0
     for &r in ps.browser_rows {
       if r.interrupt {
         continue // its own section below - it is armed, not run, so a Run tile would be a lie
@@ -214,10 +301,6 @@ gui_browser_window :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
       if filter != "" && !strings.contains(strings.to_lower(r.name, context.temp_allocator), filter) {
         continue
       }
-      if shown % per_row != 0 {
-        imgui.SameLine(0, px(8))
-      }
-      shown += 1
       matched += 1
       gui_bhv_tile(ps, f, &r)
     }
@@ -236,8 +319,30 @@ gui_browser_window :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
   imgui.PopStyleColor(1)
 }
 
+// Shorten <s> from the BACK until it fits <avail> pixels, suffixed with an ellipsis. The ordinary
+// direction, for a name or a blurb whose informative half is its head.
+//
+// Package-visible rather than file-private: every hand-drawn row in this UI has to fit strings into a
+// width it computed, so the leaderboard rows use both of these too. Nothing about them is behaviour-
+// specific.
+gui_fit :: proc(s: string, avail: f32) -> cstring {
+  out := fmt.ctprintf("%s", s)
+  if avail <= 0 {
+    return ""
+  }
+  if imgui.CalcTextSize(out).x <= avail {
+    return out
+  }
+  for n := len(s) - 1; n > 0; n -= 1 {
+    out = fmt.ctprintf("%s...", s[:n])
+    if imgui.CalcTextSize(out).x <= avail {
+      return out
+    }
+  }
+  return ""
+}
+
 // Shorten <s> from the front until it fits <avail> pixels, prefixed with an ellipsis.
-@(private = "file")
 gui_fit_right :: proc(s: string, avail: f32) -> cstring {
   out := fmt.ctprintf("%s", s)
   if imgui.CalcTextSize(out).x <= avail {
@@ -252,9 +357,12 @@ gui_fit_right :: proc(s: string, avail: f32) -> cstring {
   return "..."
 }
 
-// Interrupts, as a checklist rather than a tile grid. A tile invites a click that runs the thing, and
-// running an interrupt is not what you want from it - you want it ARMED, which is a state, and a
-// checkbox is the control for a state. Each row is one `interrupt on|off` away from the console.
+// Watcher-only documents, as a checklist rather than a tile grid. A tile invites a click that runs the
+// thing, and running one of these is not what you want from it - you want it ARMED, which is a state,
+// and a checkbox is the control for a state. Each row is one `interrupt on|off` away from the console.
+//
+// A document lands in this section because it is NOTHING BUT WATCHERS, not because a header said so:
+// there is one kind of document now, and "something you arm" is a shape it can have.
 @(private = "file")
 gui_bhv_irq_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string) {
   any := false
@@ -264,13 +372,13 @@ gui_bhv_irq_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string) {
       break
     }
   }
-  if !any && f.irq_n == 0 {
+  if !any && f.armed_watcher_count == 0 {
     return
   }
   imgui.Dummy({0, px(8)})
-  imgui.SeparatorText("Interrupts - armed, not run")
+  imgui.SeparatorText("Always watching - armed, not run")
   imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
-  imgui.TextUnformatted("An armed interrupt watches its trigger whatever else is happening, and takes over when it fires.")
+  imgui.TextWrapped("These are watchers, not charts. Ticked, one is checked whatever else is happening and takes over when it fires. A single chart can borrow one instead, from its options tab.")
   imgui.PopStyleColor(1)
 
   for &r in ps.browser_rows {
@@ -282,11 +390,11 @@ gui_bhv_irq_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string) {
     }
     on := false
     bad := ""
-    for i in 0 ..< f.irq_n {
-      if f.irq[i].name == r.name {
+    for i in 0 ..< f.armed_watcher_count {
+      if f.armed[i].name == r.name {
         on = true
-        if !f.irq[i].ok {
-          bad = f.irq[i].why
+        if !f.armed[i].ok {
+          bad = f.armed[i].why
         }
         break
       }
@@ -302,7 +410,7 @@ gui_bhv_irq_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string) {
     row_hovered := imgui.IsItemHovered()
     imgui.SameLine(0, px(10))
     imgui.PushStyleColorImVec4(.Text, bad != "" ? COL_BAD : (on ? COL_WARN : COL_TEXT_DIM))
-    imgui.TextUnformatted(fmt.ctprintf("%s", bad != "" ? bad : fmt.tprintf("fires when %s", r.trigger)))
+    imgui.TextUnformatted(fmt.ctprintf("%s", bad != "" ? bad : fmt.tprintf("takes over on %s", r.trigger)))
     imgui.PopStyleColor(1)
     row_hovered ||= imgui.IsItemHovered()
     if row_hovered && imgui.IsMouseClicked(.Right) {
@@ -330,10 +438,10 @@ gui_bhv_irq_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string) {
 
   // An enabled name whose file is gone still occupies a slot and still says so in `status`, so it has
   // to be visible here too - otherwise the only way to clear it is the console.
-  for i in 0 ..< f.irq_n {
+  for i in 0 ..< f.armed_watcher_count {
     seen := false
     for r in ps.browser_rows {
-      if r.name == f.irq[i].name {
+      if r.name == f.armed[i].name {
         seen = true
         break
       }
@@ -341,16 +449,79 @@ gui_bhv_irq_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string) {
     if seen {
       continue
     }
-    imgui.PushID(fmt.ctprintf("irqm%s", f.irq[i].name))
+    imgui.PushID(fmt.ctprintf("irqm%s", f.armed[i].name))
     want := true
-    if imgui.Checkbox(fmt.ctprintf("%s", f.irq[i].name), &want) {
-      panel_enqueue(ps, fmt.tprintf("interrupt off %s", f.irq[i].name))
+    if imgui.Checkbox(fmt.ctprintf("%s", f.armed[i].name), &want) {
+      panel_enqueue(ps, fmt.tprintf("interrupt off %s", f.armed[i].name))
     }
     imgui.SameLine(0, px(10))
     imgui.PushStyleColorImVec4(.Text, COL_BAD)
     imgui.TextUnformatted("its file is gone - untick to forget it")
     imgui.PopStyleColor(1)
     imgui.PopID()
+  }
+}
+
+// What one tile says, independent of how it is drawn. Both kinds of tile fill this and hand it to
+// gui_bhv_tile_body, so their layouts cannot drift apart - there is only one layout.
+@(private = "file")
+Bhv_Tile_Text :: struct {
+  icon:      rune,
+  icon_col:  imgui.Vec4,
+  title:     string,
+  title_col: imgui.Vec4,
+  tag:       string, // the status word: first thing on the second line
+  tag_col:   imgui.Vec4,
+  sub:       string, // the blurb, after the tag; always dim
+  tail:      string, // right-aligned badge on the TITLE line ("" = none)
+}
+
+// A tile's height: whatever two lines of text plus the padding come to. Not a constant, because the font
+// is rasterized at ui_scale and a hardcoded height would clip at the large end.
+@(private = "file")
+gui_bhv_tile_h :: proc() -> f32 {
+  return px(TILE_PAD) * 2 + imgui.GetTextLineHeight() * 2 + px(TILE_LINE_GAP)
+}
+
+// Draw a tile's contents over its button frame (same trick as gui_icon_button - a Selectable would give
+// none of this layout control). THE only place tile text is positioned:
+//
+//   pad |icon| text column ................................. [tail] | pad
+//   pad |    | tag  sub .................................           | pad
+//
+// Both lines share one left edge, the tail is right-aligned on the title's baseline rather than floated
+// near the corner, and every string is fitted to the room actually left over.
+@(private = "file")
+gui_bhv_tile_body :: proc(rmin, rmax: imgui.Vec2, t: Bhv_Tile_Text) {
+  dl := imgui.GetWindowDrawList()
+  pad := px(TILE_PAD)
+  lh := imgui.GetTextLineHeight()
+  tx := rmin.x + pad + px(TILE_GUTTER)
+  y0 := rmin.y + pad
+  y1 := y0 + lh + px(TILE_LINE_GAP)
+  right := rmax.x - pad
+
+  gui_draw_icon(dl, rmin.x + pad + px(TILE_GUTTER) * 0.5, (rmin.y + rmax.y) * 0.5, t.icon, t.icon_col)
+
+  // --- title line, with the badge claiming its width first
+  title_room := right - tx
+  if t.tail != "" {
+    tail := fmt.ctprintf("%s", t.tail)
+    tw := imgui.CalcTextSize(tail).x
+    imgui.DrawList_AddText(dl, {right - tw, y0}, u32_of(COL_TEXT_DIM), tail)
+    title_room -= tw + px(12)
+  }
+  imgui.DrawList_AddText(dl, {tx, y0}, u32_of(t.title_col), gui_fit(t.title, title_room))
+
+  // --- second line: the status word, then the blurb in whatever is left
+  x := tx
+  if t.tag != "" {
+    tag := gui_fit(t.tag, right - x)
+    imgui.DrawList_AddText(dl, {x, y1}, u32_of(t.tag_col), tag)
+    x += imgui.CalcTextSize(tag).x + px(10)
+  }
+  if t.sub != "" && x < right {
+    imgui.DrawList_AddText(dl, {x, y1}, u32_of(tint(COL_TEXT_DIM, 0.9)), gui_fit(t.sub, right - x))
   }
 }
 
@@ -364,14 +535,21 @@ gui_bhv_new_tile :: proc(ps: ^Panel_State) {
   imgui.PushStyleColorImVec4(.ButtonHovered, tint(COL_ACCENT, 0.22))
   imgui.PushStyleColorImVec4(.ButtonActive, tint(COL_ACCENT, 0.32))
   imgui.PushStyleColorImVec4(.Border, tint(COL_ACCENT, 0.55))
-  clicked := imgui.Button("##new", {px(TILE_W), px(TILE_H)})
+  clicked := imgui.Button("##new", {imgui.GetContentRegionAvail().x, gui_bhv_tile_h()})
   imgui.PopStyleColor(4)
 
-  rmin := imgui.GetItemRectMin()
-  dl := imgui.GetWindowDrawList()
-  gui_draw_icon(dl, rmin.x + px(20), rmin.y + px(22), ICON_ADD, COL_ACCENT)
-  imgui.DrawList_AddText(dl, {rmin.x + px(38), rmin.y + px(13)}, u32_of(COL_TEXT), "New chart")
-  imgui.DrawList_AddText(dl, {rmin.x + px(38), rmin.y + px(34)}, u32_of(COL_TEXT_DIM), "open the node editor")
+  gui_bhv_tile_body(
+    imgui.GetItemRectMin(),
+    imgui.GetItemRectMax(),
+    {
+      icon = ICON_ADD,
+      icon_col = COL_ACCENT,
+      title = "New chart",
+      title_col = COL_TEXT,
+      tag = "open the node editor",
+      tag_col = COL_TEXT_DIM,
+    },
+  )
   if imgui.IsItemHovered() {
     imgui.SetTooltip("Draw a behaviour as a node graph. It is saved to a .bhv file when you hit Save.")
   }
@@ -381,8 +559,12 @@ gui_bhv_new_tile :: proc(ps: ^Panel_State) {
   }
 }
 
-// One chart, as a tile. Left-click runs it (the thing you want 95% of the time); right-click is the
-// menu of everything else.
+// One chart, as a tile. **Load** runs it and closes the browser; clicking the tile itself opens it in
+// the editor; right-click is the menu of everything else.
+//
+// Running used to be the whole-tile click, which meant a stray click anywhere on a row launched a
+// behaviour at a live character. Starting something is the one action here worth aiming at, so it got
+// its own button, and the tile kept a click that cannot cost you anything.
 @(private = "file")
 gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
   running := f.script_active && f.script_name == r.name
@@ -406,52 +588,81 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
     imgui.PushStyleColorImVec4(.ButtonActive, {0.235, 0.310, 0.400, 1.0})
     imgui.PushStyleColorImVec4(.Border, COL_BORDER)
   }
-  clicked := imgui.Button("##tile", {px(TILE_W), px(TILE_H)})
+  // The Load button sits INSIDE the tile, right-aligned against its padding. The tile is submitted
+  // with SetNextItemAllowOverlap so the button - drawn after it, therefore on top - can take the hover
+  // and the click off it. An AllowOverlap item only counts as hovered if it was ALREADY the hovered
+  // item on the previous frame, which is exactly what hands the pointer over when it crosses onto the
+  // button, and what stops a click on Load from also opening the editor.
+  //
+  // Two things that are NOT the way to do this, both tried:
+  //   - Narrowing the tile and putting the button beside it. That is what this replaced: it reads as
+  //     two controls in a row rather than as one row with an action on it.
+  //   - Placing the button with SetCursorScreenPos and then putting the cursor back. A cursor move
+  //     that no item follows is what EndChild asserts on ("Code uses SetCursorPos() to extend
+  //     window/parent boundaries"), and it fired on whichever tile happened to be drawn last.
+  // Ordinary flow - SameLine, then cursor moves an item immediately follows - has no such hazard.
+  tile_h := gui_bhv_tile_h()
+  load_label: cstring = running ? "Restart" : "Load"
+  load_w := gui_text_button_w(load_label, 16)
+  load_h := f32(24)
+  row_x := imgui.GetCursorPosX()
+  row_y := imgui.GetCursorPosY()
+  tile_w := imgui.GetContentRegionAvail().x
+  imgui.SetNextItemAllowOverlap()
+  clicked := imgui.Button("##tile", {tile_w, tile_h})
   imgui.PopStyleColor(4)
-
-  rmin := imgui.GetItemRectMin()
   hovered := imgui.IsItemHovered()
-  dl := imgui.GetWindowDrawList()
+  tile_min := imgui.GetItemRectMin()
+  tile_max := imgui.GetItemRectMax()
 
-  // Contents, hand-drawn over the button frame (same trick as gui_icon_button): a kind glyph, the name,
-  // and one status word. A Selectable would give none of that layout control.
   icon_col := r.builtin ? COL_TEXT_DIM : COL_ACCENT
   if inert {
     icon_col = tint(COL_TEXT_DIM, 0.5)
   }
-  gui_draw_icon(dl, rmin.x + px(20), rmin.y + px(22), r.builtin ? ICON_CODE : ICON_FILE, icon_col)
-  imgui.DrawList_AddText(dl, {rmin.x + px(38), rmin.y + px(13)}, u32_of(inert ? COL_TEXT_DIM : COL_TEXT), fmt.ctprintf("%s", r.name))
-
   tag := r.builtin ? (r.shadowed ? "Odin (shadowed)" : "Odin") : "saved"
   tag_col := COL_TEXT_DIM
   if running {
     tag = f.script_paused ? "PAUSED" : "running"
     tag_col = f.script_paused ? COL_WARN : COL_OK
   }
-  imgui.DrawList_AddText(dl, {rmin.x + px(38), rmin.y + px(34)}, u32_of(tag_col), fmt.ctprintf("%s", tag))
-  if r.test {
-    imgui.DrawList_AddText(dl, {rmin.x + px(TILE_W) - px(28), rmin.y + px(34)}, u32_of(COL_TEXT_DIM), "test")
+  // The text stops where the button starts. Handing gui_bhv_tile_body a narrower rect is all it takes:
+  // it fits the title and right-aligns the badge against whatever rect it is given, so the button's
+  // width comes off the box rather than being special-cased inside the one layout proc.
+  text_max := tile_max
+  if !inert {
+    text_max.x -= load_w + px(TILE_PAD)
   }
-  if r.blurb != "" {
-    imgui.DrawList_AddText(
-      dl,
-      {rmin.x + px(12), rmin.y + px(54)},
-      u32_of(tint(COL_TEXT_DIM, 0.9)),
-      fmt.ctprintf("%s", gui_ellipsize(r.blurb, 30)),
-    )
-  }
+  gui_bhv_tile_body(
+    tile_min,
+    text_max,
+    {
+      icon = r.builtin ? ICON_CODE : ICON_FILE,
+      icon_col = icon_col,
+      title = r.name,
+      title_col = inert ? COL_TEXT_DIM : COL_TEXT,
+      tag = tag,
+      tag_col = tag_col,
+      sub = r.blurb,
+      tail = r.test ? "test" : "",
+    },
+  )
 
   if hovered {
     if r.blurb != "" {
-      imgui.SetTooltip("%s", fmt.ctprintf("%s\n\nLeft-click: run.  Right-click: more.", r.blurb))
+      imgui.SetTooltip("%s", fmt.ctprintf("%s\n\nClick to open it in the editor.  Right-click: more.", r.blurb))
     } else {
-      imgui.SetTooltip("Left-click: run.  Right-click: more.")
+      imgui.SetTooltip("Click to open it in the editor.  Right-click: more.")
     }
   }
+  // The tile itself opens the editor - the one click on this row that cannot start anything.
   if clicked && !inert {
-    panel_enqueue(ps, fmt.tprintf("script run %s", r.name))
+    name := strings.clone(r.name, context.temp_allocator)
+    ps.browser_open = false
+    gui_editor_open(ps, name)
   }
 
+  // The right-click menu binds to the LAST ITEM, so it has to be claimed here while that is still the
+  // tile - after the Load button it would bind to the button and the tile would stop answering.
   if imgui.BeginPopupContextItem("##ctx") {
     if !inert && imgui.Selectable("Run") {
       panel_enqueue(ps, fmt.tprintf("script run %s", r.name))
@@ -460,6 +671,16 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
       if imgui.Selectable("Stop") {
         panel_enqueue(ps, "script stop")
       }
+    }
+    // Opening a built-in is allowed and is how you make one editable: the editor loads the built
+    // program and saving it writes a file that shadows the Odin original (which the editor says out
+    // loud). Deleting that file gets the original back - the same deal `script export` documents.
+    // Two doors into the same editor. "Configure" lands on the settings tab and is the one you want
+    // nine times out of ten - you are retuning a chart, not rewiring it - so it goes first.
+    if imgui.Selectable("Configure...") {
+      name := strings.clone(r.name, context.temp_allocator)
+      ps.browser_open = false
+      gui_editor_open(ps, name, true)
     }
     // Opening a built-in is allowed and is how you make one editable: the editor loads the built
     // program and saving it writes a file that shadows the Odin original (which the editor says out
@@ -487,6 +708,31 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
       }
     }
     imgui.EndPopup()
+  }
+
+  // --- Load, back on the tile's line and inside its right-hand padding.
+  //
+  // SameLine rejoins the row first, so ItemSize measures the button against the tile's line height
+  // rather than starting a new one; the cursor moves are window-local (SetCursorPosX/Y are the exact
+  // inverses of the GetCursorPosX/Y read above the tile, groups and scroll included) and are followed
+  // immediately by an item, which is the condition ImGui asks for. Because the button is shorter than
+  // the tile and centred in it, the row still advances by the tile's height and the grid is unchanged.
+  if !inert {
+    imgui.SameLine(0, 0)
+    imgui.SetCursorPosX(row_x + tile_w - load_w - px(TILE_PAD))
+    imgui.SetCursorPosY(row_y + (tile_h - px(load_h)) * 0.5)
+    if gui_text_button(
+      "tileload",
+      load_label,
+      load_h,
+      16,
+      true,
+      running ? "Start this chart again from the top" : "Run this chart now, and close this window",
+      COL_OK,
+    ) {
+      panel_enqueue(ps, fmt.tprintf("script run %s", r.name))
+      ps.browser_open = false // you asked for it to run; the list has done its job
+    }
   }
 }
 

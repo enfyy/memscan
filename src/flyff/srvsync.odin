@@ -24,24 +24,6 @@ cli_srvsync :: proc(session: ^Session, args: []string) {
   fmt.eprintln("usage: srvsync [on|off]")
 }
 
-// srvtest -> fire exactly ONE SendSetTarget at the currently-focused mob and report the result.
-// The minimal PoC: select a mob (target_closest / a click), then 'srvtest' and watch whether the
-// session survives past the usual ~5-min kill-count DC.
-cli_srvtest :: proc(session: ^Session, args: []string) {
-  if !srvsync_ready(session) {
-    return
-  }
-  focus, fok := read_focus_ptr(session)
-  if !fok || focus == 0 {
-    fmt.eprintln("no mob focused - select one first (e.g. 'target_closest <name>' or click it).")
-    return
-  }
-  idv, idok := engine.read_value(session.proc_info.handle, focus + uintptr(session.layout.objid_off), .U32)
-  objid := idok ? u32(engine.value_as_u64(.U32, idv)) : 0
-  ok := notify_server_target(session, focus)
-  fmt.printfln("srvtest: SendSetTarget(objid=%d, 2) for obj=0x%X -> %s", objid, focus, ok ? "sent" : "FAILED")
-}
-
 // Shared precondition check for srvsync/srvtest: attached, 32-bit client, Phase-0 constants baked.
 srvsync_ready :: proc(session: ^Session) -> bool {
   if !session.attached {

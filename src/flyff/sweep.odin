@@ -418,8 +418,6 @@ sweep_tick :: proc(session: ^Session, now: i64) -> (handled: bool) {
   }
   // Pre-select is off while sweeping: the cache is measured from where the current fight is, and by the
   // time it commits we may have hopped a brush width forward - a stale pick can drift out of the circle.
-  session.auto_next_set = false
-  session.auto_next_for = 0
 
   _, engage := pick_ranges(session)
   ppos, pok := read_player_pos(session)

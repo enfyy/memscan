@@ -46,38 +46,8 @@ open_ui_hook :: proc(es: ^engine.Session) {
 module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (handled: bool) {
   s := flyff_of(es)
   switch cmd {
-  case "target_closest", "tc", "get":
-    cli_target_closest(s, args)
-  case "target_at", "tat":
-    cli_target_at(s, args)
-  case "tdbg", "tmap":
-    cli_tdbg(s, args)
   case "auto":
     cli_auto(s, args)
-  case "timer":
-    cli_timer(s, args)
-  case "kills":
-    cli_kills(s, args)
-  case "stuck":
-    cli_stuck(s, args)
-  case "combatwatch":
-    cli_combatwatch(s, args)
-  case "priority", "prio":
-    cli_priority(s, args)
-  case "preset":
-    cli_preset(s, args)
-  case "aggro":
-    cli_aggro(s, args)
-  case "preselect":
-    cli_preselect(s, args)
-  case "lookalive":
-    cli_lookalive(s, args)
-  case "density":
-    cli_density(s, args)
-  case "reachgate":
-    cli_reachgate(s, args)
-  case "hunt":
-    cli_hunt(s, args)
   case "meshreach":
     cli_meshreach(s, args)
   case "sfx":
@@ -92,8 +62,6 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_nowalk(s, args)
   case "collwatch":
     cli_collwatch(s, args)
-  case "pause":
-    cli_pause(s, args)
   case "setup":
     cli_setup(s, args)
   case "offsets", "layout":
@@ -102,22 +70,6 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_status(s, args)
   case "set":
     cli_set(s, args)
-  case "findpos":
-    cli_findpos(s, args)
-  case "findplayer":
-    cli_findplayer(s, args)
-  case "findfocus":
-    cli_findfocus(s, args)
-  case "findhp":
-    cli_findhp(s, args)
-  case "hpwatch":
-    cli_hpwatch(s, args)
-  case "findpacket":
-    cli_findpacket(s, args)
-  case "packetwatch":
-    cli_packetwatch(s, args)
-  case "idscan":
-    cli_idscan(s, args)
   case "findsettarget":
     cli_findsettarget(s, args)
   case "findaii":
@@ -126,12 +78,6 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_findprop(s, args)
   case "srvsync":
     cli_srvsync(s, args)
-  case "srvtest":
-    cli_srvtest(s, args)
-  case "deathscan":
-    cli_deathscan(s, args)
-  case "objscan":
-    cli_objscan(s, args)
   case "findpenya":
     cli_findpenya(s, args)
   case "findinv":
@@ -154,10 +100,6 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_warmtype(s, args)
   case "worldscan":
     cli_worldscan(s, args)
-  case "attr":
-    cli_attr(s, args)
-  case "attrmap":
-    cli_attrmap(s, args)
   case "objects":
     cli_objects(s, args)
   case "collscan":
@@ -166,8 +108,6 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_collignore(s, args)
   case "collmem":
     cli_collmem(s, args)
-  case "linkscan":
-    cli_linkscan(s, args)
   case "reach":
     cli_reach(s, args)
   case "attackable", "canhit":
@@ -176,40 +116,34 @@ module_dispatch :: proc(es: ^engine.Session, cmd: string, args: []string) -> (ha
     cli_reachdbg(s, args)
   case "findobjline":
     cli_findobjline(s, args)
-  case "objline":
-    cli_objline(s, args)
-  case "reachcmp":
-    cli_reachcmp(s, args)
-  case "findcull":
-    cli_findcull(s, args)
   case "findcam":
     cli_findcam(s, args)
   case "radar":
     cli_radar(s, args)
   case "fence":
     cli_fence(s, args)
+  case "waypoints", "wp":
+    cli_waypoints(s, args)
   case "sweep":
     cli_sweep(s, args)
   case "moveto", "walkto", "go":
     cli_moveto(s, args)
   case "jump":
     cli_jump(s, args)
-  case "position", "pos", "/position":
-    cli_position(s, args)
   case "findmove":
     cli_findmove(s, args)
+  case "findactive":
+    cli_findactive(s, args)
+  case "bgkeys":
+    cli_bgkeys(s, args)
   case "leaderboard", "lb":
     cli_leaderboard(s, args)
-  case "sense":
-    cli_sense(s, args)
   case "script", "sc":
     cli_script(s, args)
   case "interrupt", "irq":
     cli_interrupt(s, args)
   case "key":
     cli_key(s, args)
-  case "test":
-    cli_test(s, args)
   case:
     return false
   }
@@ -238,11 +172,14 @@ module_tick :: proc(es: ^engine.Session) {
     }
   }
   s.pause_key_prev = toggle_down
-  // Behaviour machine FIRST - that is where it belongs once it owns routing (see behaviour.odin).
-  // Today it only senses + ticks an idle state, and it is inert unless 'sense on', so this changes
-  // nothing about how the farm behaves.
+  // The behaviour machine OWNS routing now. `auto` is a chart it runs (bh_auto in behaviours.odin), so
+  // there is no second farm tick beside it - the flag-precedence chain that used to live in auto_tick
+  // is the chart's graph.
+  // Before the behaviour tick: a chart's key_down is worthless if the client's input pass is still gated
+  // off this frame, and re-asserting the flag is a single read (plus a write only when it actually flipped).
+  active_flag_scan_tick(s) // findactive's self-sampling narrowing pass (inert unless armed)
+  active_flag_tick(s)
   behaviour_tick(s)
-  auto_tick(s) // hands-free farm: advance focus when the target dies
   penya_tick(s) // accrue penya total + record gains for the radar (works with the radar closed)
   range_ring_tick(s) // attack-range circle overlay (ring / draw_range) - non-blocking
 }
@@ -262,8 +199,10 @@ on_attach :: proc(es: ^engine.Session) {
   s.sweep_walking = false
   sweep_clear(s)
 
-  // Load the persisted Flyff layout (flyff.cfg next to memscan.exe) fresh over defaults, so a
-  // patched build just needs 'calibrate' once. Absent file -> built-in defaults.
+  // Re-load the persisted Flyff layout (flyff.cfg next to memscan.exe) fresh over defaults, so a
+  // patched build just needs 'calibrate' once. Absent file -> built-in defaults. session_init already
+  // read it at startup (a detached session needs the preferences half); this is the PER-PROCESS
+  // re-read, and it resets first so offsets derived for the previous client cannot survive into this one.
   s.layout = flyff_layout_default()
   cfg := flyff_cfg_path()
   if flyff_load_cfg(&s.layout, cfg) {
@@ -274,9 +213,9 @@ on_attach :: proc(es: ^engine.Session) {
   // Derive the global-interrupt runtime half from the names the cfg just restored: read each file's
   // trigger and arm it. Has to happen after the whole cfg is in, and after layout defaults, because
   // it is a function of layout.interrupts.
-  irq_reload(s)
-  if s.irq_n > 0 {
-    fmt.printfln("interrupt: %d armed - 'interrupt list'.", s.irq_n)
+  armed_watcher_reload(s)
+  if s.armed_watcher_count > 0 {
+    fmt.printfln("interrupt: %d armed - 'interrupt list'.", s.armed_watcher_count)
     engine.ensure_hotkey_thread(&s.eng) // they are evaluated on the watcher tick
   }
 
@@ -286,6 +225,7 @@ on_attach :: proc(es: ^engine.Session) {
   s.preselect_on = s.layout.preselect_on
   s.lookalive_on = s.layout.lookalive_on
   s.reach_gate_on = s.layout.reach_gate_on
+  s.bgkeys_on = s.layout.bgkeys_on
   s.hunt_on = s.layout.hunt_on
   s.combat_watch_on = s.layout.combat_watch_on
   s.auto_stuck_on = s.layout.auto_stuck_on
@@ -345,6 +285,10 @@ on_detach :: proc(es: ^engine.Session) {
   // in-flight action's Exit still runs against the process it was issued in (halting a walk while
   // there is still something to halt). Same reasoning as sweep_walking being dropped on attach.
   script_stop(s)
+  // After the script, for the same reason and one level wider: script_teardown released whatever the
+  // chart was holding, this catches a key held by hand (`key hold w`) that no run owns. Still on the
+  // live window, so the client actually sees the WM_KEYUP.
+  keys_release_all(s)
   behaviour_reset(s) // drop the sense baselines with the process they were measured against
 }
 
@@ -359,9 +303,11 @@ on_close :: proc(es: ^engine.Session) {
     remote_free_dplay_page(s)
   }
   script_run_free(&s.script) // owned steps + watchers
-  irq_free(s) // global interrupts: each holds an owned trigger + name
+  armed_watcher_free_all(s) // global interrupts: each holds an owned trigger + name
   behaviour_scratch_free(s)
+  delete(s.active_cands) // findactive's narrowing set
   fence_destroy(&s.fence)
+  waypoint_destroy(s) // the live route + both history stacks
   delete(s.sweep_path)
   auto_free_names(s)
   for n in s.last_auto_names {
@@ -386,7 +332,7 @@ module_help :: proc() {
 
 @(private = "file")
 HELP_FLYFF :: `
-============ FLYFF (Neuz.exe - offsets live in flyff.cfg, loaded on attach) ============
+====== FLYFF (Neuz.exe - offsets live in flyff.cfg, read at startup + fresh on every attach) ======
 typical use: attach Neuz -> auto -> hold your attack key.   after a patch: 'setup <name>' in the field.
 check the setup anytime with 'status'.
 
@@ -435,24 +381,25 @@ farming (day to day)
                              inert until 'findobjline' pins intersectobjline_rva (re-run it after a game patch)
   findobjline                re-pin intersectobjline_rva by signature so meshreach / objline / reachcmp work again
   mobs <name>                list nearby <name> movers by distance (hp, model, address)
-  tdbg [label] [zoom] (tmap)  write a top-down radar map of the PREDICTED auto kill-order
-                             (tc_map[_label].html) + a console factor table; diagnoses target order.
-                             label tags the file ('tdbg cloakia' vs 'tdbg tower'); a trailing number is
-                             the view radius in world units ('tdbg tower 30' to zoom in)
   radar [seconds]            open the WINDOW (live top-down map + the Dear ImGui control surface);
                              wheel=zoom, titlebar X closes it (ESC no longer does). raylib+imgui are
                              statically linked (no dll). seconds>0 auto-closes. Does NOT need an attached
-                             process: with none it opens on the Attach dialog (defaults to 'neuz').
+                             process: with none it opens on the Attach dialog (defaults to 'neuz'), and
+                             'Work offline' there gets you the browser and the chart EDITOR with no game
+                             running - browse, edit, lint and save charts, then Attach when you want to
+                             run one. Every block is placeable offline; only the ones with no code behind
+                             them yet are not ('script blocks' marks those [xx]).
                              LEFT-CLICK a mob to target it; SHIFT+LEFT-CLICK the ground to walk there
                              (needs 'findmove'); a '+penya' pops on each pickup (needs 'findpenya').
                              toolbar (top-left): setup traffic light -> the Setup dialog (checklist +
                              attack_range), the BEHAVIOUR BROWSER (every chart, Odin and saved; left-click
                              runs, right-click duplicates/renames/deletes), zone/fence editor (E), camera
-                             follow (L, ON by default), no-walk overlay (N), mute. While a chart runs, a
+                             follow (L, ON by default), no-walk overlay (N), mute, and - once
+                             leaderboard_url is set - LEADERBOARDS (the trophy). While a chart runs, a
                              transport strip (play/pause, rewind, step, stop + the current block) sits
                              top-centre. Unlock the camera and a recenter button appears bottom-right (C
-                             also works); penya + bag gauges sit bottom-left. auto, the targeting options
-                             and leaderboards are CLI-only for now.
+                             also works); penya + bag gauges sit bottom-left. auto and the targeting
+                             options are CLI-only for now.
   hillshade [on|off]         radar display only: colourless terrain shaded-relief backdrop (key H).
                              needs 'worldscan'; depth/light are 'set hillshade_z' / 'set hillshade_light'
   nowalk [on|off]            radar display only: paint the walk-blocking terrain cells the reach oracle
@@ -466,6 +413,18 @@ farming (day to day)
                              (carve-out; don't target inside), '!' AVOID (a hard no-go: don't target inside OR
                              behind it, and the player never walks through it - e.g. a tower teleport pad).
                              adding a shape auto-activates the gate; 'fence off' overrides without clearing.
+  waypoints [sub]   (wp)     WAYPOINT SETS - an ordered, named route you draw on the map and import into
+                             a chart. Place flags on the radar in W mode (left-click places, drag moves,
+                             right-click a flag for name/order/delete, Ctrl+Z undoes), or add them from
+                             here as you walk. Order IS the list order: deleting one closes its own gap.
+                             no arg = status. subs: show / add [<x,z>] [name...] (no coords = at your
+                             feet) / rename <n> <name...> / move <n> <to> / delete <n> / clear / undo /
+                             redo / save [name] / load <name> / list / erase <name> / import <set> [as
+                             <chart>]. Indices are 1-based. 'import' writes a NEW chart of walk_to nodes,
+                             one per waypoint, each in a section named after it - it runs once and stops,
+                             so wire the last node yourself. It refuses to overwrite an existing chart.
+                             A set remembers which map it was drawn on and says so when that is not the
+                             map you are standing on (needs 'worldscan' for the map id).
   sweep [sub]                SWEEP MODE - paint a route and clear it lane by lane. RIGHT-DRAG from inside
                              the green attack-range ring on the radar to paint a swath the width of your
                              reach; release and auto clears the circle it stands in, steps forward along
@@ -493,16 +452,14 @@ character control (no keypress simulation; run 'findmove' once to pin it)
                              there itself (like a ground click). Y defaults to your height. aliases: walkto, go
   key <name>                 press one game hotkey now (1-9, a-z, f1-f12, space...). posts to the
                              game window, so it does NOT need focus. the primitive behind press_key
+  key hold <name>            push a key down and LEAVE it down (walking, hold-to-attack); the
+                             primitive behind key_down. 'key release [<name>]' lets go of one or all.
+                             released automatically when a script ends or on detach
   jump                       jump (sends the client's own OBJMSG_JUMP; all in-game jump guards apply)
   position (pos)             print your world position (copy-paste x,y,z for moveto / findpos)
   findmove                   pin the move/jump config (dest-field offsets + sendactmsg_rva via the
                              actmover vtable + actmover_off + jump_msg); re-run after a game patch. saves flyff.cfg
 
-live verification (run these once after a build, with the game running)
-  test                       list the checks; each is ONE command, in the order worth doing them
-  test all                   run every check that does NOT move your character
-  test <name> [arg]          run one (e.g. 'test pet 9', 'test walkstop')
-                             most decide PASS/FAIL themselves by reading the game's own memory
 
 behaviour scripts (build your own farming behaviour out of blocks; 'auto' becomes one script among many)
   script blocks              THE CATALOG: every action + event, with [OK] / [--] and what a missing
@@ -558,7 +515,7 @@ terrain / obstacle reach oracle ('setup' pins these; commands below are for stan
   worldscan [reset]          pin the terrain-grid offsets from your ground height (stand on solid
                              ground; if ambiguous, walk to a different-height spot and re-run)
   findcull                   locate the on-screen object array (legacy; reach no longer needs it - colliders full-scan)
-  findcam                    locate the render camera (CWorld::m_pCamera); lets tdbg draw the cull cone / blind spot
+  findcam                    locate the render camera (CWorld::m_pCamera); drives the radar's camera frustum (F)
   attr [x,z]                 terrain attribute at your feet (or a world point): NONE/NOWALK/NOMOVE/DIE
   attrmap [radius] [step]    ASCII map of terrain attributes around you (reveals invisible walls)
   objects [radius]           list nearby CObj of any type + locate m_OBB (props the grid misses)
@@ -598,11 +555,12 @@ leaderboards (submit a timed farm run to a self-hosted backend)
   leaderboard status         span progress + whether the 5-min minimum is met + last network result
   leaderboard submit <name>  finalize + POST the run under <name> (needs >=5 min). Uploads your farming
                              setup (behavior keys only, never memory offsets). Runs off the main loop (no UI hitch)
-  leaderboard top [sort]     fetch + print the board. sort: penya|kpm|kills|monsters|density (default penya)
+  leaderboard top [sort]     fetch + print the board. sort: penya|kills|kpm (default penya)
   leaderboard getcfg <id> [path]  download entry <id>'s flyff.cfg (to path, or flyff_<id>.cfg)
   set lb_penya_cap <n>       anti-cheat: penya counts ONLY gains paired with a recent kill AND <= <n> (default
                              10M) - for BOTH the panel "penya:" total and a submission. A 100M Perin is ignored.
                              cheat-proofing is layered + honest: build-hash gate + HMAC signing + server-side
                              plausibility (>=5 min, rate caps) + rate limiting. A memory tool's self-reported
                              stats are still spoofable by a determined attacker - this raises the bar, not anti-cheat.
-  leaderboards are CLI-only since the ImGui redesign (the old sidebar button went with the raygui panel).`
+  every one of the above is also a button: once leaderboard_url is set, a trophy joins the radar toolbar
+  and opens the board + the run recorder (it lights up while a run is recording).`

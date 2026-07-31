@@ -16,9 +16,9 @@ Session :: struct {
   layout:        Flyff_Layout,
   tc_recent:     [dynamic]TC_Recent, // objs target_closest picked recently (skip just-killed)
 
-  // Auto-farm mode (see auto_tick / cli_auto in target.odin). When on, the watcher thread
-  // advances the focus to the next fresh mob matching auto_names whenever m_pObjFocus clears.
-  // An empty auto_names list means "any monster" (name gate off; player is still excluded).
+  // Auto-farm mode (see cli_auto). auto_on means "the farm chart is running" - it and session.script
+  // are kept in step in both directions, so status and F10 can never disagree with what is actually
+  // driving. An empty auto_names list means "any monster" (name gate off; player is still excluded).
   auto_on:       bool,
   auto_names:    [dynamic]string, // cloned target names; empty = any monster. Freed on toggle/close.
   auto_last:     i64, // time.now()._nsec of the last advance attempt (throttle)
@@ -30,9 +30,6 @@ Session :: struct {
   // Obstacle / stuck detection (see auto_monitor in target.odin). Tracks progress toward the
   // focused mob; if player->target distance plateaus while still far, the mob is blacklisted
   // (auto_blocked, skipped for BLOCKED_NS) and focus is cleared so the next tick re-acquires.
-  auto_focus_obj:   uintptr, // obj currently being monitored (0 = none / just changed)
-  auto_best_dist:   f32, // closest player->target distance seen this approach
-  auto_progress_at: i64, // time.now()._nsec of the last real progress (start of the STUCK_NS window)
   auto_blocked:     [dynamic]TC_Recent, // mobs flagged unreachable; skipped by the picker for BLOCKED_NS
   auto_stuck_on:    bool, // stuck-detection enabled (default on; 'stuck off' disables, e.g. for ranged)
   auto_avoid_dir:   [2]f32, // horizontal (x,z) player->last-stuck-mob delta; one-shot steer-away hint
@@ -54,9 +51,6 @@ Session :: struct {
   // layout.combat_grace seconds after the last HP drop they resume, so a mob we genuinely can't hit
   // (blocked, out of reach) is still skipped. Needs hp_off (pinned by `setup`); inert without it.
   combat_watch_on:  bool,    // cfg-mirrored ('combatwatch off' to get the old drop-on-plateau behavior)
-  auto_hp_obj:      uintptr, // mob the HP anchor belongs to (0 = none / just changed)
-  auto_hp_last:     i64,     // last HP seen for it (a RISE re-anchors: regen / heal, never damage)
-  auto_hp_drop_at:  i64,     // time.now()._nsec of its last observed HP drop (0 = none yet this target)
 
   // Proactive reach gate (see cand_reachable / tc_select). When on, auto skips candidate mobs whose
   // straight approach is blocked by terrain OR a placed-object OBB (the reach oracle) BEFORE selecting -
@@ -78,6 +72,17 @@ Session :: struct {
   // Mutated only under exec_mutex (REPL/radar) and read only under it (watcher picker) - no extra lock.
   fence:            Fence,
 
+  // Waypoint sets (see waypoints.odin / cli_waypoints). ONE active ordered route plus many saved by
+  // name, exactly the fence arrangement. Order is array position - there is no index field - so a
+  // delete closes its own gap. Authored by the radar's flag editor (mode W) or the 'waypoints' text
+  // commands; serialized to waypoints/*.waypoints, and importable into a chart as walk_to nodes.
+  // Mutated only under exec_mutex (REPL/radar); nothing on the watcher side reads it at all.
+  waypoint_set:     Waypoint_Set,
+  // Whole-set undo snapshots, like the chart editor's (gui_nodes.odin), NOT the fence's pop-the-last:
+  // this editor renames and reorders in place, and there is no popping a rename.
+  waypoint_undo:    [dynamic]Waypoint_Set,
+  waypoint_redo:    [dynamic]Waypoint_Set,
+
   // Bow-range retarget anchor (see tc_select). While a shootable mob is in bow range, the auto picker
   // ranks by nearest-to-the-last-kill's-spot instead of nearest-to-you, so a ranger stays on the pack.
   auto_sel_pos:     [3]f32, // world pos of the current auto target when it was selected (pending anchor)
@@ -94,10 +99,6 @@ Session :: struct {
   cluster_committed:  bool,
   cluster_origin_pos: [3]f32,
 
-  // Pause (see pause_tick / cli_pause). auto_paused holds a running auto without advancing; killing the
-  // watched mob resumes it. 'auto' starts paused (armed), so the first kill kicks off farming.
-  auto_paused:      bool,
-  pause_obj:        uintptr, // mob watched for a kill while paused (0 = none)
   pause_key_prev:   bool, // F10 edge-detection state for the default auto-toggle binding (see module_tick)
 
   // Last-used auto target spec, for the F10 full toggle (see module_tick / auto_rearm_command). Set on
@@ -107,15 +108,9 @@ Session :: struct {
 
   // Background candidate-collect job (see tc_scan_request / tc_scan_worker in target.odin). The
   // expensive enumeration (full region walk + parallel value scan) runs on a one-shot worker thread
-  // WITHOUT exec_mutex; only the publish takes the lock. auto_tick consumes res_* on a later tick, so
-  // the watcher never blocks the radar's frame pump on a kill (the kill-tick stutter fix).
+  // WITHOUT exec_mutex; only the publish takes the lock. The scan_mobs block consumes res_* on a later
+  // tick, so the watcher never blocks the radar's frame pump on a kill (the kill-tick stutter fix).
   scan_job: Scan_Job,
-
-  // Reach re-watch while a target is locked (see auto_reach_watch). Probes the straight approach every
-  // REACH_RECHECK_NS; consecutive blocked probes (debounce) skip the mob like a stuck-skip.
-  auto_reach_obj:        uintptr, // focus the current debounce window belongs to (0 = none)
-  auto_reach_next_check: i64, // nsec of the next scheduled reach probe
-  auto_reach_fail_count: int, // consecutive blocked probes so far
 
   // Async setup progress (see cli_setup / setup_step_mark). setup_running guards re-entry (one run at
   // a time, REPL or panel); setup_step (1..9, 0 = idle) feeds the radar panel's live step counter.
@@ -173,36 +168,14 @@ Session :: struct {
   // is the focus obj the cache was computed against. The cached pick is re-validated at commit time
   // (focus_set_obj); if it went stale, auto falls back to the reactive tc_select scan. Default on.
   preselect_on:     bool,
-  auto_next_obj:    uintptr, // the precomputed next target (0 / auto_next_set=false = none cached)
-  auto_next_pos:    [3]f32, // its world pos (seeds the kill-anchor bookkeeping on commit)
-  auto_next_set:    bool,
-  auto_next_for:    uintptr, // the focused obj this cache is for (re-arm the precompute when focus changes)
-  auto_next_stage:  TC_Stage, // which cascade stage produced the cached pick (drives cluster_advance on commit)
-  auto_next_pack:   int, // the cached pick's local pack size (drives cluster_advance on commit)
-  auto_next_anchor: [3]f32, // the stand-point the cache was measured from (re-arm if the fight drags away)
 
-  // Look-alive mode (see cli_lookalive + the lookalive_* hooks in auto_tick). Opt-in human-like farming
-  // for low-spawn quest grinds: a randomized hesitation before engaging each new target (delayed lock-on,
-  // which also holds the pre-select fast-commit) and occasional jumps while travelling to a far target.
-  // Deliberately less efficient than the snappy loop, so default OFF. Jumps reuse the 'findmove' primitive
-  // and are skipped when char-control isn't configured. RNG = core:math/rand (see lookalive_rand_ns).
+  // Look-alive mode (see cli_lookalive). Opt-in human-like farming for low-spawn quest grinds. It is
+  // pure CHART SHAPE now: with it on, auto_cfg_from_session emits a wait_random (the hesitation), a
+  // chance branch and an approach node, so the "human" behaviour is nodes you can see and delete rather
+  // than hooks inside a tick. Deliberately less efficient than the snappy loop, so default OFF. The walk
+  // and jump need 'findmove' (moveto_configured). RNG = core:math/rand (see lookalive_rand_ns).
   lookalive_on:         bool,
-  lookalive_hold_until: i64, // nsec deadline for the post-kill hesitation (0 = no active hold)
   lookalive_jump_at:    i64, // nsec of the next scheduled travel-jump attempt (0 = (re)seed on next tick)
-
-  // Look-alive "approach" (walk-first) state machine (see lookalive_begin_approach / lookalive_approach_tick
-  // in autofarm.odin). While active, auto has picked the next mob but NOT locked it: instead it walks the
-  // character to waypoints via moveto and only locks (auto_commit_pick) once it arrives / is close enough.
-  // Both the single intermediate-step (la_step_on) and the multi-hop max-range approach (la_maxrange_on) use
-  // this one state. All reset in auto_stop; needs 'findmove' (moveto_configured), else it's never entered.
-  la_approach_on:          bool,    // an approach is in progress (short-circuits the rest of auto_tick)
-  la_approach_obj:         uintptr, // the pending (not-yet-locked) target we're walking toward
-  la_approach_wp:          [3]f32,  // the current waypoint we're walking to
-  la_approach_multi:       bool,    // max-range multi-hop (true) vs single intermediate step (false)
-  la_approach_stage:       TC_Stage, // cascade stage of the pending pick (feeds cluster_advance on lock)
-  la_approach_pack:        int,     // its local pack size (feeds cluster_advance on lock)
-  la_approach_best:        f32,     // closest player->waypoint distance seen (progress watchdog)
-  la_approach_progress_at: i64,     // nsec of the last real progress toward the waypoint (stuck timeout)
 
   // Sweep mode (see sweep.odin / cli_sweep): a painted lane the character clears circle-by-circle. While
   // sweep_on, the picker short-circuits to "nearest mob already inside attack_range" (tc_pick_one) so
@@ -225,13 +198,12 @@ Session :: struct {
   sweep_nodes_total: int, // node count at arm time (the progress readout's denominator)
 
   // Hunt mode (cli_hunt, cfg mirror layout.hunt_on): commit to ONE target and never drop it for being
-  // far/unreachable. Suppresses the reach-watch/stuck-plateau drops and relaxes the selection reach-gate;
-  // when the path stalls it side-steps (unlock -> moveto a perpendicular waypoint via the la_approach
-  // machinery -> re-lock on arrival) instead of blacklisting. hunt_side_flip alternates the step side so
-  // repeated stalls sweep both ways around an obstacle; hunt_sidestep_count paces the flip. Reset in auto_stop.
+  // far/unreachable. As a chart this is one EDGE - hold_target's fail edge goes back to approach instead
+  // of to skip_target (see bh_hunt) - plus `sidestep` on the approach, which walks around a jam rather
+  // than abandoning the mob. It also relaxes the selection reach-gate (script_pick_ctx). hunt_side_flip
+  // alternates the step side so repeated stalls sweep both ways around an obstacle.
   hunt_on:             bool,
   hunt_side_flip:      bool, // which side the next side-step offsets to (flips every HUNT_SIDESTEP_FLIP stalls)
-  hunt_sidestep_count: int,  // consecutive side-steps on the current target (paces hunt_side_flip)
 
   // Behaviour machine (see behaviour.odin): the declared state machine that will eventually own
   // routing and replace auto's implicit flag-precedence chain. bh_state is the durable, printable
@@ -264,11 +236,22 @@ Session :: struct {
   // happens in Odin (builder.odin) or in the editor, and a saved behaviour is a file (behaviour_io.odin).
   script: Script_Run,
 
+  // What the run just did, as a ring (see Script_Trace in script.odin). Session-scoped rather than
+  // run-scoped on purpose: the run is freed the moment it ends, and "why did it stop" is asked after.
+  // Pure observation - nothing reads it back to make a decision - so it is never reset on attach.
+  script_trace: Script_Trace,
+
+  // Keys the tool is currently HOLDING DOWN, indexed by virtual-key code (see keys.odin). Only
+  // key_down/`key hold` put anything in here: a plain press is a down/up pair inside one step, but a
+  // HELD key deliberately outlives the step that pressed it, so this is the record that lets every
+  // teardown path (run end, detach) let go of it again.
+  keys_held:     [KEY_VK_COUNT]bool,
+
   // Global interrupts, RUNTIME half - derived from layout.interrupts (the persisted enabled-set) by
-  // irq_reload, which is the only thing that writes it. Holds each one's trigger and its edge latch;
+  // armed_watcher_reload, which is the only thing that writes it. Holds each one's trigger and its edge latch;
   // the latch is why this cannot just be re-derived per tick. Freed in on_close.
-  irq:    [FLYFF_MAX_INTERRUPTS]Global_Irq,
-  irq_n:  int,
+  armed_watchers: [FLYFF_MAX_ARMED_WATCHERS]Armed_Watcher,
+  armed_watcher_count:  int,
 
   // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
@@ -278,6 +261,25 @@ Session :: struct {
   // also fires the client's own SendSetTarget(objid, 2) so the server's m_idSetTarget matches
   // what we attack - the anti-DC fix. Defaults ON on attach (inert until configured); cleared on
   // detach/close and re-enabled on the next attach. 'srvsync off' disables it for the session.
+  // `bgkeys` (see cli_bgkeys / active_flag_tick in move.odin): hold the client's m_bActiveNeuz TRUE so its
+  // own input pass keeps running while the window is in the background, which is what makes key_down W/A/S/D
+  // actually move and TURN. Session-scoped rather than persisted-on by default: it is a continuous write
+  // into the game, so it starts off and you turn it on deliberately.
+  bgkeys_on:     bool,
+  // findactive's differential narrowing set. Survives between invocations because the derivation IS two or
+  // three passes with a focus change in between - see the note atop cli_findactive.
+  // Dynamic, NOT a fixed array: the first cut capped this at 8192 and the seed hit the cap exactly, which
+  // silently truncated the candidate set - so the flag might not have been in it at all and a unique
+  // survivor was partly luck. Freed in on_close.
+  active_cands:      [dynamic]uintptr,
+  active_cand_count: int,
+  active_scan_on:    bool,
+  active_saw_fg:     int, // foreground samples taken; BOTH counts must be >0 before pinning
+  active_saw_bg:     int,
+  active_confirming:    bool, // one survivor left, now proving itself across ACTIVE_CONFIRM_FLIPS transitions
+  active_confirm_flips: int,
+  active_confirm_last:  bool, // the focus state of the previous sample, to count transitions not samples
+
   srvsync_on:    bool,
   srv_shim:      uintptr, // cached RWX shim page in the target (remote_send_settarget); 0 = none
 
@@ -357,6 +359,13 @@ session_init :: proc(session: ^Session) -> bool {
   // decorative filter (collscan) delivers most of the benefit safely. Opt in per session with 'meshreach on'.
   session.mesh_reach_on = false
   session.layout = flyff_layout_default()
+  // flyff.cfg at STARTUP, not only on attach. The file holds two kinds of thing under one roof: memory
+  // offsets, which genuinely belong to a process, and tool preferences (ui_scale, sfx, trail, the
+  // leaderboard URL, attack_range) which do not. Loading only on attach meant a detached session ran on
+  // built-in defaults for both - so the offline chart editor opened at ui_scale 1.0 whatever you had
+  // set, and any flyff_save_cfg reached while detached wrote those defaults straight over your file.
+  // on_attach still re-reads it fresh over defaults per process; this is the floor under that.
+  flyff_load_cfg(&session.layout, flyff_cfg_path()) // absent file = built-in defaults, and that is fine
   flyff_register(session)
   return true
 }

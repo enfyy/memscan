@@ -116,34 +116,6 @@ TC_Stage :: enum {
   Excluded,
 }
 
-// Human name for a ladder rung, shared by `priority`, the `auto` status line and the tdbg legend so the
-// three can't drift. Matches the numbering tc_pick_one actually runs in (which is NOT the enum order).
-tc_stage_name :: proc(s: TC_Stage) -> string {
-  switch s {
-  case .Aggro:
-    return "aggro"
-  case .Melee:
-    return "melee"
-  case .Avoid:
-    return "avoid"
-  case .Pocket:
-    return "pocket"
-  case .Cluster:
-    return "cluster"
-  case .Density:
-    return "density"
-  case .Nearest:
-    return "nearest"
-  case .Sweep:
-    return "sweep"
-  case .Excluded:
-    return "excluded"
-  case .None:
-    return "none"
-  }
-  return "none"
-}
-
 // Everything the pick cascade reads, snapshotted so a pick never touches live session state mid-run.
 // The live picker (tc_select) builds one from the session and applies the result back; the debug
 // predictor (tc_predict_order) builds one and then mutates a LOCAL copy across simulated kills. Ranges
@@ -193,7 +165,13 @@ tc_cand_skip :: proc(session: ^Session, ctx: Pick_Ctx, cands: []TC_Cand, i: int,
   if recent_list_contains(ctx.blocked, c.obj, ctx.now, BLOCKED_NS) {
     return true
   }
-  if ctx.gate && !cand_reachable(session, ctx.world, ctx.player_pos, c.pos) {
+  // Reach is tested from live_player, NOT player_pos. player_pos is where the batch was MEASURED -
+  // for a pre-selected batch that is the spot you killed the last mob at, which can be a long way from
+  // where you now stand. Ranking from the measurement anchor is right (it is what the batch describes);
+  // GATING from it asks "could I have walked there from over there", which is not the question, and
+  // with preselect on it made the collision gate quietly consult the wrong origin on every pick.
+  // Every other gate in this file already measures from live_player - see the pocket/in-range note below.
+  if ctx.gate && !cand_reachable(session, ctx.world, ctx.live_player, c.pos) {
     return true
   }
   if ctx.fence_on && !fence_contains(session.fence, c.pos[0], c.pos[2]) {
@@ -205,12 +183,247 @@ tc_cand_skip :: proc(session: ^Session, ctx: Pick_Ctx, cands: []TC_Cand, i: int,
   return false
 }
 
+// ===========================================================================
+// PRIORITY LADDER RUNGS
+//
+// One proc per rung. Each is pure (reads ctx + game memory, mutates neither session nor ctx), takes
+// the same arguments, and returns the same shape as tc_pick_one itself: the index into cands of its
+// pick and the stage that chose it, or (-1, .None) when it has nothing to say. tc_pick_one below is
+// exactly the ordered composition of them, so the live picker and the debug predictor
+// (tc_predict_order) still run identical logic.
+//
+// WHY THEY ARE SEPARATE PROCS: a behaviour chart wires the ladder as nodes, and a `pick_aggro` block
+// is a wrapper around rung_aggro. Sharing the proc is what stops a node and the built-in ladder from
+// drifting apart - the same reason tc_pick_one was factored out of tc_select in the first place.
+//
+// The ENABLE checks (ctx.aggro_on, ctx.melee_on, ctx.density_on, ...) deliberately stay in
+// tc_pick_one rather than moving into the rungs: in a chart the node's PRESENCE is the enable, so a
+// rung called directly must just run. Preconditions that are logic rather than configuration - is
+// there a cluster commitment, is the density array sized - stay inside their rung.
+//
+// Cands MUST be sorted nearest-first (tc_collect_cands does this); the melee / pocket / density
+// range breaks rely on it.
+// ===========================================================================
+
+Rung_Fn :: #type proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage)
+
+// SWEEP: the painted lane owns the route, so selection may never propose a walk. Only mobs already
+// inside attack_range of where we STAND are eligible; nearest wins.
+//   Shaped like the pocket rung below, but ranked nearest-to-PLAYER rather than nearest-to-last-kill:
+// pack stickiness is meaningless when the route is fixed. tc_cand_skip still runs, so the reach gate,
+// the geo-fence, the just-killed cooldown and the stuck blacklist all still apply inside the circle.
+// Its caller SHORT-CIRCUITS the rest of the ladder rather than falling through - see tc_pick_one.
+rung_sweep :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage) {
+  best := -1
+  best_d := f32(1e30)
+  for c, i in cands {
+    pd := engine.dist_horizontal(c.pos, ctx.live_player)
+    if pd > ctx.engage {
+      continue // outside the circle we are standing in - taking it would mean walking off the lane
+    }
+    if tc_cand_skip(session, ctx, cands, i, alive) {
+      continue
+    }
+    if pd < best_d {
+      best_d = pd
+      best = i
+    }
+  }
+  if best >= 0 {
+    return best, .Sweep
+  }
+  return -1, .None
+}
+
+// Rung 1 - AGGRO: something is already committed to attacking us, so it will reach us and chip at us
+// whatever else we pick. Killing it first is strictly better than kiting it around the field while we
+// farm something else. Deliberately unbounded by distance (the user's call): a mob that aggroed from
+// across the room still outranks a mob at our feet, because it is coming either way. Ranked nearest
+// first (cands are sorted), so a pack of adds is eaten closest-out. Inert when the aggro flag can't be
+// computed - see TC_Cand.aggro - which makes this rung fail-safe: no reads, no picks, ladder unchanged.
+rung_aggro :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage) {
+  for c, i in cands {
+    if !c.aggro {
+      continue
+    }
+    if tc_cand_skip(session, ctx, cands, i, alive) {
+      continue
+    }
+    return i, .Aggro
+  }
+  return -1, .None
+}
+
+// Rung 2 - MELEE: a mob within melee_range is on top of us and immediately killable, so it wins before
+// any anchor heuristic gets to reason about packs.
+//   This used to be gated on ctx.name_filtered, i.e. it was SWITCHED OFF in any-monster mode ('auto'
+// with no names) on the theory that something is always in melee range there and the pick would
+// ping-pong. That reasoning was wrong in an important way: the rung below (pocket) ranks by distance to
+// the LAST KILL, not to the player, so with this rung off a mob 15 units away can outrank the one
+// hitting you in the face - which is exactly the "melee targets are ignored" bug. Ping-pong is already
+// prevented by the recent-pick cooldown (TC_RECENT_NS) and by melee_range being a tight radius.
+// Switchable now (`priority melee off`) instead of being implied by whether you typed a mob name.
+rung_melee :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage) {
+  for c, i in cands {
+    if c.d > ctx.melee {
+      break // sorted by distance - nothing further is in melee range
+    }
+    if tc_cand_skip(session, ctx, cands, i, alive) {
+      continue
+    }
+    return i, .Melee
+  }
+  return -1, .None
+}
+
+// Rung 3 - AVOID: right after a stuck-skip, prefer the nearest eligible mob on the OPPOSITE side of us
+// from the one we jammed on (dot(player->cand, avoid_dir) < 0), so we walk away from the wall instead
+// of back into it.
+rung_avoid :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage) {
+  for c, i in cands {
+    if !cand_is_opposite(ctx.player_pos, c.pos, ctx.avoid_dir) {
+      continue // cheap direction test first; only reach-check opposite-side candidates
+    }
+    if tc_cand_skip(session, ctx, cands, i, alive) {
+      continue
+    }
+    return i, .Avoid
+  }
+  return -1, .None
+}
+// Rung 4 - POCKET. In-range priority ("stay on the pack, but never leave my reach"): among the mobs within attack_range
+// of where the PLAYER actually stands, take the one NEAREST THE LAST-KILL spot (pack stickiness). Above
+// the cluster stage: whatever is in range dies first, and we only leave the player's range when nothing
+// eligible is inside it.
+//   The GATE is the fix - it measures from ctx.live_player (the true player position), NOT the rolling
+// last-kill anchor. The old gate used c.d (anchor-relative; in pre-select the anchor is the kill spot,
+// up to attack_range away), so it counted mobs up to ~2x attack_range from the player as "in range" and
+// marched the target off along the pack (targets at 16, 23, 33, 45+ units while the mob next to you was
+// ignored). The RANKING stays nearest-to-last-kill so pack behaviour is unchanged; before the first kill
+// (no anchor) it falls back to nearest-to-player. c.d is anchor-relative, so the gate can't break early.
+rung_pocket :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage) {
+  best := -1
+  best_rank := f32(1e30)
+  for c, i in cands {
+    pd := engine.dist_horizontal(c.pos, ctx.live_player)
+    if pd > ctx.engage {
+      continue // not within attack_range of the player - can't hit it where we stand
+    }
+    if tc_cand_skip(session, ctx, cands, i, alive) {
+      continue
+    }
+    rank := ctx.last_kill_set ? engine.dist_horizontal(c.pos, ctx.last_kill_pos) : pd
+    if rank < best_rank {
+      best_rank = rank
+      best = i
+    }
+  }
+  if best >= 0 {
+    return best, .Pocket
+  }
+  return -1, .None
+}
+
+// Rung 5 - CLUSTER commitment: a previous pick locked onto a pack (see cluster_advance), so KEEP eating
+// it - the eligible mob nearest the rolling anchor (last_kill_pos) that is still inside the pack radius
+// AND within the leash of where the commitment started. Only reached when NOTHING eligible is in engage
+// range (the pocket rung above owns that case), so this decides where to WALK next, never drags us off
+// an in-range mob. Other packs are not scored at all while members remain; that hysteresis is what stops
+// two similar packs from flipping the pick every kill. Reports nothing when the committed pack has no
+// eligible member left (wiped or all blocked), landing in the density/nearest rungs for a fresh pick.
+//   The commitment test is a precondition, not a switch, so it lives here rather than at the call site.
+rung_cluster :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage) {
+  if !ctx.cluster_committed || !ctx.last_kill_set {
+    return -1, .None
+  }
+  cr := density_radius(ctx.engage)
+  leash := cr * CLUSTER_LEASH_MULT
+  best := -1
+  best_ad := f32(1e30)
+  for c, i in cands {
+    ad := engine.dist_horizontal(c.pos, ctx.last_kill_pos)
+    if ad > cr {
+      continue // not part of the committed pack
+    }
+    if engine.dist_horizontal(c.pos, ctx.cluster_origin_pos) > leash {
+      continue // beyond the leash - don't let a spawn line chain-drag the commitment across the map
+    }
+    if tc_cand_skip(session, ctx, cands, i, alive) {
+      continue // cheap distance gates above run first; reach checks only on real pack members
+    }
+    if ad < best_ad {
+      best_ad = ad
+      best = i
+    }
+  }
+  if best >= 0 {
+    return best, .Cluster
+  }
+  return -1, .None
+}
+
+// Rung 6 - switch-threshold DENSITY: nothing eligible is in engage range and no committed pack has
+// members left, so we're choosing WHICH mob to walk to next. Default is the plain nearest eligible mob;
+// a denser alternative steals the pick ONLY when it clears BOTH gates - at least min_gain more pack
+// members AND at most max_detour extra walk distance. A hard double gate instead of the old continuous
+// score, so two similarly-sized packs can never flip the pick on a marginal difference. Returns .Nearest
+// when the winner IS the nearest (no detour taken), so tdbg's stage column only says "density" when the
+// gate actually changed the pick.
+//   The density array being sized to cands is a precondition, not a switch - without it there is nothing
+// to rank, so the rung reports nothing and the caller falls through to plain nearest.
+rung_density :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage) {
+  if len(ctx.density) != len(cands) {
+    return -1, .None
+  }
+  nearest := -1
+  for _, i in cands {
+    if !tc_cand_skip(session, ctx, cands, i, alive) {
+      nearest = i
+      break // sorted nearest-first
+    }
+  }
+  if nearest < 0 {
+    return -1, .None
+  }
+  best := nearest
+  best_pack := ctx.density[nearest]
+  for c, i in cands {
+    if c.d > cands[nearest].d + ctx.max_detour {
+      break // sorted by distance - nothing further can clear the detour gate
+    }
+    if i == nearest {
+      continue
+    }
+    // Must clear the gain gate vs the NEAREST pick, and strictly beat the current winner's pack
+    // (ties keep the nearer candidate, since we iterate nearest-first). Cheap gates run before the
+    // reach/fence skip test so only real contenders pay for it.
+    if ctx.density[i] < ctx.density[nearest] + ctx.min_gain || ctx.density[i] <= best_pack {
+      continue
+    }
+    if tc_cand_skip(session, ctx, cands, i, alive) {
+      continue
+    }
+    best = i
+    best_pack = ctx.density[i]
+  }
+  return best, best == nearest ? .Nearest : .Density
+}
+
+// Rung 7 - NEAREST: the always-on fallback, the nearest eligible mob.
+rung_nearest :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage) {
+  for _, i in cands {
+    if !tc_cand_skip(session, ctx, cands, i, alive) {
+      return i, .Nearest
+    }
+  }
+  return -1, .None
+}
+
 // The target-selection cascade, factored out of tc_select so the live picker AND the debug predictor
 // run the SAME logic (no drift). Returns the index into cands of the pick and which stage chose it, or
 // (-1, .None) when nothing is eligible. Pure: reads ctx + game memory, mutates neither session nor ctx.
-// Cands MUST be sorted nearest-first (tc_collect_cands does this) - the melee/pocket range breaks rely
-// on it. The PRIORITY LADDER, in the order it actually runs (each rung fully answers the pick; only if
-// it finds nothing does the next get a say):
+// The PRIORITY LADDER, in the order it actually runs (each rung fully answers the pick; only if it
+// finds nothing does the next get a say):
 //   1 aggro   - a mob that is coming for US (ctx.aggro_on)
 //   2 melee   - a mob on top of us, within ctx.melee (ctx.melee_on)
 //   3 avoid   - one-shot post-stuck steer to the opposite side (part of stuck recovery)
@@ -221,197 +434,44 @@ tc_cand_skip :: proc(session: ^Session, ctx: Pick_Ctx, cands: []TC_Cand, i: int,
 // With density off rungs 5+6 are dead code. Rungs 1/2/4 are user-switchable (`priority`); turning all
 // three off leaves avoid+nearest, i.e. "always take the closest eligible mob".
 //   SWEEP mode replaces the whole ladder while a painted lane is armed - see the short-circuit below.
+// Every rung body lives in its own rung_* proc above; this proc is only their order and their enables.
 tc_pick_one :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: []bool) -> (idx: int, stage: TC_Stage) {
-  // SWEEP: the painted lane owns the route, so selection may never propose a walk. Only mobs already
-  // inside attack_range of where we STAND are eligible; nearest wins. Deliberately RETURNS instead of
-  // falling through - rungs 1 (aggro) and 7 (nearest) are distance-unbounded by design and would pull the
-  // character off the lane, which is the one thing sweep mode exists to prevent.
-  //   Shaped like the pocket rung below, but ranked nearest-to-PLAYER rather than nearest-to-last-kill:
-  // pack stickiness is meaningless when the route is fixed. tc_cand_skip still runs, so the reach gate,
-  // the geo-fence, the just-killed cooldown and the stuck blacklist all still apply inside the circle.
-  // Auto only (require_fresh) - an explicit `tc` / `target_at` is the user overriding the route by hand.
+  // SWEEP short-circuits the WHOLE ladder rather than falling through: rungs 1 (aggro) and 7 (nearest)
+  // are distance-unbounded by design and would pull the character off the lane, which is the one thing
+  // sweep mode exists to prevent. Auto only (require_fresh) - an explicit `tc` / `target_at` is the user
+  // overriding the route by hand.
   if ctx.require_fresh && ctx.sweep_on {
-    best := -1
-    best_d := f32(1e30)
-    for c, i in cands {
-      pd := engine.dist_horizontal(c.pos, ctx.live_player)
-      if pd > ctx.engage {
-        continue // outside the circle we are standing in - taking it would mean walking off the lane
-      }
-      if tc_cand_skip(session, ctx, cands, i, alive) {
-        continue
-      }
-      if pd < best_d {
-        best_d = pd
-        best = i
-      }
-    }
-    if best >= 0 {
-      return best, .Sweep
-    }
-    return -1, .None
+    return rung_sweep(session, cands, ctx, alive)
   }
-  // Rung 1 - AGGRO: something is already committed to attacking us, so it will reach us and chip at us
-  // whatever else we pick. Killing it first is strictly better than kiting it around the field while we
-  // farm something else. Deliberately unbounded by distance (the user's call): a mob that aggroed from
-  // across the room still outranks a mob at our feet, because it is coming either way. Ranked nearest
-  // first (cands are sorted), so a pack of adds is eaten closest-out. Inert when the aggro flag can't be
-  // computed - see TC_Cand.aggro - which makes this rung fail-safe: no reads, no picks, ladder unchanged.
   if ctx.require_fresh && ctx.aggro_on {
-    for c, i in cands {
-      if !c.aggro {
-        continue
-      }
-      if tc_cand_skip(session, ctx, cands, i, alive) {
-        continue
-      }
-      return i, .Aggro
+    if i, st := rung_aggro(session, cands, ctx, alive); i >= 0 {
+      return i, st
     }
   }
-  // Rung 2 - MELEE: a mob within melee_range is on top of us and immediately killable, so it wins before
-  // any anchor heuristic gets to reason about packs.
-  //   This used to be gated on ctx.name_filtered, i.e. it was SWITCHED OFF in any-monster mode ('auto'
-  // with no names) on the theory that something is always in melee range there and the pick would
-  // ping-pong. That reasoning was wrong in an important way: the rung below (pocket) ranks by distance to
-  // the LAST KILL, not to the player, so with this rung off a mob 15 units away can outrank the one
-  // hitting you in the face - which is exactly the "melee targets are ignored" bug. Ping-pong is already
-  // prevented by the recent-pick cooldown (TC_RECENT_NS) and by melee_range being a tight radius.
-  // Switchable now (`priority melee off`) instead of being implied by whether you typed a mob name.
   if ctx.require_fresh && ctx.melee_on {
-    for c, i in cands {
-      if c.d > ctx.melee {
-        break // sorted by distance - nothing further is in melee range
-      }
-      if tc_cand_skip(session, ctx, cands, i, alive) {
-        continue
-      }
-      return i, .Melee
+    if i, st := rung_melee(session, cands, ctx, alive); i >= 0 {
+      return i, st
     }
   }
-  // Right after a stuck-skip, prefer the nearest eligible mob on the OPPOSITE side of us from the one we
-  // jammed on (dot(player->cand, avoid_dir) < 0), so we walk away from the wall instead of back into it.
   if ctx.require_fresh && ctx.avoid_on {
-    for c, i in cands {
-      if !cand_is_opposite(ctx.player_pos, c.pos, ctx.avoid_dir) {
-        continue // cheap direction test first; only reach-check opposite-side candidates
-      }
-      if tc_cand_skip(session, ctx, cands, i, alive) {
-        continue
-      }
-      return i, .Avoid
+    if i, st := rung_avoid(session, cands, ctx, alive); i >= 0 {
+      return i, st
     }
   }
-  // Rung 4 - POCKET. In-range priority ("stay on the pack, but never leave my reach"): among the mobs within attack_range
-  // of where the PLAYER actually stands, take the one NEAREST THE LAST-KILL spot (pack stickiness). Above
-  // the cluster stage: whatever is in range dies first, and we only leave the player's range when nothing
-  // eligible is inside it.
-  //   The GATE is the fix - it measures from ctx.live_player (the true player position), NOT the rolling
-  // last-kill anchor. The old gate used c.d (anchor-relative; in pre-select the anchor is the kill spot,
-  // up to attack_range away), so it counted mobs up to ~2x attack_range from the player as "in range" and
-  // marched the target off along the pack (targets at 16, 23, 33, 45+ units while the mob next to you was
-  // ignored). The RANKING stays nearest-to-last-kill so pack behaviour is unchanged; before the first kill
-  // (no anchor) it falls back to nearest-to-player. c.d is anchor-relative, so the gate can't break early.
   if ctx.require_fresh && ctx.pocket_on {
-    best := -1
-    best_rank := f32(1e30)
-    for c, i in cands {
-      pd := engine.dist_horizontal(c.pos, ctx.live_player)
-      if pd > ctx.engage {
-        continue // not within attack_range of the player - can't hit it where we stand
-      }
-      if tc_cand_skip(session, ctx, cands, i, alive) {
-        continue
-      }
-      rank := ctx.last_kill_set ? engine.dist_horizontal(c.pos, ctx.last_kill_pos) : pd
-      if rank < best_rank {
-        best_rank = rank
-        best = i
-      }
-    }
-    if best >= 0 {
-      return best, .Pocket
+    if i, st := rung_pocket(session, cands, ctx, alive); i >= 0 {
+      return i, st
     }
   }
-  // Cluster commitment (density feature, auto only): a previous pick locked onto a pack (see
-  // cluster_advance), so KEEP eating it - the eligible mob nearest the rolling anchor (last_kill_pos)
-  // that is still inside the pack radius AND within the leash of where the commitment started. Only
-  // reached when NOTHING eligible is in engage range (the pocket stage above owns that case), so this
-  // decides where to WALK next, never drags us off an in-range mob. Other packs are not scored at all
-  // while members remain; that hysteresis is what stops two similar packs from flipping the pick every
-  // kill. Falls through when the committed pack has no eligible member left (wiped or all blocked),
-  // landing in the density/nearest stages below for a fresh pick.
-  if ctx.require_fresh && ctx.density_on && ctx.cluster_committed && ctx.last_kill_set {
-    cr := density_radius(ctx.engage)
-    leash := cr * CLUSTER_LEASH_MULT
-    best := -1
-    best_ad := f32(1e30)
-    for c, i in cands {
-      ad := engine.dist_horizontal(c.pos, ctx.last_kill_pos)
-      if ad > cr {
-        continue // not part of the committed pack
-      }
-      if engine.dist_horizontal(c.pos, ctx.cluster_origin_pos) > leash {
-        continue // beyond the leash - don't let a spawn line chain-drag the commitment across the map
-      }
-      if tc_cand_skip(session, ctx, cands, i, alive) {
-        continue // cheap distance gates above run first; reach checks only on real pack members
-      }
-      if ad < best_ad {
-        best_ad = ad
-        best = i
-      }
+  if ctx.require_fresh && ctx.density_on {
+    if i, st := rung_cluster(session, cands, ctx, alive); i >= 0 {
+      return i, st
     }
-    if best >= 0 {
-      return best, .Cluster
+    if i, st := rung_density(session, cands, ctx, alive); i >= 0 {
+      return i, st
     }
   }
-  // Switch-threshold density (density feature, auto only): nothing eligible is in engage range and no
-  // committed pack has members left, so we're choosing WHICH mob to walk to next. Default is the plain
-  // nearest eligible mob; a denser alternative steals the pick ONLY when it clears BOTH gates - at least
-  // min_gain more pack members AND at most max_detour extra walk distance. A hard double gate instead of
-  // the old continuous score, so two similarly-sized packs can never flip the pick on a marginal
-  // difference. Returns .Nearest when the winner IS the nearest (no detour taken), so tdbg's stage
-  // column only says "density" when the gate actually changed the pick.
-  if ctx.require_fresh && ctx.density_on && len(ctx.density) == len(cands) {
-    nearest := -1
-    for _, i in cands {
-      if !tc_cand_skip(session, ctx, cands, i, alive) {
-        nearest = i
-        break // sorted nearest-first
-      }
-    }
-    if nearest >= 0 {
-      best := nearest
-      best_pack := ctx.density[nearest]
-      for c, i in cands {
-        if c.d > cands[nearest].d + ctx.max_detour {
-          break // sorted by distance - nothing further can clear the detour gate
-        }
-        if i == nearest {
-          continue
-        }
-        // Must clear the gain gate vs the NEAREST pick, and strictly beat the current winner's pack
-        // (ties keep the nearer candidate, since we iterate nearest-first). Cheap gates run before the
-        // reach/fence skip test so only real contenders pay for it.
-        if ctx.density[i] < ctx.density[nearest] + ctx.min_gain || ctx.density[i] <= best_pack {
-          continue
-        }
-        if tc_cand_skip(session, ctx, cands, i, alive) {
-          continue
-        }
-        best = i
-        best_pack = ctx.density[i]
-      }
-      return best, best == nearest ? .Nearest : .Density
-    }
-  }
-  // Fallback: the nearest eligible mob.
-  for _, i in cands {
-    if !tc_cand_skip(session, ctx, cands, i, alive) {
-      return i, .Nearest
-    }
-  }
-  return -1, .None
+  return rung_nearest(session, cands, ctx, alive)
 }
 
 // True if <name> case-insensitively equals any entry in <names>. An empty <names> list is
@@ -716,9 +776,14 @@ density_radius :: proc(engage: f32) -> f32 {
 // Local PACK SIZE per candidate: how many candidates (including itself) lie within `r` horizontally.
 // Index-aligned to `cands`; O(n^2) over the candidate set (tens-to-~150) so sub-millisecond. Run once
 // per pick and carried in Pick_Ctx.density, so the live picker (tc_select) and the debug predictor
-// (tc_predict_order) score identically. A lone mob has pack size 1. Temp-allocated.
-compute_densities :: proc(cands: []TC_Cand, r: f32) -> []int {
-  out := make([]int, len(cands), context.temp_allocator)
+// (tc_predict_order) score identically. A lone mob has pack size 1.
+//
+// Temp-allocated BY DEFAULT, which is right for the callers that score and discard within one call.
+// A caller that PARKS the result - the chart's scan_mobs, whose batch has to survive until the rungs
+// run on a later tick - must pass context.allocator: behaviour_tick points temp at a scratch arena it
+// free_all's at the top of every tick, so a temp slice stored on the run is freed under it.
+compute_densities :: proc(cands: []TC_Cand, r: f32, allocator := context.temp_allocator) -> []int {
+  out := make([]int, len(cands), allocator)
   r2 := r * r
   for a, i in cands {
     c := 0
@@ -1270,72 +1335,6 @@ tc_scan_invalidate :: proc(session: ^Session) {
   session.scan_job.res_cands = nil
 }
 
-// One-shot: select the nearest selectable mover matching <name> by writing it into
-// m_pObjFocus. Repeated presses advance through the nearby mobs (the recently-targeted
-// cooldown skips a just-killed corpse). All anchors/offsets are baked Flyff constants, so
-// it needs no setup: `target_closest Mutant Yetti`. Multiple names are allowed, comma-separated
-// (quote names with spaces): `target_closest 'Mutant Yetti', 'Captain Mutant Yetti'`.
-cli_target_closest :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  names := parse_target_names(strings.join(args, " ", context.temp_allocator))
-  if len(names) == 0 {
-    fmt.eprintln("usage: target_closest <name>[, <name> ...]")
-    return
-  }
-  desc := auto_target_desc(names[:])
-
-  res, obj, d, sel, total := tc_select(session, names[:], false)
-  switch res {
-  case .Picked:
-    fmt.printfln("targeted %s #%d/%d obj=0x%X at d=%.1f.", desc, sel + 1, total, obj, d)
-  case .NoCandidates:
-    fmt.printfln("no %s found.", desc)
-  case .AnchorFail:
-    fmt.eprintln("could not read world/player anchors (wrong build or not in-game?).")
-  case .AllOnCooldown:
-    fmt.printfln("no fresh %s available.", desc) // unreachable with require_fresh=false
-  case .WentStale:
-    fmt.printfln("%s just died/despawned - try again.", desc)
-  case .WriteFail: // tc_select already printed the specific error
-  }
-}
-
-// target_at <addr> (alias tat) - select the EXACT object at <addr> (a raw CObj*), writing it into
-// m_pObjFocus with the same crash-guard + server-notify as `tc`. Unlike `target_closest` (name +
-// distance, which re-scans and could pick a different same-named mob), this pins the one object you
-// name - it's the headless-testable primitive behind the radar's click-to-target (grab a live CObj*
-// with `mobs`, then `target_at 0x..`). Refuses a freed / model-less / non-mover pointer (writing one
-// crashes the client's selection-render). <addr> is decimal or 0x-hex.
-cli_target_at :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  if len(args) < 1 {
-    fmt.eprintln("usage: target_at <addr>   (a live CObj* - e.g. an address from 'mobs')")
-    return
-  }
-  v, ok := engine.parse_addr(args[0])
-  if !ok {
-    fmt.eprintfln("bad address: %s", args[0])
-    return
-  }
-  obj := uintptr(v)
-  switch focus_set_obj(session, obj, nil) {
-  case .Picked:
-    fmt.printfln("targeted obj=0x%X.", obj)
-  case .WentStale:
-    fmt.printfln("obj 0x%X is not a live selectable mover (freed / model-less / wrong type) - not written.", obj)
-  case .AnchorFail:
-    fmt.eprintln("could not read world anchor (wrong build or not in-game?).")
-  case .WriteFail: // focus_set_obj already printed the specific error
-  case .NoCandidates, .AllOnCooldown: // not returned by focus_set_obj
-  }
-}
-
 AUTO_MIN_INTERVAL_NS :: i64(30_000_000) // ~300ms between advance attempts (caps idle rescans)
 
 // Stuck / obstacle detection tuning (see auto_monitor). While a target is focused we watch the
@@ -1345,6 +1344,12 @@ AUTO_MIN_INTERVAL_NS :: i64(30_000_000) // ~300ms between advance attempts (caps
 STUCK_NS :: i64(2_500_000_000) // ~2.5s of no progress while far -> blocked
 ARRIVE_DIST :: f32(3.0) // within this of the target = arrived / in melee; never flagged
 PROGRESS_EPS :: f32(0.5) // a distance drop >= this counts as making progress
+
+// The same idea one level up, for the `approach` block: how long it may fail to GAIN ON THE TARGET
+// before that counts as a chase it is losing. Deliberately longer than STUCK_NS - a mob that turns and
+// walks a few steps costs you ground for a moment without the approach being in any trouble, and a
+// hair-trigger here would drop a target every time it wandered.
+APPROACH_CHASE_NS :: i64(6_000_000_000)
 
 // Locked-target reach re-watch tuning (see auto_reach_watch). Complements the plateau monitor above:
 // it catches "target went unreachable AFTER selection" directly instead of waiting out the plateau.
@@ -1392,257 +1397,6 @@ pick_ranges :: proc(session: ^Session) -> (melee: f32, engage: f32) {
     melee = engage
   }
   return
-}
-
-// priority                    -> print the whole ladder: every rung, in the order tc_pick_one runs them,
-//                                with its enable state and tunable.
-// priority aggro on|off       -> rung 1: a mob coming for US outranks everything, at any distance
-// priority melee on|off       -> rung 2: a mob within melee_range outranks the pack-stickiness ranking
-// priority melee <range>      -> set that radius (world units) and enable the rung
-// priority pocket on|off      -> rung 4: in-attack_range, ranked nearest-to-last-kill (pack stickiness)
-// Rungs 5+6 (cluster/density) belong to `density on|off` and are only DISPLAYED here, so there is exactly
-// one command that owns each setting. Rung 3 (avoid) is part of stuck recovery, not separately switchable;
-// rung 7 (nearest) is the always-on fallback. All three toggles persist to flyff.cfg.
-cli_priority :: proc(session: ^Session, args: []string) {
-  usage :: "usage: priority [aggro|melee|pocket on|off]  |  priority melee <range>"
-  changed := false
-  if len(args) >= 1 {
-    rung := strings.to_lower(args[0])
-    if len(args) < 2 {
-      fmt.eprintln(usage)
-      return
-    }
-    val := strings.to_lower(args[1])
-    on := val == "on"
-    if val != "on" && val != "off" {
-      // 'priority melee 4.5' - a bare number sets the radius (and enables the rung).
-      if rung != "melee" {
-        fmt.eprintln(usage)
-        return
-      }
-      r, rok := strconv.parse_f64(args[1])
-      if !rok || r <= 0 {
-        fmt.eprintln("priority melee wants on|off or a radius > 0 in world units (e.g. 3).")
-        return
-      }
-      session.layout.melee_range = f32(r)
-      session.melee_first_on = true
-      changed = true
-    } else {
-      switch rung {
-      case "aggro":
-        session.aggro_first_on = on
-      case "melee":
-        session.melee_first_on = on
-      case "pocket":
-        session.pocket_on = on
-      case "cluster", "density":
-        fmt.eprintln("rungs 5-6 belong to the density feature - use 'density on|off' (see 'density').")
-        return
-      case "avoid":
-        fmt.eprintln("rung 3 (avoid) is part of stuck recovery - use 'stuck on|off'.")
-        return
-      case "nearest":
-        fmt.eprintln("rung 7 (nearest) is the fallback and can't be turned off - something has to be picked.")
-        return
-      case:
-        fmt.eprintln(usage)
-        return
-      }
-      changed = true
-    }
-  }
-  if changed {
-    // cfg mirrors (see on_attach); attach-gated save so defaults never clobber a calibrated cfg.
-    session.layout.aggro_first_on = session.aggro_first_on
-    session.layout.melee_first_on = session.melee_first_on
-    session.layout.pocket_on = session.pocket_on
-    if session.attached {
-      flyff_save_cfg(session.layout, flyff_cfg_path())
-    }
-  }
-  melee, engage := pick_ranges(session)
-  onoff :: proc(b: bool) -> string {return b ? "ON " : "off"}
-  fmt.println("target priority ladder - the first rung that finds an eligible mob wins:")
-  aggro_note := ""
-  if session.aggro_first_on && (session.layout.objid_off == 0 || session.layout.iddest_off == 0) {
-    aggro_note = "  [INERT: needs objid_off + iddest_off - run 'setup <name>']"
-  }
-  // pick_ranges clamps the melee radius to the engage range (never prefer a mob you can't actually hit
-  // from where you stand). Say so when it bites, or 'priority melee 4.5' looks like it did nothing.
-  cfg_melee := session.layout.melee_range > 0 ? session.layout.melee_range : MELEE_RANGE
-  melee_note := ""
-  if melee < cfg_melee {
-    melee_note = fmt.tprintf("  [clamped from %.1f to attack_range - 'set attack_range <n>' to your real reach]", cfg_melee)
-  }
-  fmt.printfln("  1. %s  attacking me   it is coming for ME, any distance    ('priority aggro on|off')%s", onoff(session.aggro_first_on), aggro_note)
-  fmt.printfln("  2. %s  melee range    within %.1f units of me%s", onoff(session.melee_first_on), melee, melee_note)
-  fmt.printfln("  3. %s  in range       within attack_range (%.1f), nearest my last kill - pack stickiness", onoff(session.pocket_on), engage)
-  if session.layout.density_on {
-    fmt.printfln("  4. ON   pack steering  commit to a pack; detour only past mingain %d / detour %.0f", session.layout.density_min_gain, session.layout.density_max_detour)
-  } else {
-    fmt.println("  4. off  pack steering  ('density on' to enable cluster commitment + denser-pack detours)")
-  }
-  fmt.println("  5. ON   nearest        the closest eligible mob (fallback, can't be turned off)")
-  fmt.printfln("  +      after a stuck-skip, one pick steers AWAY from the jam  (%s, 'stuck on|off')", session.auto_stuck_on ? "on" : "off")
-  if !session.aggro_first_on && !session.melee_first_on && !session.pocket_on && !session.layout.density_on {
-    fmt.println("  note: every optional rung is off - auto is in plain 'always take the closest mob' mode.")
-  }
-}
-
-// aggro -> read-only diagnostic: which nearby movers have US as their destination object, i.e. which ones
-// the server has told this client are chasing/attacking the player (ladder rung 1's input). Prints our own
-// OBJID and each mover's m_idDest so a mismatch is obvious. Use it to answer the one thing the game source
-// doesn't settle: whether m_idDest STAYS pointed at us once the mob arrives and starts swinging (it's set
-// on entering AI2_TRACKING). Stand still, let something attack you, run this - no writes, no injection.
-cli_aggro :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  radius := f32(60)
-  if len(args) >= 1 {
-    if v, ok := strconv.parse_f64(args[0]); ok && v > 0 {
-      radius = f32(v)
-    }
-  }
-  if session.layout.objid_off == 0 || session.layout.iddest_off == 0 {
-    fmt.eprintfln(
-      "aggro needs objid_off (%s) and iddest_off (%s) - run 'setup <name>' (findsettarget + findmove).",
-      session.layout.objid_off == 0 ? "MISSING" : "ok", session.layout.iddest_off == 0 ? "MISSING" : "ok",
-    )
-    return
-  }
-  me, meok := read_player_objid(session)
-  if !meok || me == 0 {
-    fmt.eprintln("could not read the player's own OBJID (wrong build, or not in-game?).")
-    return
-  }
-  world, player, ppos, aok := tc_resolve_anchors(session)
-  if !aok {
-    fmt.eprintln("could not read world/player anchors (not in-game?).")
-    return
-  }
-  cands := tc_collect_cands(session, nil, world, player, ppos)
-  fmt.printfln("my OBJID = %d (0x%X)   scanning %d movers within %.0f units:", me, me, len(cands), radius)
-  n_aggro := 0
-  shown := 0
-  for c in cands {
-    if c.d > radius {
-      break // sorted nearest-first
-    }
-    nm, _ := read_mover_name(session, c.obj)
-    dest: i64 = -1
-    if v, ok := engine.read_value(session.proc_info.handle, c.obj + uintptr(session.layout.iddest_off), .U32); ok {
-      dest = i64(u32(engine.value_as_u64(.U32, v)))
-    }
-    if c.aggro {
-      n_aggro += 1
-    }
-    fmt.printfln(
-      "  %-20s d=%6.1f  m_idDest=%-12s%s",
-      nm == "" ? "?" : nm, c.d,
-      dest < 0 ? "<unreadable>" : fmt.tprintf("%d", dest),
-      c.aggro ? "  <-- AGGRO (targeting me)" : "",
-    )
-    shown += 1
-    if shown >= 40 {
-      fmt.println("  ... (truncated at 40)")
-      break
-    }
-  }
-  fmt.printfln("%d of %d shown movers are targeting you.", n_aggro, shown)
-  if n_aggro == 0 {
-    fmt.println("none right now. if something IS hitting you and this says 0, m_idDest is cleared on arrival -")
-    fmt.println("ladder rung 2 (melee) still covers that case; see BACKLOG for the m_idTarget follow-up.")
-  }
-}
-
-// density                -> show the cluster-steering state
-// density on|off         -> master toggle. OFF (default) = the plain nearest-mob cascade,
-//                           v0.4.0-identical. ON = auto commits to a mob pack until it's wiped and only
-//                           detours to a denser pack past the mingain/detour gate. Persisted.
-// density mingain <n>    -> gate 1: extra pack members a farther pack needs to steal the pick (default 3)
-// density detour <n>     -> gate 2: max extra walk distance (world units) for that detour (default 20)
-// The old numeric weight form (`density 20`) is retired - the two gates replaced the continuous weight.
-cli_density :: proc(session: ^Session, args: []string) {
-  if !session.attached {
-    fmt.eprintln("not attached.")
-    return
-  }
-  usage :: "usage: density [on|off]  |  density mingain <n>  |  density detour <n>  |  density hue [on|off]"
-  if len(args) >= 1 {
-    switch strings.to_lower(args[0]) {
-    case "on":
-      session.layout.density_on = true
-      session.cluster_committed = false // start fresh; the next pick decides the first commitment
-      session.cluster_origin_pos = {}
-    case "off":
-      session.layout.density_on = false
-      session.cluster_committed = false
-      session.cluster_origin_pos = {}
-    case "mingain":
-      if len(args) < 2 {
-        fmt.eprintln(usage)
-        return
-      }
-      n, nok := strconv.parse_int(args[1])
-      if !nok || n < 0 {
-        fmt.eprintln("mingain wants a whole number >= 0 (extra pack members, e.g. 3).")
-        return
-      }
-      session.layout.density_min_gain = n
-    case "detour":
-      if len(args) < 2 {
-        fmt.eprintln(usage)
-        return
-      }
-      v, vok := strconv.parse_f64(args[1])
-      if !vok || v < 0 {
-        fmt.eprintln("detour wants a distance >= 0 in world units (e.g. 20).")
-        return
-      }
-      session.layout.density_max_detour = f32(v)
-    case "hue":
-      // Radar display toggle (no picker effect): colour monster dots by local pack size. Handled
-      // inline (own save + message + return) so it doesn't also print the cluster-steering status.
-      on := !session.layout.density_hue_on
-      if len(args) >= 2 {
-        switch strings.to_lower(args[1]) {
-        case "on":
-          on = true
-        case "off":
-          on = false
-        case:
-          fmt.eprintln("usage: density hue [on|off]")
-          return
-        }
-      }
-      session.layout.density_hue_on = on
-      flyff_save_cfg(session.layout, flyff_cfg_path())
-      fmt.printfln("radar density-hue: %s - monster dots %s.", on ? "ON" : "OFF", on ? "tinted by local pack size (lone red -> dense green)" : "flat red")
-      return
-    case:
-      if _, isnum := strconv.parse_f64(args[0]); isnum {
-        fmt.eprintln("the numeric density weight is retired - use 'density on' plus 'density mingain <n>' / 'density detour <n>'.")
-      } else {
-        fmt.eprintln(usage)
-      }
-      return
-    }
-    flyff_save_cfg(session.layout, flyff_cfg_path())
-  }
-  if session.layout.density_on {
-    fmt.printfln(
-      "density steering: ON (mingain=%d detour=%v) - auto sticks to a mob pack until it's wiped; a farther pack steals the pick only with >=%d more members within %v extra walk.",
-      session.layout.density_min_gain,
-      session.layout.density_max_detour,
-      session.layout.density_min_gain,
-      session.layout.density_max_detour,
-    )
-  } else {
-    fmt.println("density steering: OFF - auto targets the plain nearest eligible mob (v0.4.0 behaviour).")
-  }
 }
 
 // Read the player's world position: [base+player_rva] -> the CMover*, then +pos_off (m_vPos).
