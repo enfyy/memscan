@@ -2285,7 +2285,17 @@ cli_radar :: proc(session: ^Session, args: []string) {
       gf.script_active = true
       gf.script_paused = run.paused
       gf.script_step = run.stepping
-      gf.script_in_watcher = run.watcher_depth > 0
+      gf.script_in_watcher = script_frame_in_watcher(run)
+      // Which sub-chart, if any, the live node belongs to - the editor's canvas highlights a node by id,
+      // and inside a call that id is a REMAPPED copy no open document contains. Naming the document is
+      // what stops "the chart is running but nothing lights up" from looking like a bug.
+      gf.script_in_call = ""
+      for i in 0 ..< min(run.depth, len(run.frames)) {
+        f := run.frames[i]
+        if f.kind == .Call && f.pc >= 0 && f.pc < len(run.steps) {
+          gf.script_in_call = strings.clone(run.steps[f.pc].call_name, context.temp_allocator)
+        }
+      }
       gf.script_name = strings.clone(run.name, context.temp_allocator)
       gf.script_pc = min(run.pc + 1, run.main_len)
       gf.script_len = run.main_len
@@ -2300,7 +2310,7 @@ cli_radar :: proc(session: ^Session, args: []string) {
         gf.watchers[i] = Gui_Watcher_Row {
           label    = strings.clone(w.src, context.temp_allocator),
           fires    = w.fires,
-          live     = run.watcher_depth > 0 && run.active_watcher == i,
+          live     = script_frame_in_watcher(run) && run.active_watcher == i,
           borrowed = w.global_source != "" || strings.contains(w.src, ": "),
         }
       }

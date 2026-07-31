@@ -38,6 +38,12 @@ import "../engine"
 SCRIPT_MAX_STEPS_PER_TICK :: 64 // a pure if/var script must not spin the watcher tick
 SCRIPT_MAX_NEST :: 16 // if/repeat/while nesting depth
 SCRIPT_MAX_WATCHERS :: 16
+// Suspended regions live at once: sub-chart calls, plus at most one interrupt on top of them.
+SCRIPT_MAX_FRAMES :: 8
+// How deep sub-charts may call sub-charts. One less than the frame cap, so a chart that legally nests
+// to the limit still has a frame left for an interrupt to fire into - an escape hatch that stops
+// working at maximum depth is an escape hatch you cannot rely on.
+SUBCHART_MAX_DEPTH :: 6
 
 // --- program representation -------------------------------------------------------------------
 
@@ -76,11 +82,34 @@ Script_Op :: enum {
   Goto, // graph: continue at goto_id, unconditionally
   Branch, // graph: cond ? goto_id : else_id. Both edges are explicit - there is no fall-through arm.
   Return, // graph: end an interrupt region and resume the main program where it was suspended
+  // graph: run another DOCUMENT and come back. The callee is pasted in as a region at load
+  // (script_expand_calls), so this is a jump plus a frame - out by goto_id when it returns, by else_id
+  // when it fails. It is an OP rather than a block because a block cannot redirect the pc: script_advance
+  // recomputes it from step.jump the moment start() returns, which would clobber the jump. See .Loop and
+  // .Branch, which own their pc control for the same reason.
+  Call,
 }
 
 // A node's stable identity. Edges reference THIS, never a position, so inserting or removing a step
 // cannot silently retarget the jumps around it. 0 means "none".
 Node_Id :: distinct u32
+
+// How many parameters a sub-chart may declare. A cap rather than a dynamic list because a call's
+// arguments live ON the step, and Script_Step is cloned for every undo snapshot - a [dynamic] there
+// would put an allocation on paths (script_step_clone, the editor's undo ring) that have none today.
+SUBCHART_MAX_PARAMS :: 6
+
+// One argument at a CALL SITE, as text.
+//
+// Text, and not a slot in Script_Action's [4]f64/[2]string payload, for two reasons. The payload is a
+// hard ceiling that a per-document parameter list cannot be made to fit. And a variable is already
+// text - engine/vars.odin is string-in/string-out on purpose - so an argument that becomes a variable
+// has nothing to convert. `value` is run through script_arg when the call is taken, which is what lets
+// a caller pass `@camp` down.
+Call_Arg :: struct {
+  name:  string, // owned; the parameter's name in the CALLEE
+  value: string, // owned
+}
 
 Script_Step :: struct {
   // --- identity + structure (authoring; this is what an editor would save) ---
@@ -100,11 +129,18 @@ Script_Step :: struct {
   close:     Script_Op, // for .End: which op it closes (so the walker knows fall-through vs loop-back)
   count:     int, // .Repeat iteration count
 
+  // --- the call (op == .Call) ---
+  call_name:      string, // owned; the sub-chart DOCUMENT this node runs
+  call_args:      [SUBCHART_MAX_PARAMS]Call_Arg,
+  call_arg_count: int,
+  call_entry_id:  Node_Id, // the callee region's remapped entry node; stamped by script_expand_calls
+
   // --- derived (runtime) ---
   jump:      int, // DERIVED from goto_id by script_resolve_ids at load. Never author this directly:
   // it is a cache of a position, and positions move. It exists so the hot walker indexes straight
   // into the array instead of hashing an id on every branch.
   jump_else: int, // DERIVED from else_id, same rules. -1 means "no edge" = the program ends here.
+  call_entry: int, // DERIVED from call_entry_id, same rules. -1 = the callee was not expanded.
 
   // --- presentation + per-run state ---
   ui_pos:    [2]f32, // node position on the editor canvas. AUTHORING DATA the VM never reads - it is
@@ -141,7 +177,7 @@ Script_Step :: struct {
 // partition uses, and two lint passes - and four copies of it is how they would come to disagree.
 script_op_falls_through :: proc(op: Script_Op) -> bool {
   #partial switch op {
-  case .Action, .Wait_For, .Goto, .Branch, .Loop, .Return:
+  case .Action, .Wait_For, .Goto, .Branch, .Loop, .Return, .Call:
     return false
   }
   return true
@@ -169,9 +205,18 @@ script_resolve_ids :: proc(steps: []Script_Step) -> (ok: bool, dangling: Node_Id
     // arm and .Action reads it as its FAIL arm (see script_take_fail_edge), and a plain zero would be
     // read as "jump to index 0" - i.e. an unwired block would silently restart the program.
     s.jump_else = -1
+    // Same rule, third edge: an unexpanded callee must read as "nowhere", never as index 0.
+    s.call_entry = -1
     #partial switch s.op {
-    case .Goto, .Branch, .Loop:
+    case .Goto, .Branch, .Loop, .Call:
       s.jump = -1 // no edge = end, not index 0
+    }
+    if s.call_entry_id != 0 {
+      tgt, found := index_of[s.call_entry_id]
+      if !found {
+        return false, s.call_entry_id
+      }
+      s.call_entry = tgt
     }
     if s.goto_id != 0 {
       tgt, found := index_of[s.goto_id]
@@ -205,9 +250,11 @@ Script_Mode :: enum {
 
 // An `on <event> -> <action>` interrupt. Hoisted out of the instruction stream at run start, so
 // declaration position does not affect when it is armed.
+// A watcher is a TRIGGER plus the region it enters. It used to also be able to carry a single action
+// of its own, for the legacy one-node shape; that shape is upgraded away at load now, so the only
+// thing a fired watcher does is jump to `entry`.
 Script_Watcher :: struct {
   condition:     Script_Condition,
-  action:   Script_Action,
   condition_state: Condition_State,
   src:      string, // owned
   fires:    int, // how many times it has fired this run (shown by `script`)
@@ -221,14 +268,48 @@ Script_Watcher :: struct {
   // Session-level watcher when the run ends - see the two-sites note in interrupt.odin.
 }
 
-// The main program's position, saved while an interrupt region runs so it can be resumed exactly.
-// Saving the loop stack matters as much as the pc: an interrupt that fires inside `repeat 8` has to come
-// back to the same iteration, not to a loop that thinks it is starting over.
+// What pushed a frame. The two answers differ only in what popping it does, but they differ ENOUGH:
+// a watcher resumes the step it suspended (possibly mid-flight), a call continues PAST the node that
+// made it and hands back a verdict.
+Frame_Kind :: enum {
+  Watcher,
+  Call,
+}
+
+// One parameter's value in the CALLER, remembered so the call can put it back.
+//
+// Fixed buffers rather than owned strings, for the reason Behaviour_Signal gives: a frame is pushed on
+// the watcher tick, and nothing frees an allocation made there. Truncation is the right failure - a
+// parameter name longer than this is refused at declaration time anyway.
+SUBCHART_SAVE_NAME :: 32
+SUBCHART_SAVE_VALUE :: 96
+
+Saved_Var :: struct {
+  name:      [SUBCHART_SAVE_NAME]u8,
+  value:     [SUBCHART_SAVE_VALUE]u8,
+  name_len:  int,
+  value_len: int,
+  had:       bool, // was it set at all? An unset variable must come back UNSET, not as ""
+}
+
+// The suspended position of whatever was running when a region was entered, so it can be resumed
+// exactly. Saving the loop stack matters as much as the pc: an interrupt that fires inside `repeat 8`
+// has to come back to the same iteration, not to a loop that thinks it is starting over.
+//
+// ONE STRUCT FOR BOTH REGION KINDS. Interrupt bodies and sub-charts are the same mechanism - program
+// text past main_len, terminated by .Return, entered by saving where you were. They were not made to
+// share this by accident: keeping two stacks would mean two answers to "did the pc run off the end",
+// and the walker asks that in one place.
 Suspended_Frame :: struct {
+  kind:    Frame_Kind,
   pc:      int,
   entered: bool, // was the suspended step mid-flight? (a walk that is still walking)
   nloop:   int,
   loops:   [SCRIPT_MAX_NEST]Loop_Frame,
+  watcher: int, // .Watcher: which one has control, so the UI can light the right chip
+  // .Call only: what the caller's copies of the callee's parameters were.
+  saved:       [SUBCHART_MAX_PARAMS]Saved_Var,
+  saved_count: int,
 }
 
 // --- run state ---------------------------------------------------------------------------------
@@ -268,14 +349,23 @@ Script_Run :: struct {
   paused:         bool, // transport: the machine is frozen entirely - no walk AND no interrupts. Distinct
   // from `stepping`, which keeps servicing interrupts so a kill-switch can still break you out.
 
-  // Interrupt regions. `steps` holds the main program in [0, main_len) followed by one region per
-  // watcher; each region is a body ending in .Return. Firing a watcher saves the main program's
-  // position into suspended and jumps into its region, so an interrupt body is a full multi-step
-  // program (it can walk, wait, and have its exit run) rather than a single fire-and-forget call.
+  // Regions. `steps` holds the main program in [0, main_len) followed by one region per watcher and one
+  // per called sub-chart; each region is a body ending in .Return. Entering one saves where you were on
+  // the frame stack and jumps, so a region is a full multi-step program (it can walk, wait, and have its
+  // exit run) rather than a single fire-and-forget call.
+  //
+  // A STACK, not a slot. A watcher alone never needed one - an interrupt cannot interrupt itself, so
+  // depth was 0 or 1 - but a sub-chart may call a sub-chart, and an interrupt may fire while one is
+  // running. The cap on WATCHER nesting is still one, enforced by refusing to push a second .Watcher
+  // frame (script_interrupts); the rest of the depth is calls.
   main_len:       int,
-  watcher_depth:      int, // 0 = running the main program. Capped at 1 - an interrupt cannot interrupt itself.
-  active_watcher:          int, // which watcher has control while watcher_depth > 0; -1 otherwise. Read by the UI.
-  suspended:       Suspended_Frame,
+  frames:         [SCRIPT_MAX_FRAMES]Suspended_Frame,
+  depth:          int, // 0 = running the main program
+  active_watcher: int, // which watcher has control while a .Watcher frame is live; -1 otherwise. Read by the UI.
+  // Did the sub-chart that just returned fail? Read once by the pop, so the call node can take its fail
+  // arm. On the run rather than on the frame because it is set by the FAILING step, which is inside the
+  // callee and has no business reaching into the frame that will read it.
+  call_failed:    bool,
   last_line:      string, // owned - the last step's source, for `script`
   auto_owned:     bool, // a farm/sweep block turned auto on, so leaving must turn it off
   // Does this program contain an `approach` that side-steps? Decided once at script_begin and read by
@@ -369,6 +459,14 @@ script_trace_text :: proc(row: ^Script_Trace_Row) -> string {
 script_step_free :: proc(step: ^Script_Step) {
   delete(step.src)
   delete(step.group)
+  delete(step.call_name)
+  // Every declared argument, not just the ones in use: call_arg_count shrinks when a parameter is
+  // dropped in the editor, and a slot past it can still be holding the string it was set to.
+  for &a in step.call_args {
+    delete(a.name)
+    delete(a.value)
+    a = {}
+  }
   delete(step.action.strs[0])
   delete(step.action.strs[1])
   // Through script_condition_free, not two deletes: a condition owns the strings of EVERY row, and freeing
@@ -390,8 +488,6 @@ script_run_free :: proc(run: ^Script_Run) {
   for &w in run.watchers {
     delete(w.src)
     delete(w.global_source)
-    delete(w.action.strs[0])
-    delete(w.action.strs[1])
     script_condition_free(&w.condition)
   }
   delete(run.watchers)
@@ -483,6 +579,26 @@ script_render_step :: proc(b: ^strings.Builder, step: Script_Step, depth: int, d
     fmt.sbprintf(b, " ? #%d : #%d", u32(step.goto_id), u32(step.else_id))
   case .Return:
     strings.write_string(b, "return")
+  case .Call:
+    // The console spelling. The FILE writes the name and the arguments on their own payload lines
+    // instead (see bhv_serialize), for the same reason a group does: an argument's value is free text
+    // and taking the rest of the line sidesteps quoting entirely.
+    fmt.sbprintf(b, "call %s", step.call_name)
+    for i in 0 ..< min(step.call_arg_count, len(step.call_args)) {
+      fmt.sbprintf(b, " %s=", step.call_args[i].name)
+      v := step.call_args[i].value
+      if v == "" || strings.contains_any(v, " \t,") {
+        fmt.sbprintf(b, "'%s'", v)
+      } else {
+        strings.write_string(b, v)
+      }
+    }
+    if step.goto_id != 0 {
+      fmt.sbprintf(b, " -> #%d", u32(step.goto_id))
+    }
+    if step.else_id != 0 {
+      fmt.sbprintf(b, " else #%d", u32(step.else_id))
+    }
   }
   strings.write_string(b, "\n")
 }
@@ -547,7 +663,7 @@ script_write_params :: proc(b: ^strings.Builder, spec: []Param_Spec, nums: [4]f6
       }
       ni += 2
       si += 1
-    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
       strings.write_string(b, " ")
       // Quote anything with whitespace or a comma so the round-trip re-parses identically - and an
       // EMPTY string too, which is the case that actually bit. Written bare it is not a short

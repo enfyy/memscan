@@ -34,6 +34,7 @@ Block_Cat :: enum {
   Timing, // waiting, and the dice
   Vars, // the script's own scratch values
   System, // memscan and the client: alerts, keys, commands, chat
+  Sub, // a block you made yourself: a call into another chart
 }
 
 BLOCK_CAT_NAMES := [Block_Cat]string {
@@ -45,6 +46,7 @@ BLOCK_CAT_NAMES := [Block_Cat]string {
   .Timing = "timing",
   .Vars   = "variables",
   .System = "system",
+  .Sub    = "your blocks",
 }
 
 // ===========================================================================
@@ -166,6 +168,10 @@ block_title :: proc(s: Script_Step, allocator := context.temp_allocator) -> stri
     return "Jump"
   case .Return:
     return "Hand control back"
+  case .Call:
+    // The DOCUMENT's name, prettified the same way a block with no catalog title is. A sub-chart's
+    // description is a sentence and belongs in the tooltip; a node headline wants the noun.
+    return prose_title_of_name(s.call_name, allocator)
   }
   return "?"
 }
@@ -185,6 +191,10 @@ block_cat :: proc(s: Script_Step) -> Block_Cat {
     return .Flow
   case .Else, .End, .Repeat, .Loop, .Goto, .Return:
     return .Flow
+  case .Call:
+    // Its own category rather than .Flow: a call IS control flow, but what a reader needs to see at a
+    // glance is "this is one of mine", because that is the node whose contents live somewhere else.
+    return .Sub
   }
   return .Flow
 }
@@ -233,7 +243,7 @@ param_value_text :: proc(spec: []Param_Spec, i: int, nums: [4]f64, strs: [2]stri
     prose_num(&b, nums[slot])
     strings.write_string(&b, ", ")
     prose_num(&b, nums[slot + 1])
-  case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+  case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
     if strs[slot] == "" {
       return "any"
     }
@@ -256,7 +266,7 @@ param_is_default :: proc(spec: []Param_Spec, i: int, nums: [4]f64, strs: [2]stri
     return nums[num_slot] == p.def
   case .Coord:
     return nums[num_slot] == 0 && nums[num_slot + 1] == 0 && strs[str_slot] == ""
-  case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+  case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
     return strs[str_slot] == ""
   }
   return false
@@ -313,19 +323,15 @@ condition_params_line :: proc(condition: Script_Condition, allocator := context.
 step_params_line :: proc(s: Script_Step, allocator := context.temp_allocator) -> string {
   line := ""
   switch s.op {
-  case .Action, .On:
+  case .Action:
     if def := action_def(s.action.kind); def != nil {
       line = prose_params(def.params, s.action.nums, s.action.strs, allocator)
     }
-    // A watcher's title is its trigger, so its body line has to be the thing it DOES. When it names a
-    // subgraph rather than carrying one action, the honest answer is that the wire says where.
-    if s.op == .On {
-      if s.goto_id != 0 {
-        return "takes over and runs its own steps"
-      }
-      what := action_title(s.action.kind, allocator)
-      line = line == "" ? what : fmt.aprintf("%s   %s", what, line, allocator = allocator)
-    }
+  // A watcher's title is its TRIGGER, so its body line is what happens when it fires - and that is
+  // always the wire now. It used to have a second answer, for a watcher carrying one action instead
+  // of naming a body; nothing can author that shape any more.
+  case .On:
+    return s.goto_id != 0 ? "takes over and runs its own steps" : "nothing wired - it would fire and do nothing"
   case .Branch, .If, .While, .Wait_For:
     line = condition_params_line(s.condition, allocator)
   case .Repeat, .Loop:
@@ -334,6 +340,27 @@ step_params_line :: proc(s: Script_Step, allocator := context.temp_allocator) ->
     return s.close == .If ? "end of the if" : "back to the top"
   case .Else, .Goto, .Return:
     return ""
+  case .Call:
+    // The arguments as `who Aibatt   spot 6800,3300`, the same two-space-separated shape prose_params
+    // gives a catalog block - a call node should read like any other node with settings on it. A
+    // sub-chart that takes nothing says so, rather than leaving an empty body under the title.
+    if s.call_arg_count == 0 {
+      return "takes no settings"
+    }
+    b := strings.builder_make(allocator)
+    n := 0
+    for i in 0 ..< min(s.call_arg_count, len(s.call_args)) {
+      a := s.call_args[i]
+      if a.name == "" {
+        continue
+      }
+      if n > 0 {
+        strings.write_string(&b, "   ")
+      }
+      fmt.sbprintf(&b, "%s %s", prose_words(a.name, allocator), a.value == "" ? "(blank)" : a.value)
+      n += 1
+    }
+    return strings.to_string(b)
   }
   if s.has_until {
     u := fmt.aprintf("until %s", condition_title(s.until, allocator), allocator = allocator)

@@ -66,6 +66,11 @@ suggest_corpus :: proc(
     return suggest_filter(choices, query, exclude)
   case .Var_Name:
     return suggest_filter(chart_variable_names(doc), query, exclude)
+  case .Chart_Name:
+    // Derived from what is on disk right now, like .Var_Name is derived from the open document. The
+    // registry is scanned on the browser's throttle rather than here - this runs per frame while a
+    // field is open, and a directory listing per frame is exactly what that cache exists to avoid.
+    return suggest_filter(subchart_registry_names(), query, exclude)
   case .Str, .Num, .Duration, .Percent, .Coord:
     return nil
   }

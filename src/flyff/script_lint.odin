@@ -116,6 +116,78 @@ lint_document :: proc(doc: ^Behaviour_Doc, out: ^[dynamic]Chart_Problem) {
       })
     }
   }
+  if doc.is_subchart {
+    lint_subchart_document(doc, out)
+  }
+}
+
+// What a sub-chart may not be. Every one of these is refused again at run start
+// (subchart_callable_why) - this half exists so you find out while you are drawing it rather than the
+// first time something tries to call it.
+@(private = "file")
+lint_subchart_document :: proc(doc: ^Behaviour_Doc, out: ^[dynamic]Chart_Problem) {
+  if doc.mode == .Loop {
+    append(out, Chart_Problem{
+      level = .Error,
+      text  = "a block is set to loop, so a chart that called it would never get control back",
+      hint  = "set the mode to 'once' in this chart's options",
+    })
+  }
+  for s in doc.steps {
+    if s.op == .On {
+      append(out, Chart_Problem{
+        node  = s.id,
+        level = .Error,
+        text  = "a block cannot declare a watcher - a watcher belongs to the chart you RUN",
+        hint  = "move this 'on' node into the chart that calls this block, or arm it globally",
+      })
+      break // one is the point; five copies of it is a list nobody reads
+    }
+  }
+  if len(doc.uses) > 0 {
+    append(out, Chart_Problem{
+      level = .Error,
+      text  = fmt.aprintf("a block cannot borrow watchers ('uses %s') - a watcher belongs to the chart you RUN", doc.uses[0]),
+      hint  = "borrow it in the chart that calls this block instead",
+    })
+  }
+  // A parameter with no sentence beside it is a knob you have to read the source to set. Exactly the
+  // bar script_selftest_meta holds the built-in catalog to, applied to the catalog the user is writing.
+  for p in subchart_params(doc) {
+    if p.title == "" || p.help == "" {
+      append(out, Chart_Problem{
+        level = .Warning,
+        text  = fmt.aprintf("the '%s' setting has no %s", p.name, p.title == "" ? "label" : "description"),
+        hint  = "every block in the palette says what its settings do; give this one a sentence too",
+      })
+    }
+  }
+  // Free variables: read by this block, set by nobody. Inside a BLOCK that is nearly always a missing
+  // parameter, which is a much more useful thing to say than the generic "nothing sets it" warning -
+  // so it replaces it here (lint_references skips a name that is declared).
+  set_names := lint_variables_set(doc)
+  defer delete(set_names)
+  declared := make(map[string]bool, SUBCHART_MAX_PARAMS, context.temp_allocator)
+  defer delete(declared)
+  for p in subchart_params(doc) {
+    declared[p.name] = true
+  }
+  seen := make(map[string]bool, 8, context.temp_allocator)
+  defer delete(seen)
+  for s in doc.steps {
+    for name in lint_step_references(s) {
+      if set_names[name] || declared[name] || seen[name] {
+        continue
+      }
+      seen[name] = true
+      append(out, Chart_Problem{
+        node  = s.id,
+        level = .Warning,
+        text  = fmt.aprintf("this block reads @%s but never sets it", name),
+        hint  = fmt.aprintf("add '%s' as a setting in this chart's options, so whoever places the block fills it in", name),
+      })
+    }
+  }
 }
 
 // --- one step -------------------------------------------------------------------------------------
@@ -149,7 +221,7 @@ lint_step :: proc(
         fmt.aprintf("falls back to node #%d, which is not in this chart", u32(s.else_id)),
         "re-wire it, or delete the wire by clicking it")
     }
-    lint_arguments(s, set_names, .Error, out)
+    lint_arguments(s, set_names, .Error, out, doc.is_subchart)
     // A branch or a graph loop with an unwired arm does not fall through - script_resolve_ids leaves it
     // at -1 ("no edge = end, not index 0"), so taking that arm ENDS THE RUN. On a loop chart that is
     // always a mistake; on a once chart it may well be the intended ending, hence the split.
@@ -160,18 +232,21 @@ lint_step :: proc(
     case .Loop:
       lint_arm(s, s.goto_id, "each pass", doc.mode, out)
       lint_arm(s, s.else_id, "when done", doc.mode, out)
+    case .Call:
+      lint_call(doc, s, .Error, out)
     }
 
   case .Warning:
-    lint_arguments(s, set_names, .Warning, out)
+    lint_arguments(s, set_names, .Warning, out, doc.is_subchart)
     if s.id not_in reachable {
       add(out, s.id, .Warning,
         "nothing leads here - this node can never run",
         "wire something into it, or delete it")
     }
-    // A watcher with no body cannot be armed and cannot be borrowed: there is nothing for its trigger to
-    // run. (An `on` node carrying a single ACTION is the legacy one-shot shape and is fine.)
-    if s.op == .On && s.goto_id == 0 && s.action.kind == .None {
+    // A watcher with no body cannot be armed and cannot be borrowed: there is nothing for its trigger
+    // to run. There is no longer an exception for the legacy shape (an `on` carrying a single action
+    // and naming no body) - files holding it are upgraded on load, and nothing can author a new one.
+    if s.op == .On && s.goto_id == 0 {
       add(out, s.id, .Warning,
         "this watcher has no body wired, so it does nothing",
         "drag from its port to the first node of what it should do")
@@ -191,6 +266,9 @@ lint_step :: proc(
           fmt.aprintf("'%s' is not built yet - the run will refuse to start", def.name),
           "'script blocks' lists what each gated block still needs")
       }
+    }
+    if s.op == .Call {
+      lint_call(doc, s, .Warning, out)
     }
 
   case .Note:
@@ -218,6 +296,89 @@ lint_step :: proc(
       add(out, s.id, .Note,
         "this coin flip is re-rolled every tick (20ms), so it fires almost immediately",
         "put a 'wait' or 'wait_random' on the path into it to make it a chance per pass")
+    }
+  }
+}
+
+// A call node: does it name a block that exists, is that block still shaped the way this call site
+// remembers, and would running it loop forever?
+//
+// This is the ONE check in the file that looks past the document, via the sub-chart registry - which is
+// a header cache, not a session, so the "no Session" rule at the top still holds. Everything it reports
+// is refused again at run start (script_expand_calls); the point of having it here is that a chart with
+// a broken call should look broken on the canvas.
+@(private = "file")
+lint_call :: proc(doc: ^Behaviour_Doc, s: Script_Step, level: Chart_Problem_Level, out: ^[dynamic]Chart_Problem) {
+  add :: proc(out: ^[dynamic]Chart_Problem, node: Node_Id, level: Chart_Problem_Level, text, hint: string) {
+    append(out, Chart_Problem{node = node, level = level, text = text, hint = hint})
+  }
+  if level == .Error && s.call_name == "" {
+    add(out, s.id, .Error, "this node calls no block", "pick one in the inspector, or delete the node")
+    return
+  }
+  if s.call_name == "" {
+    return
+  }
+  info := subchart_registry_find(s.call_name)
+  if level == .Error {
+    if info == nil {
+      add(out, s.id, .Error,
+        fmt.aprintf("there is no block called '%s'", s.call_name),
+        "it may have been renamed or deleted - pick another in the inspector")
+      return
+    }
+    // Direct self-call. The indirect case needs the whole graph and is caught at run start, where the
+    // full call chain is available to name; catching the obvious half here is what makes the canvas
+    // refuse the mistake as you draw it.
+    if s.call_name == doc.name {
+      add(out, s.id, .Error,
+        "this block calls itself",
+        "a block cannot call itself, directly or through another block")
+      return
+    }
+    // A missing REQUIRED argument. Same rule and the same words as a blank required field on a catalog
+    // block (lint_payload), because to whoever placed it they are the same mistake.
+    for p in subchart_info_params(info) {
+      if p.optional {
+        continue
+      }
+      filled := false
+      for i in 0 ..< min(s.call_arg_count, len(s.call_args)) {
+        if s.call_args[i].name == p.name && strings.trim_space(s.call_args[i].value) != "" {
+          filled = true
+          break
+        }
+      }
+      if !filled {
+        add(out, s.id, .Error,
+          fmt.aprintf("'%s' needs a %s and the field is empty", s.call_name, p.title == "" ? p.name : p.title),
+          p.help)
+      }
+    }
+    return
+  }
+  if level != .Warning || info == nil {
+    return
+  }
+  // An argument for a setting the block no longer has: it was renamed or removed after this call was
+  // placed. Not an error - the run ignores it - but it is silently doing nothing, which is exactly the
+  // kind of thing the Problems tab exists to surface.
+  for i in 0 ..< min(s.call_arg_count, len(s.call_args)) {
+    a := s.call_args[i]
+    if a.name == "" {
+      continue
+    }
+    known := false
+    for p in subchart_info_params(info) {
+      if p.name == a.name {
+        known = true
+        break
+      }
+    }
+    if !known {
+      add(out, s.id, .Warning,
+        fmt.aprintf("'%s' has no setting called '%s' any more - this value is ignored", s.call_name, a.name),
+        "open the block to see what it takes now, or clear the value")
     }
   }
 }
@@ -250,21 +411,27 @@ lint_arm :: proc(s: Script_Step, arm: Node_Id, name: string, mode: Script_Mode, 
 // selected by <level>, so the ERROR findings (a blank required field, a key name that is not one) and
 // the WARNING ones (an @name nothing sets) stay in their own sections of the report.
 @(private = "file")
-lint_arguments :: proc(s: Script_Step, set_names: map[string]bool, level: Chart_Problem_Level, out: ^[dynamic]Chart_Problem) {
+lint_arguments :: proc(
+  s: Script_Step,
+  set_names: map[string]bool,
+  level: Chart_Problem_Level,
+  out: ^[dynamic]Chart_Problem,
+  in_subchart: bool,
+) {
   if def := action_def(s.action.kind); def != nil {
-    lint_payload(s, def.name, def.params, s.action.strs, set_names, level, out)
+    lint_payload(s, def.name, def.params, s.action.strs, set_names, level, out, in_subchart)
   }
   for i in 0 ..< condition_row_count(s.condition) {
     r := condition_row(s.condition, i)
     if def := event_def(r.kind); def != nil {
-      lint_payload(s, def.name, def.params, r.strs, set_names, level, out)
+      lint_payload(s, def.name, def.params, r.strs, set_names, level, out, in_subchart)
     }
   }
   if s.has_until {
     for i in 0 ..< condition_row_count(s.until) {
       r := condition_row(s.until, i)
       if def := event_def(r.kind); def != nil {
-        lint_payload(s, def.name, def.params, r.strs, set_names, level, out)
+        lint_payload(s, def.name, def.params, r.strs, set_names, level, out, in_subchart)
       }
     }
   }
@@ -279,6 +446,10 @@ lint_payload :: proc(
   set_names: map[string]bool,
   level: Chart_Problem_Level,
   out: ^[dynamic]Chart_Problem,
+  // Inside a BLOCK, an unset @name gets the sub-chart-specific message from lint_subchart_document
+  // instead ("reads @x but never sets it - add it as a setting"), which is both more accurate and more
+  // actionable. Emitting both would be two warnings about one thing.
+  in_subchart: bool,
 ) {
   for p, i in spec {
     // A Coord's expression slot is a string argument in every way that matters here: it is where
@@ -287,7 +458,7 @@ lint_payload :: proc(
     // required-and-empty check below rather than reporting a chart that is perfectly filled in.
     if p.kind == .Coord {
       _, expression_slot := param_slots(spec, i)
-      if level == .Warning && strs[expression_slot] != "" {
+      if level == .Warning && !in_subchart && strs[expression_slot] != "" {
         lint_references(s, strs[expression_slot], set_names, out)
       }
       continue
@@ -321,7 +492,7 @@ lint_payload :: proc(
       }
       continue
     }
-    if level == .Warning {
+    if level == .Warning && !in_subchart {
       lint_references(s, raw, set_names, out)
     }
     // A value with an @name in it is whatever the variable turns out to hold, which is not a question
@@ -362,6 +533,69 @@ lint_payload :: proc(
 // seed one - the linter simply cannot see it, and says what it can see instead.
 @(private = "file")
 lint_references :: proc(s: Script_Step, raw: string, set_names: map[string]bool, out: ^[dynamic]Chart_Problem) {
+  names := make([dynamic]string, 0, 4, context.temp_allocator)
+  lint_scan_references(raw, &names)
+  for name in names {
+    if set_names[name] {
+      continue
+    }
+    append(out, Chart_Problem{
+      node  = s.id,
+      level = .Warning,
+      text  = fmt.aprintf("nothing in this chart sets '%s', so @%s stays as literal text", name, name),
+      hint  = fmt.aprintf("add a 'var' node that sets %s, or set it from the REPL with: var %s <value>", name, name),
+    })
+  }
+}
+
+// Same alphabet expand_vars uses. Kept in step with it by hand rather than exported from engine: a
+// linter that accepted a name the expander would not is worse than no linter.
+@(private = "file")
+lint_name_byte :: proc(c: byte) -> bool {
+  return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// Every variable this chart WRITES. `var`, `add` and `read_value` all create one - `add` at 0 and
+// `read_value` at whatever the game says - so all three count as setting it.
+//
+// A CALL COUNTS TOO, twice over: it sets every argument it passes (script_take_call does exactly that),
+// and it runs a whole document that sets things of its own. The second half is why Subchart_Info
+// carries `sets` - without it, the normal way to get a value out of a block (the block computes it, the
+// caller reads it, because a call has no return value) would warn at every caller.
+@(private = "file")
+lint_variables_set :: proc(doc: ^Behaviour_Doc) -> map[string]bool {
+  out := make(map[string]bool, 8, context.temp_allocator)
+  for s in doc.steps {
+    #partial switch s.action.kind {
+    case .Var, .Add, .Read_Value:
+      if name := script_var_name_of(s.action.strs[0]); name != "" {
+        out[name] = true
+      }
+    }
+    if s.op != .Call {
+      continue
+    }
+    for i in 0 ..< min(s.call_arg_count, len(s.call_args)) {
+      if s.call_args[i].name != "" {
+        out[s.call_args[i].name] = true
+      }
+    }
+    // One level, not the whole call graph. A block's OWN blocks are its business, and following the
+    // graph from a linter that runs every frame would put a file read per call site per depth on it.
+    if info := subchart_registry_find(s.call_name); info != nil {
+      for n in info.sets {
+        out[n] = true
+      }
+    }
+  }
+  return out
+}
+
+// Every @name <raw> references. The scan expand_vars does, factored out because two callers want it:
+// lint_references, which reports the ones nothing sets, and the sub-chart free-variable check, which
+// wants the names themselves.
+@(private = "file")
+lint_scan_references :: proc(raw: string, out: ^[dynamic]string) {
   i := 0
   for i < len(raw) {
     if raw[i] != '@' {
@@ -380,40 +614,35 @@ lint_references :: proc(s: Script_Step, raw: string, set_names: map[string]bool,
       i += 1 // a bare '@' with nothing after it
       continue
     }
-    name := raw[i + 1:j]
-    if !set_names[name] {
-      append(out, Chart_Problem{
-        node  = s.id,
-        level = .Warning,
-        text  = fmt.aprintf("nothing in this chart sets '%s', so @%s stays as literal text", name, name),
-        hint  = fmt.aprintf("add a 'var' node that sets %s, or set it from the REPL with: var %s <value>", name, name),
-      })
-    }
+    append(out, raw[i + 1:j])
     i = j
   }
 }
 
-// Same alphabet expand_vars uses. Kept in step with it by hand rather than exported from engine: a
-// linter that accepted a name the expander would not is worse than no linter.
+// Every @name anywhere in <s> - its action's arguments, every condition row's, and a call's argument
+// values. Order is document order; duplicates are the caller's to collapse.
 @(private = "file")
-lint_name_byte :: proc(c: byte) -> bool {
-  return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-}
-
-// Every variable this chart WRITES. `var`, `add` and `read_value` all create one - `add` at 0 and
-// `read_value` at whatever the game says - so all three count as setting it.
-@(private = "file")
-lint_variables_set :: proc(doc: ^Behaviour_Doc) -> map[string]bool {
-  out := make(map[string]bool, 8, context.temp_allocator)
-  for s in doc.steps {
-    #partial switch s.action.kind {
-    case .Var, .Add, .Read_Value:
-      if name := script_var_name_of(s.action.strs[0]); name != "" {
-        out[name] = true
+lint_step_references :: proc(s: Script_Step, allocator := context.temp_allocator) -> []string {
+  out := make([dynamic]string, 0, 4, allocator)
+  for str in s.action.strs {
+    lint_scan_references(str, &out)
+  }
+  for i in 0 ..< condition_row_count(s.condition) {
+    for str in condition_row(s.condition, i).strs {
+      lint_scan_references(str, &out)
+    }
+  }
+  if s.has_until {
+    for i in 0 ..< condition_row_count(s.until) {
+      for str in condition_row(s.until, i).strs {
+        lint_scan_references(str, &out)
       }
     }
   }
-  return out
+  for i in 0 ..< min(s.call_arg_count, len(s.call_args)) {
+    lint_scan_references(s.call_args[i].value, &out)
+  }
+  return out[:]
 }
 
 // The same set, sorted, as a slice - what the editor's variable-name picker offers. It deliberately
@@ -470,7 +699,14 @@ lint_reachable :: proc(doc: ^Behaviour_Doc, ids: map[Node_Id]int) -> map[Node_Id
     // FALL-THROUGH to the next array slot, for the ops that still have one - `.On`, whose body is
     // reached by its edge while the main program walks PAST it, and any structured op that outlived
     // lowering. An .Action with no successor ends the program (script_op_falls_through).
-    if s.goto_id == 0 && script_op_falls_through(s.op) && index + 1 < len(doc.steps) {
+    //
+    // `.On` IS THE ONE OP WITH BOTH, and the `goto_id == 0` guard is wrong for it: its edge names a
+    // BODY, reached only when the trigger fires, and the next slot is where the main program carries
+    // on regardless. Every other op has one or the other. This was latent for as long as a
+    // builder-made `on` carried its action inline and named no body - the guard happened to hold.
+    // The moment script_materialize_watcher_bodies gave it one, this severed the entire main program
+    // of every chart with a watcher at the top of it, and `clockworks` linted 41 unreachable nodes.
+    if (s.op == .On || s.goto_id == 0) && script_op_falls_through(s.op) && index + 1 < len(doc.steps) {
       append(&pending, doc.steps[index + 1].id)
     }
   }

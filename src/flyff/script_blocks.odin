@@ -53,12 +53,16 @@ Param_Kind :: enum {
   Key,      // a key name (KEY_NAMES is the corpus; vk_from_name is the judge)
   Var_Name, // NAMES a variable rather than referencing one - `dir`, never `@dir`
   Choice,   // one of a fixed set, spelled out by the row's `choices`
+  // Names a BEHAVIOUR DOCUMENT - which sub-chart a call node runs. Its corpus is the sub-chart
+  // registry, the way .Var_Name's is the chart's own variables: derived from what exists right now,
+  // not from a table.
+  Chart_Name,
 }
 
-// Is this kind stored in a string slot? Six of the ten are, and the count is what param_slot walks.
+// Is this kind stored in a string slot? Seven of the eleven are, and the count is what param_slot walks.
 param_kind_is_str :: proc(k: Param_Kind) -> bool {
   switch k {
-  case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+  case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
     return true
   case .Num, .Duration, .Percent, .Coord:
     return false
@@ -123,7 +127,7 @@ param_slots :: proc(spec: []Param_Spec, i: int) -> (num_slot: int, str_slot: int
     case .Coord:
       ni += 2
       si += 1
-    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
       si += 1
     }
   }

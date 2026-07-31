@@ -2,8 +2,10 @@ package flyff
 
 import "core:fmt"
 import "core:os"
+import "core:slice"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 
 // ===========================================================================
 // Behaviour documents on disk - <exe-dir>/behaviours/<name>.bhv
@@ -37,6 +39,78 @@ import "core:strings"
 // catalog and then parses arguments straight off that row's []Param_Spec. Adding a block to
 // script_blocks.odin therefore teaches this file about it too, with no edit here.
 // ===========================================================================
+
+// ===========================================================================
+// The sub-chart registry - package-level state, refreshed from disk on a throttle
+// ===========================================================================
+//
+// What blocks the user has made. Package-level rather than carried on Panel_State because the readers
+// are scattered and most of them are not the GUI: the palette, a suggestion field, the canvas title of
+// a call node, `script list`, and the LINTER, which has to know what a called block sets before it can
+// tell an author that nothing sets it.
+//
+// SELF-THROTTLING, so no caller has to remember to refresh it. Every accessor below refreshes first;
+// at one directory scan per REGISTRY_INTERVAL that is cheap enough for a per-frame linter and correct
+// enough for a CLI command that runs once. Timed off core:time rather than raylib, because the CLI
+// half of the tool has no window and must not depend on one.
+REGISTRY_INTERVAL_NS :: i64(1_500_000_000)
+
+@(private = "file")
+subchart_registry: [dynamic]Subchart_Info
+@(private = "file")
+subchart_registry_at: i64
+@(private = "file")
+subchart_registry_names_cache: [dynamic]string
+
+// Rebuild from disk if the cache is stale. <force> is for the one case a throttle gets wrong: something
+// this process just SAVED, where the answer has to change now rather than within a second and a half.
+subchart_registry_refresh :: proc(force := false) {
+  now := time.now()._nsec
+  if !force && subchart_registry_at != 0 && now - subchart_registry_at < REGISTRY_INTERVAL_NS {
+    return
+  }
+  subchart_registry_at = now
+  for &info in subchart_registry {
+    subchart_info_free(&info)
+  }
+  clear(&subchart_registry)
+  clear(&subchart_registry_names_cache)
+  for name in bhv_list_names() {
+    info, ok := bhv_read_header(name)
+    if !ok {
+      continue
+    }
+    if !info.is_subchart {
+      subchart_info_free(&info)
+      continue
+    }
+    append(&subchart_registry, info)
+    append(&subchart_registry_names_cache, info.name)
+  }
+}
+
+// Every sub-chart, in directory order. Borrowed - valid until the next refresh.
+subchart_registry_rows :: proc() -> []Subchart_Info {
+  subchart_registry_refresh()
+  return subchart_registry[:]
+}
+
+// Just the names, for a suggestion corpus.
+subchart_registry_names :: proc() -> []string {
+  subchart_registry_refresh()
+  return subchart_registry_names_cache[:]
+}
+
+// One row by name, or nil. This is how a call node finds the parameters to draw fields for.
+subchart_registry_find :: proc(name: string) -> ^Subchart_Info {
+  subchart_registry_refresh()
+  for &info in subchart_registry {
+    if info.name == name {
+      return &info
+    }
+  }
+  return nil
+}
 
 BHV_EXT :: ".bhv"
 
@@ -72,7 +146,51 @@ Behaviour_Doc :: struct {
   // of the three scopes: inline is one chart's own business, global is everything's, and this is "this
   // chart also watches for that".
   uses:    [dynamic]string, // owned
+  // One line of description. Every chart may have one - the browser had nowhere to read a blurb from
+  // for a saved file, so every tile but the built-in ones was a bare name. A sub-chart NEEDS one: it
+  // appears in the palette next to blocks that all carry a sentence saying what they do.
+  desc:    string, // owned
+  // --- the sub-chart half -------------------------------------------------------------------------
+  // Is this document a BLOCK rather than a program? Declared by a `subchart` line, not derived from
+  // content the way "watchers only" is: there is nothing in a chart's nodes from which a parameter list
+  // could be inferred, and a chart that silently changed kind when you added a parameter would be worse
+  // than one that says so. What it costs you is listed in script_lint - once mode, no watchers, no
+  // borrowing, no recursion.
+  is_subchart: bool,
+  // What a call site fills in. Param_Spec is REUSED rather than mirrored: it is exactly what ed_params
+  // renders a field from and what the linter judges a value against, so a declared parameter is the
+  // same kind of thing as a catalog one and every generic consumer already knows how to treat it.
+  // `name`, `title` and `help` are owned; see behaviour_doc_free.
+  params:      [SUBCHART_MAX_PARAMS]Param_Spec,
+  param_count: int,
 }
+
+// The declared parameters, as the slice every spec-driven consumer wants.
+subchart_params :: proc(doc: ^Behaviour_Doc) -> []Param_Spec {
+  if doc == nil {
+    return nil
+  }
+  return doc.params[:min(doc.param_count, SUBCHART_MAX_PARAMS)]
+}
+
+// Which parameter kinds a sub-chart may declare, and why not the others.
+//
+// An argument arrives as a VARIABLE, and `@name` is only expanded in slots that have text to expand -
+// script_arg for the string kinds, script_coord for a Coord's expression slot. A numeric slot is an
+// f64 with nowhere to put an expression, so `approach @dist` cannot work; declaring a numeric parameter
+// would produce a block whose knob silently did nothing. See BACKLOG.md, "Numeric block arguments do
+// not interpolate" - that item is what unblocks the other four kinds.
+subchart_param_kind_ok :: proc(kind: Param_Kind) -> bool {
+  switch kind {
+  case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name, .Coord:
+    return true
+  case .Num, .Duration, .Percent:
+    return false
+  }
+  return false
+}
+
+SUBCHART_NUMERIC_WHY :: "a number cannot be passed in yet - an argument arrives as @name, and numeric slots do not interpolate (BACKLOG: 'Numeric block arguments do not interpolate'). Use a text kind, or test the value with var_above / var_below inside the sub-chart."
 
 // A string field of a step, copied so the copy owns it. Empty stays empty rather than becoming a
 // zero-length allocation: script_step_free deletes every one of these, and "" carries no pointer to
@@ -89,6 +207,13 @@ script_step_clone :: proc(s: Script_Step) -> Script_Step {
   out := s
   out.src = clone_if(s.src)
   out.group = clone_if(s.group)
+  out.call_name = clone_if(s.call_name)
+  // Every slot, not just [0, call_arg_count) - script_step_free deletes every slot, so cloning fewer
+  // would hand the copy a pointer into the original's strings and free it twice.
+  for a, i in s.call_args {
+    out.call_args[i].name = clone_if(a.name)
+    out.call_args[i].value = clone_if(a.value)
+  }
   out.action.strs[0] = clone_if(s.action.strs[0])
   out.action.strs[1] = clone_if(s.action.strs[1])
   // Every ROW of each condition, not just row 0 - see script_condition_free for the other half of this.
@@ -108,6 +233,13 @@ script_step_clone :: proc(s: Script_Step) -> Script_Step {
 behaviour_doc_clone :: proc(doc: Behaviour_Doc) -> (out: Behaviour_Doc) {
   out = doc
   out.name = clone_if(doc.name)
+  out.desc = clone_if(doc.desc)
+  for p, i in doc.params {
+    out.params[i].name = clone_if(p.name)
+    out.params[i].title = clone_if(p.title)
+    out.params[i].help = clone_if(p.help)
+    out.params[i].choices = subchart_choices_clone(p.choices)
+  }
   out.trigger.strs[0] = clone_if(doc.trigger.strs[0])
   out.trigger.strs[1] = clone_if(doc.trigger.strs[1])
   out.steps = make([dynamic]Script_Step, 0, len(doc.steps))
@@ -130,7 +262,37 @@ behaviour_doc_free :: proc(doc: ^Behaviour_Doc) {
   }
   delete(doc.uses)
   delete(doc.name)
+  delete(doc.desc)
+  // Every slot, past param_count too - dropping a parameter in the editor lowers the count without
+  // clearing the row behind it, and the row still owns its strings.
+  for &p in doc.params {
+    delete(p.name)
+    delete(p.title)
+    delete(p.help)
+    subchart_choices_free(&p.choices)
+  }
   doc^ = {}
+}
+
+// A .Choice parameter's value list. Owned as a whole - the slice AND every string in it - because it
+// is built from a `choices=a,b,c` token rather than pointing at the rodata a catalog row uses.
+subchart_choices_clone :: proc(src: []string) -> []string {
+  if len(src) == 0 {
+    return nil
+  }
+  out := make([]string, len(src))
+  for s, i in src {
+    out[i] = strings.clone(s)
+  }
+  return out
+}
+
+subchart_choices_free :: proc(choices: ^[]string) {
+  for c in choices^ {
+    delete(c)
+  }
+  delete(choices^)
+  choices^ = nil
 }
 
 // --- paths ---------------------------------------------------------------------------------------
@@ -168,6 +330,23 @@ bhv_name_ok :: proc(name: string) -> bool {
 
 BHV_NAME_RULE :: "letters, digits, - and _ only (no spaces: the name is also a command argument)"
 
+// A PARAMETER's name, which is a stricter thing than a document's: it becomes a variable, so it has to
+// survive `@name` interpolation. That alphabet is engine/vars.odin's var_name_byte - a hyphen would end
+// the name early and `@stop-at` would read as `@stop` followed by "-at". Kept in step with it by hand
+// for the same reason lint_name_byte is: the engine's copy is file-private.
+bhv_param_name_ok :: proc(name: string) -> bool {
+  if name == "" || len(name) >= SUBCHART_SAVE_NAME {
+    return false // SUBCHART_SAVE_NAME is what a call frame can remember; a longer name could not be restored
+  }
+  for i in 0 ..< len(name) {
+    c := name[i]
+    if c != '_' && !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') {
+      return false
+    }
+  }
+  return true
+}
+
 // --- op names ------------------------------------------------------------------------------------
 
 @(rodata)
@@ -184,6 +363,35 @@ BHV_OP_NAMES := [Script_Op]string {
   .Goto     = "goto",
   .Branch   = "branch",
   .Return   = "return",
+  .Call     = "call",
+}
+
+// The parameter kind names a `param` line spells. Not derived from the enum: the file's vocabulary is
+// its own contract, and renaming a Param_Kind variant must not silently invalidate every saved
+// sub-chart. A kind with no entry here simply cannot be declared, which is how the numeric three stay
+// out (see subchart_param_kind_ok).
+@(rodata)
+BHV_PARAM_KIND_NAMES := [Param_Kind]string {
+  .Num        = "num",
+  .Duration   = "duration",
+  .Percent    = "percent",
+  .Coord      = "coord",
+  .Str        = "text",
+  .Names      = "names",
+  .Mob        = "mob",
+  .Key        = "key",
+  .Var_Name   = "var",
+  .Choice     = "choice",
+  .Chart_Name = "chart",
+}
+
+bhv_param_kind_from_name :: proc(s: string) -> (kind: Param_Kind, ok: bool) {
+  for n, k in BHV_PARAM_KIND_NAMES {
+    if n == s {
+      return k, true
+    }
+  }
+  return .Str, false
 }
 
 bhv_op_from_name :: proc(s: string) -> (op: Script_Op, ok: bool) {
@@ -202,12 +410,34 @@ bhv_serialize :: proc(doc: ^Behaviour_Doc, b: ^strings.Builder) {
   // `kind` / `trigger` are NOT written any more - a watcher is an `.On` node now, and bhv_deserialize
   // rewrites an old file into that shape on the way in. The reader still understands them, so an
   // existing interrupt file keeps working; re-saving one writes the new form.
+  // A bare flag line, first, so `head -3` on a file answers "is this a block or a program".
+  if doc.is_subchart {
+    fmt.sbprintln(b, "subchart")
+  }
+  // Rest-of-line, like `group` - a description is a sentence, and quoting one would be the only place
+  // in this format where prose needed escaping.
+  if doc.desc != "" {
+    fmt.sbprintfln(b, "desc %s", doc.desc)
+  }
   fmt.sbprintfln(b, "mode %s", doc.mode == .Loop ? "loop" : "once")
   fmt.sbprintfln(b, "entry %d", u32(doc.entry))
   // Borrowed watchers, in priority order. One line each rather than a comma list, because a behaviour
   // name is a command argument everywhere else in the tool and this keeps it one token.
   for u in doc.uses {
     fmt.sbprintfln(b, "uses %s", u)
+  }
+  // Declared parameters, in order - the order is the order the call site's fields are drawn in, so it
+  // is authoring data and has to round-trip. Title and help are quoted because they contain spaces;
+  // bhv_tokens already honours a leading quote, so the reader learns nothing new.
+  for p in subchart_params(doc) {
+    fmt.sbprintf(b, "param %s %s '%s' '%s'", p.name, BHV_PARAM_KIND_NAMES[p.kind], p.title, p.help)
+    if len(p.choices) > 0 {
+      fmt.sbprintf(b, " choices=%s", strings.join(p.choices, ",", context.temp_allocator))
+    }
+    if p.optional {
+      fmt.sbprint(b, " optional")
+    }
+    fmt.sbprintln(b)
   }
   for step in doc.steps {
     fmt.sbprintf(b, "node %d %s %v %v", u32(step.id), BHV_OP_NAMES[step.op], step.ui_pos[0], step.ui_pos[1])
@@ -237,10 +467,24 @@ bhv_serialize :: proc(doc: ^Behaviour_Doc, b: ^strings.Builder) {
     if step.group != "" {
       fmt.sbprintfln(b, "  group %s", step.group)
     }
+    // A call names its document and then one line per argument. Rest-of-line for the same reason
+    // `group` is: an argument's value is free text (a monster name has spaces, a coord has a comma),
+    // and the alternative is teaching the tokenizer about quoting inside a key=value token.
+    if step.op == .Call {
+      fmt.sbprintfln(b, "  call %s", step.call_name)
+      for i in 0 ..< min(step.call_arg_count, len(step.call_args)) {
+        a := step.call_args[i]
+        if a.name == "" {
+          continue
+        }
+        fmt.sbprintfln(b, "  arg %s %s", a.name, a.value)
+      }
+    }
     // Payload, in the same spelling `script show` uses - script_write_* is the single renderer.
-    // A watcher that names a BODY carries no action of its own, and writing "do ?" for the empty one
-    // produced a file that would not load back - the reader has no block called "?".
-    if step.op == .Action || (step.op == .On && step.action.kind != .None) {
+    // A watcher carries no action of its own - what it does is the body it names - so `.On` is not
+    // here. It used to be, for the legacy one-node shape; a document cannot hold that any more
+    // (script_materialize_watcher_bodies upgrades it on load), so writing one would be inventing it.
+    if step.op == .Action {
       strings.write_string(b, "  do ")
       script_write_action(b, step.action)
       fmt.sbprintln(b)
@@ -321,7 +565,7 @@ bhv_parse_params :: proc(spec: []Param_Spec, toks: []string, nums: ^[4]f64, strs
         ni += 2
         strs[si] = strings.clone("")
         si += 1
-      case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+      case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
         strs[si] = strings.clone("")
         si += 1
       }
@@ -361,7 +605,7 @@ bhv_parse_params :: proc(spec: []Param_Spec, toks: []string, nums: ^[4]f64, strs
       ni += 2
       strs[si] = strings.clone("")
       si += 1
-    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
       strs[si] = strings.clone(t)
       si += 1
     }
@@ -457,6 +701,78 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
         continue
       }
       doc.trigger = ev
+
+    case "subchart":
+      doc.is_subchart = true
+
+    case "desc":
+      // Verbatim like `group` - it is a sentence, not a token list.
+      doc.desc = strings.clone(strings.trim_space(line[len("desc"):]))
+
+    case "param":
+      if len(toks) < 5 {
+        report(&problems, lineno, "param: expected \"param <name> <kind> 'Title' 'help sentence'\"")
+        continue
+      }
+      if doc.param_count >= SUBCHART_MAX_PARAMS {
+        report(&problems, lineno, fmt.tprintf("param: more than %d parameters on one sub-chart", SUBCHART_MAX_PARAMS))
+        continue
+      }
+      if !bhv_param_name_ok(toks[1]) {
+        report(&problems, lineno, fmt.tprintf("param: '%s' is not a usable name - letters, digits and _ only (it is read as @%s)", toks[1], toks[1]))
+        continue
+      }
+      kind, kok := bhv_param_kind_from_name(toks[2])
+      if !kok {
+        report(&problems, lineno, fmt.tprintf("param: unknown kind '%s'", toks[2]))
+        continue
+      }
+      // Refused at READ time, not only by the linter: a numeric parameter would load into a field that
+      // silently does nothing, and a file that cannot work should say so where it is opened.
+      if !subchart_param_kind_ok(kind) {
+        report(&problems, lineno, fmt.tprintf("param %s: %s", toks[1], SUBCHART_NUMERIC_WHY))
+        continue
+      }
+      spec := Param_Spec {
+        name  = strings.clone(toks[1]),
+        kind  = kind,
+        title = strings.clone(toks[3]),
+        help  = strings.clone(toks[4]),
+      }
+      bad_param := false
+      for kv in toks[5:] {
+        if kv == "optional" {
+          spec.optional = true
+          continue
+        }
+        eq := strings.index_byte(kv, '=')
+        if eq < 0 {
+          report(&problems, lineno, fmt.tprintf("param: '%s' is not key=value", kv))
+          bad_param = true
+          break
+        }
+        key, val := kv[:eq], kv[eq + 1:]
+        switch key {
+        case "choices":
+          parts := strings.split(val, ",", context.temp_allocator)
+          spec.choices = subchart_choices_clone(parts)
+        case:
+          report(&problems, lineno, fmt.tprintf("param: unknown key '%s' - written by a newer build?", key))
+          bad_param = true
+        }
+        if bad_param {
+          break
+        }
+      }
+      if bad_param {
+        delete(spec.name)
+        delete(spec.title)
+        delete(spec.help)
+        subchart_choices_free(&spec.choices)
+        continue
+      }
+      doc.params[doc.param_count] = spec
+      doc.param_count += 1
 
     case "uses":
       if len(toks) < 2 {
@@ -593,7 +909,7 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
       }
       append(&doc.steps, step)
 
-    case "do", "if", "until", "group":
+    case "do", "if", "until", "group", "call", "arg":
       if len(doc.steps) == 0 {
         report(&problems, lineno, fmt.tprintf("'%s' before any node line", toks[0]))
         continue
@@ -603,6 +919,37 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
       case "group":
         // Verbatim, not tokenised: the name is free text and may contain spaces and punctuation.
         step.group = strings.clone(strings.trim_space(line[len("group"):]))
+      case "call":
+        if len(toks) < 2 {
+          report(&problems, lineno, "call: expected the name of the sub-chart to run")
+          continue
+        }
+        if !bhv_name_ok(toks[1]) {
+          report(&problems, lineno, fmt.tprintf("call: '%s' is not a usable name - %s", toks[1], BHV_NAME_RULE))
+          continue
+        }
+        delete(step.call_name)
+        step.call_name = strings.clone(toks[1])
+      case "arg":
+        if len(toks) < 2 {
+          report(&problems, lineno, "arg: expected 'arg <parameter> <value...>'")
+          continue
+        }
+        if step.call_arg_count >= SUBCHART_MAX_PARAMS {
+          report(&problems, lineno, fmt.tprintf("arg: more than %d arguments on one call", SUBCHART_MAX_PARAMS))
+          continue
+        }
+        // Rest-of-line after the parameter name, verbatim: a value is free text (a monster name has
+        // spaces, a coord has a comma), and it is handed to the variable store as-is.
+        rest := strings.trim_space(line[len("arg"):])
+        cut := strings.index_any(rest, " \t")
+        value := cut < 0 ? "" : strings.trim_space(rest[cut:])
+        slot := &step.call_args[step.call_arg_count]
+        delete(slot.name)
+        delete(slot.value)
+        slot.name = strings.clone(toks[1])
+        slot.value = strings.clone(value)
+        step.call_arg_count += 1
       case "do":
         act, aok, aerr := bhv_parse_action(toks[1:])
         if !aok {
@@ -670,6 +1017,10 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
   // and re-saving it writes the lowered form.
   if problems == 0 {
     script_lower_structured(&doc.steps, &doc.entry)
+    // BETWEEN the two, because it produces a node the fall-through pass has to see: the body it
+    // appends is what makes the watcher's subgraph identifiable as a region rather than as loose
+    // program text the node above it would be given an edge into.
+    script_materialize_watcher_bodies(&doc.steps)
     // AFTER lowering, never before: lowering rewrites structured blocks into graph ops using array
     // order, so naming successors first would freeze edges it is about to redraw.
     script_materialize_fallthrough(doc.steps[:])
@@ -749,6 +1100,54 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
 // moves the bodies out at run time and those two rules take over, so naming a successor across such a
 // boundary would freeze an answer that is about to stop being true. Every skip below is one of those,
 // and a skip only ever leaves things as they already were.
+// Give a bodyless `on <event> -> <action>` a real body node, and wire the watcher to it.
+//
+// THE LEGACY WATCHER SHAPE. An `.On` used to be able to carry a single action itself, with no edge -
+// which is what builder.on() emits and what every interrupt file written before bodies existed holds.
+// The header of this file says there is one concept now ("a WATCHER is an `.On` node plus the body its
+// edge points at"), and everything downstream believes it: `script_attach_doc_watchers`,
+// `armed_watcher_reload` and `cli_interrupt` all skip an `.On` whose goto_id is 0. Only
+// script_build_irq_regions still knew how to synthesize the missing half, at RUN time.
+//
+// So the shape was runnable and un-armable at the same time - `interrupt on <name>` refused it with
+// "it has no watchers", which reads as a broken file rather than as an old one. It is the same
+// one-way door as script_lower_structured: upgrade it on the way in, and everything past this point
+// sees exactly one representation.
+//
+// The action's owned strings MOVE to the body rather than being cloned, so nothing is freed twice.
+script_materialize_watcher_bodies :: proc(steps: ^[dynamic]Script_Step) -> (changed: bool) {
+  next_id := Node_Id(0)
+  for s in steps {
+    next_id = max(next_id, s.id)
+  }
+  // Bounded to the ORIGINAL length: the bodies this appends are `.Action`s and can never need one.
+  n := len(steps)
+  for i in 0 ..< n {
+    if steps[i].op != .On || steps[i].goto_id != 0 || steps[i].action.kind == .None {
+      continue
+    }
+    next_id += 1
+    body := Script_Step {
+      id     = next_id,
+      op     = .Action,
+      action = steps[i].action, // ownership MOVES - see below
+      // Under the watcher rather than on top of it, so a file opened in the editor for the first time
+      // does not stack the two nodes at one point and look like a single node.
+      ui_pos = {steps[i].ui_pos.x, steps[i].ui_pos.y + 120},
+      group  = clone_if(steps[i].group),
+    }
+    body.src = step_label(body)
+    steps[i].action = {} // the .On must not keep the strings it just handed over
+    steps[i].goto_id = body.id
+    delete(steps[i].src)
+    steps[i].src = step_label(steps[i])
+    // Nothing above is held across this: append may realloc, so every touch goes through steps[i].
+    append(steps, body)
+    changed = true
+  }
+  return
+}
+
 script_materialize_fallthrough :: proc(steps: []Script_Step) -> (changed: bool) {
   n := len(steps)
   if n < 2 {
@@ -1004,6 +1403,141 @@ bhv_exists :: proc(name: string) -> bool {
   return os.exists(bhv_file_path(name))
 }
 
+// What one saved behaviour DECLARES about itself, without parsing its program.
+//
+// The browser and the palette both need this for every behaviour on disk, several times a second. A
+// full bhv_open per file per scan already costs a parse of every node; adding the palette as a second
+// caller of that would double it, so this reads the header and STOPS at the first `node` line - which
+// bhv_serialize guarantees comes after every header line it writes.
+//
+// Built-ins are answered from the registry rather than built: bhv_from_builtin runs the whole builder,
+// which is not something to do inside a UI scan, and a built-in is never a sub-chart anyway.
+Subchart_Info :: struct {
+  name:        string, // owned by the caller's allocator
+  desc:        string, // owned
+  is_subchart: bool,
+  params:      [SUBCHART_MAX_PARAMS]Param_Spec, // name/title/help owned; choices owned
+  param_count: int,
+  // Every variable this document WRITES - the same question lint_variables_set asks of an open
+  // document, answered for one that is not open. The linter needs it: a chart that calls a block and
+  // then reads what the block computed is doing the only thing there is to do (a call has no return
+  // value), and warning "nothing sets it" at that chart would be wrong.
+  sets:        []string, // owned
+}
+
+subchart_info_free :: proc(info: ^Subchart_Info) {
+  delete(info.name)
+  delete(info.desc)
+  for &p in info.params {
+    delete(p.name)
+    delete(p.title)
+    delete(p.help)
+    subchart_choices_free(&p.choices)
+  }
+  subchart_choices_free(&info.sets)
+  info^ = {}
+}
+
+bhv_read_header :: proc(name: string) -> (info: Subchart_Info, ok: bool) {
+  if !bhv_exists(name) {
+    if def := behaviour_def(name); def != nil {
+      return Subchart_Info{name = strings.clone(name), desc = clone_if(def.blurb)}, true
+    }
+    return {}, false
+  }
+  data, err := os.read_entire_file(bhv_file_path(name), context.temp_allocator)
+  if err != nil {
+    return {}, false
+  }
+  info.name = strings.clone(name)
+  // The whole file is already in memory, so walking past the header costs a token split per `do` line
+  // and nothing else. That is what buys `sets` - the header alone could not answer it.
+  sets := make([dynamic]string, 0, 8, context.temp_allocator)
+  header_over := false
+  for raw in strings.split_lines(strings.trim_prefix(string(data), BHV_BOM), context.temp_allocator) {
+    line := strings.trim_space(raw)
+    if line == "" || line[0] == '#' {
+      continue
+    }
+    toks := bhv_tokens(line)
+    if len(toks) == 0 {
+      continue
+    }
+    if header_over {
+      // Only the three blocks that create a variable, matched by the spelling script_write_action
+      // produces. Kept in step with lint_variables_set by hand; the selftest checks the pair agree.
+      if toks[0] == "do" && len(toks) >= 3 {
+        switch toks[1] {
+        case "var", "add", "read_value":
+          if n := script_var_name_of(toks[2]); n != "" && !slice.contains(sets[:], n) {
+            append(&sets, n)
+          }
+        }
+      }
+      continue
+    }
+    switch toks[0] {
+    case "node":
+      header_over = true // everything below is program; keep going for `sets`
+    case "subchart":
+      info.is_subchart = true
+    case "desc":
+      delete(info.desc)
+      info.desc = strings.clone(strings.trim_space(line[len("desc"):]))
+    case "param":
+      // Silently skipped when malformed. This is the FAST path, not the judge - bhv_deserialize
+      // reports the problem properly the moment anything opens the document for real.
+      if len(toks) < 5 || info.param_count >= SUBCHART_MAX_PARAMS || !bhv_param_name_ok(toks[1]) {
+        continue
+      }
+      kind, kok := bhv_param_kind_from_name(toks[2])
+      if !kok || !subchart_param_kind_ok(kind) {
+        continue
+      }
+      spec := Param_Spec {
+        name  = strings.clone(toks[1]),
+        kind  = kind,
+        title = strings.clone(toks[3]),
+        help  = strings.clone(toks[4]),
+      }
+      for kv in toks[5:] {
+        if kv == "optional" {
+          spec.optional = true
+        } else if strings.has_prefix(kv, "choices=") {
+          spec.choices = subchart_choices_clone(strings.split(kv[len("choices="):], ",", context.temp_allocator))
+        }
+      }
+      info.params[info.param_count] = spec
+      info.param_count += 1
+    }
+  }
+  info.sets = subchart_choices_clone(sets[:])
+  return info, true
+}
+
+// The declared parameters of an info row, as a slice.
+subchart_info_params :: proc(info: ^Subchart_Info) -> []Param_Spec {
+  if info == nil {
+    return nil
+  }
+  return info.params[:min(info.param_count, SUBCHART_MAX_PARAMS)]
+}
+
+// `approach_and_kill <who> <spot>` - what a call site reads as. The same shape script_sig gives a
+// catalog block, so the palette's sub-chart rows line up with its block rows.
+subchart_signature :: proc(name: string, params: []Param_Spec, allocator := context.temp_allocator) -> string {
+  b := strings.builder_make(allocator)
+  strings.write_string(&b, name)
+  for p in params {
+    if p.optional {
+      fmt.sbprintf(&b, " [%s]", p.name)
+    } else {
+      fmt.sbprintf(&b, " <%s>", p.name)
+    }
+  }
+  return strings.to_string(b)
+}
+
 // Every saved behaviour, sorted the way the directory hands them over. Names are TEMP-allocated.
 bhv_list_names :: proc(allocator := context.temp_allocator) -> []string {
   out := make([dynamic]string, allocator)
@@ -1037,12 +1571,19 @@ bhv_from_builtin :: proc(def: ^Behaviour_Def) -> (doc: Behaviour_Doc, ok: bool) 
   doc.mode = mode
   doc.steps = steps
   doc.uses = make([dynamic]string)
+  // The registry's blurb IS the document's description. One field, so the browser reads a built-in and
+  // a saved chart the same way instead of special-casing which of the two carries a sentence.
+  doc.desc = clone_if(def.blurb)
   if len(doc.steps) > 0 {
     doc.entry = doc.steps[0].id
   }
   // The builder's structured blocks stop at the document boundary - see script_lower_structured. This
   // is a no-op for the graph-authored charts (auto, hunt, sweep), which is most of them.
   script_lower_structured(&doc.steps, &doc.entry)
+  // builder.on() emits the bodyless shape, so an Odin behaviour with a watcher arrives needing this
+  // too - and it has to be the same upgrade, or an exported built-in would differ from the file it
+  // was exported from.
+  script_materialize_watcher_bodies(&doc.steps)
   // ... and its fall-throughs stop here too. `seq` writes steps in execution order and lets adjacency
   // carry the flow, which is the right way to WRITE one and the wrong way to EDIT one.
   script_materialize_fallthrough(doc.steps[:])

@@ -48,7 +48,7 @@ st_script :: proc(user_data: rawptr, phase: engine.State_Phase) -> engine.State_
     // otherwise that escape hatch would need you to hand-step your own kill switch.
     if !run.paused {
       script_interrupts(ctx)
-      if !run.stepping || run.watcher_depth > 0 {
+      if !run.stepping || script_frame_in_watcher(run) {
         script_walk(ctx)
       }
     }
@@ -80,6 +80,11 @@ script_exit_current :: proc(ctx: ^Behaviour_Context) {
 // path without any of them having to remember.
 script_teardown :: proc(ctx: ^Behaviour_Context) {
   script_exit_current(ctx)
+  // Hand back what every live call borrowed. A run stopped INSIDE a sub-chart - `script stop`, a detach,
+  // an interrupt that ended the program - still owes the caller its own values for that block's
+  // parameters, and this is the one path every ending goes through. It sits with the key release below
+  // for exactly that reason: both are things the RUN owes, not things a step can be asked to undo.
+  script_frames_unwind(ctx.session)
   // Latch handover, half two: give the edge state back to the Session-level watchers before this run
   // stops being the evaluator. Without it, a trigger that is still true when the chart ends would look
   // like a fresh rising edge to armed_watcher_tick a moment later and fire again. See interrupt.odin.
@@ -125,10 +130,19 @@ script_teardown :: proc(ctx: ^Behaviour_Context) {
 // for a completion or branch condition.)
 script_interrupts :: proc(ctx: ^Behaviour_Context) {
   run := &ctx.session.script
-  // Already inside a region: evaluate nothing. Not even the latches - a condition that becomes true
+  // Already inside a WATCHER: evaluate nothing. Not even the latches - a condition that becomes true
   // while the region runs is a real edge that has not been serviced yet, and it should fire once the
   // region returns rather than be quietly swallowed here.
-  if run.watcher_depth > 0 {
+  //
+  // Deliberately not "already inside any region". A sub-chart is ordinary program text that happens to
+  // live past main_len, and an escape hatch that stopped watching the moment you called one of your own
+  // blocks would be an escape hatch with a hole in it. Only interrupting an interrupt is refused.
+  if script_frame_in_watcher(run) {
+    return
+  }
+  // ... and there has to be somewhere to put the frame. Full means a chart nested to its call limit,
+  // which SUBCHART_MAX_DEPTH is set below the frame cap specifically to prevent.
+  if run.depth >= SCRIPT_MAX_FRAMES {
     return
   }
   for &w, wi in run.watchers {
@@ -155,16 +169,12 @@ script_interrupts :: proc(ctx: ^Behaviour_Context) {
     // program from here on: it polls across ticks and its exit runs, so an interrupt can walk somewhere
     // and actually arrive. A body that never finishes freezes the main program until `script stop` -
     // which is the same deal as any other blocking step, and visible in `script` as the current step.
-    run.suspended = Suspended_Frame {
-      pc      = run.pc,
-      entered = run.entered,
-      nloop   = run.nloop,
-      loops   = run.loops,
-    }
-    run.watcher_depth = 1
     run.active_watcher = wi // which watcher has control, so the UI can light the right chip
-    run.nloop = 0 // the region gets its own loop stack; the main program's is in suspended
-    script_goto(run, w.entry)
+    script_frame_push(
+      run,
+      Suspended_Frame{kind = .Watcher, pc = run.pc, entered = run.entered, nloop = run.nloop, loops = run.loops, watcher = wi},
+      w.entry,
+    )
     return
   }
 }
@@ -300,11 +310,11 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
       return
     }
     // The main program ends at main_len, not at the end of the array: everything past that point is
-    // interrupt-region code, which is only reachable by an interrupt firing.
-    off_end := run.pc < 0 || run.pc >= len(run.steps) || (run.watcher_depth == 0 && run.pc >= run.main_len)
+    // region code - a watcher body or a called sub-chart - reachable only by being entered.
+    off_end := run.pc < 0 || run.pc >= len(run.steps) || (run.depth == 0 && run.pc >= run.main_len)
     if off_end {
-      if run.watcher_depth > 0 {
-        script_watcher_return(ctx) // a region that ran off its end - resume as if it had returned
+      if run.depth > 0 {
+        script_frame_pop(ctx) // a region that ran off its end - resume as if it had returned
         continue
       }
       if !script_program_end(ctx) {
@@ -497,30 +507,183 @@ script_walk_n :: proc(ctx: ^Behaviour_Context, budget: int) {
       script_goto(run, dest)
 
     case .Return:
-      if run.watcher_depth == 0 {
+      if run.depth == 0 {
         // A `return` reached in the main program is simply the end of it - a graph's terminator.
         if !script_program_end(ctx) {
           return
         }
         continue
       }
-      script_watcher_return(ctx)
+      script_frame_pop(ctx)
+
+    case .Call:
+      if !script_take_call(ctx, step) {
+        return
+      }
     }
   }
 }
 
-// Resume the main program where the interrupt suspended it. pc is restored DIRECTLY rather than through
-// script_goto because `entered` must come back too: the suspended step may have been mid-flight (a walk
-// that is still walking), and re-entering it would re-issue its start.
-script_watcher_return :: proc(ctx: ^Behaviour_Context) {
+// Enter the sub-chart <step> names. Returns false when the run cannot continue.
+//
+// Everything that can go wrong here was already refused at load - script_expand_calls resolves the
+// entry, checks the cycle and checks the depth - so these are assertions with an explanation attached,
+// not the primary gate. They are still checked, because a node whose callee failed to expand is a node
+// that would otherwise jump to index 0 and silently restart the program.
+@(private = "file")
+script_take_call :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> bool {
   run := &ctx.session.script
-  run.pc = run.suspended.pc
-  run.entered = run.suspended.entered
-  run.nloop = run.suspended.nloop
-  run.loops = run.suspended.loops
-  run.watcher_depth = 0
+  if step.call_entry < 0 || step.call_entry >= len(run.steps) {
+    script_fail(ctx, step, fmt.tprintf("sub-chart '%s' was not loaded", step.call_name))
+    return false
+  }
+  if run.depth >= SCRIPT_MAX_FRAMES {
+    script_fail(ctx, step, fmt.tprintf("too many nested calls (%d) at '%s'", SCRIPT_MAX_FRAMES, step.call_name))
+    return false
+  }
+  frame := Suspended_Frame {
+    kind    = .Call,
+    pc      = run.pc, // the .Call node itself: the pop continues past it, by its own edges
+    entered = true,
+    nloop   = run.nloop,
+    loops   = run.loops,
+  }
+  // Bind the arguments, remembering what each name held first. Both halves in one pass, and in
+  // ARGUMENT order rather than in the callee's declared order, because the frame only has to be able to
+  // undo exactly what this loop did.
+  for i in 0 ..< min(step.call_arg_count, len(step.call_args)) {
+    a := step.call_args[i]
+    if a.name == "" || frame.saved_count >= len(frame.saved) {
+      continue
+    }
+    sv := &frame.saved[frame.saved_count]
+    sv.name_len = copy(sv.name[:], a.name)
+    if old, had := engine.session_var_get(&ctx.session.eng, a.name); had {
+      sv.had = true
+      sv.value_len = copy(sv.value[:], old)
+    }
+    frame.saved_count += 1
+    // script_arg, so a caller can pass one of its OWN variables down: `who=@target_name`. Resolved
+    // here, at the call, rather than inside the callee - the callee has no idea whose scope it came from.
+    engine.session_var_set(&ctx.session.eng, a.name, script_arg(ctx, a.value))
+  }
+  script_trace(ctx.session, step.id, .Step, "CALL '%s'", step.call_name)
+  script_frame_push(run, frame, step.call_entry)
+  return true
+}
+
+// --- the frame stack ---------------------------------------------------------------------------
+//
+// Entering a region - a watcher body or a called sub-chart - is one operation with one shape: remember
+// where you were, then jump. These four procs are that one operation, and every caller goes through
+// them so that "what does it mean for the pc to run off the end" has exactly one answer.
+
+// Is an interrupt currently in control? Not the same question as "is the stack non-empty" any more: a
+// sub-chart may be several frames deep with no watcher anywhere. Read by the walker's interrupt gate
+// (an interrupt cannot interrupt itself) and by the radar's status chips.
+script_frame_in_watcher :: proc(run: ^Script_Run) -> bool {
+  for i in 0 ..< min(run.depth, len(run.frames)) {
+    if run.frames[i].kind == .Watcher {
+      return true
+    }
+  }
+  return false
+}
+
+// Push <frame> and jump to <entry>. The region gets its own loop stack; the caller's is in the frame.
+@(private = "file")
+script_frame_push :: proc(run: ^Script_Run, frame: Suspended_Frame, entry: int) {
+  run.frames[run.depth] = frame
+  run.depth += 1
+  run.nloop = 0
+  script_goto(run, entry)
+}
+
+// Leave the innermost region and resume its caller.
+//
+// pc is restored DIRECTLY rather than through script_goto because `entered` must come back too: the
+// suspended step may have been mid-flight (a walk that is still walking), and re-entering it would
+// re-issue its start. A CALL is the exception - it resumes PAST the node that made it, so it goes
+// through script_goto after all, by way of the same success/fail arms every other block has.
+@(private = "file")
+script_frame_pop :: proc(ctx: ^Behaviour_Context) {
+  run := &ctx.session.script
+  if run.depth <= 0 {
+    return
+  }
+  run.depth -= 1
+  frame := run.frames[run.depth]
+  run.frames[run.depth] = {}
+  run.nloop = frame.nloop
+  run.loops = frame.loops
+  switch frame.kind {
+  case .Watcher:
+    run.pc = frame.pc
+    run.entered = frame.entered
+    run.active_watcher = -1
+    // Named by NODE, not by step index. The index is a position in the flat array - regions included -
+    // so once sub-charts exist "back to step 7" points at a node no open document contains.
+    back := run.pc >= 0 && run.pc < len(run.steps) ? run.steps[run.pc].id : Node_Id(0)
+    script_trace(ctx.session, back, .Note, "watcher done - back to where it was")
+  case .Call:
+    // Put the caller's own values back before anything else runs. A sub-chart's parameters behave as
+    // locals for exactly the names it declared; everything else it touched is still shared, which is
+    // the documented deal.
+    script_restore_saved_vars(ctx.session, &frame)
+    failed := run.call_failed
+    run.call_failed = false
+    run.pc = frame.pc
+    run.entered = true // the .Call node is finished; do not re-enter it
+    if run.pc < 0 || run.pc >= len(run.steps) {
+      return
+    }
+    step := &run.steps[run.pc]
+    if failed {
+      script_trace(ctx.session, step.id, .Note, "'%s' failed", step.call_name)
+      if !script_take_fail_edge(ctx, step) {
+        script_fail(ctx, step, fmt.tprintf("'%s' failed", step.call_name))
+      }
+      return
+    }
+    script_trace(ctx.session, step.id, .Step, "'%s' done", step.call_name)
+    script_goto(run, step.jump)
+  }
+}
+
+// Unwind every frame, restoring what each one saved. For the paths that abandon a run mid-region -
+// `script stop`, `script reset`, a detach. Without it a chart stopped inside a sub-chart would leave
+// the caller's variables holding the callee's arguments.
+@(private = "file")
+script_frames_unwind :: proc(session: ^Session) {
+  run := &session.script
+  for run.depth > 0 {
+    run.depth -= 1
+    if run.frames[run.depth].kind == .Call {
+      script_restore_saved_vars(session, &run.frames[run.depth])
+    }
+    run.frames[run.depth] = {}
+  }
   run.active_watcher = -1
-  script_trace(ctx.session, 0, .Note, "watcher done - back to step %d", run.pc + 1)
+  run.call_failed = false
+}
+
+// Put back what a call frame borrowed. An unset variable comes back UNSET rather than as "", because
+// `var_is` treats those differently on purpose (an unset variable equals nothing, not even "").
+@(private = "file")
+script_restore_saved_vars :: proc(session: ^Session, frame: ^Suspended_Frame) {
+  for i in 0 ..< min(frame.saved_count, len(frame.saved)) {
+    sv := &frame.saved[i]
+    name := string(sv.name[:min(sv.name_len, len(sv.name))])
+    if name == "" {
+      continue
+    }
+    if sv.had {
+      engine.session_var_set(&session.eng, name, string(sv.value[:min(sv.value_len, len(sv.value))]))
+    } else {
+      engine.session_var_set(&session.eng, name, "") // "" unsets - see engine/vars.odin
+    }
+  }
+  frame.saved_count = 0
 }
 // The pc ran off the end. Returns true if the walker should keep going (the program looped), false
 // if the run is over. There is no sub-script return path any more: sub-scripts were a stand-in for
@@ -610,6 +773,20 @@ script_note_line :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
 }
 
 script_fail :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, why: string) {
+  run := &ctx.session.script
+  // INSIDE A SUB-CHART, a failure with nowhere to go fails the CALL, not the run. That is what makes
+  // the call node's fail arm mean what every other block's fail arm means: "this did not work out, go
+  // this way instead". Without it a sub-chart would be the one block in the tool that can take the whole
+  // program down, and factoring a chart would change what it does.
+  //
+  // A WATCHER frame is deliberately not treated this way. An interrupt body that fails has no caller
+  // that asked for it - it fired on its own - so the run ending is the honest outcome.
+  if run.depth > 0 && run.frames[run.depth - 1].kind == .Call {
+    script_trace(ctx.session, step.id, .Note, "%s - sub-chart fails", why)
+    run.call_failed = true
+    script_frame_pop(ctx)
+    return
+  }
   fmt.printf("\n[script] step %d (%s) - %s. run stopped.\n", u32(step.id), step.src, why)
   fmt.print("memscan> ")
   // Say WHY the run is over here rather than leaving it to script_finish's "failed": the fail edge is
@@ -691,6 +868,42 @@ script_check_avail :: proc(session: ^Session, steps: []Script_Step) -> [dynamic]
   return out
 }
 
+// The same gate, over <doc> AND every sub-chart it can reach. Problems are prefixed with the document
+// they came from, because "approach: needs findmove" is unhelpful when the approach is three calls down
+// in a chart you did not write.
+//
+// Bounded by SUBCHART_MAX_DEPTH and by a visited set, so a cycle cannot spin here - script_expand_calls
+// is what REPORTS the cycle, and this runs before it.
+script_check_avail_deep :: proc(session: ^Session, doc: ^Behaviour_Doc) -> [dynamic]string {
+  out := script_check_avail(session, doc.steps[:])
+  seen := make(map[string]bool, 8, context.temp_allocator)
+  defer delete(seen)
+  seen[doc.name] = true
+
+  walk :: proc(session: ^Session, doc: ^Behaviour_Doc, seen: ^map[string]bool, depth: int, out: ^[dynamic]string) {
+    if depth > SUBCHART_MAX_DEPTH {
+      return
+    }
+    for s in doc.steps {
+      if s.op != .Call || s.call_name == "" || seen[s.call_name] {
+        continue
+      }
+      seen[s.call_name] = true
+      sub, ok := bhv_open(s.call_name)
+      if !ok {
+        continue // script_expand_calls reports the missing document; saying it twice helps nobody
+      }
+      defer behaviour_doc_free(&sub)
+      for p in script_check_avail(session, sub.steps[:]) {
+        append(out, fmt.tprintf("in sub-chart '%s': %s", s.call_name, p))
+      }
+      walk(session, &sub, seen, depth + 1, out)
+    }
+  }
+  walk(session, doc, &seen, 0, &out)
+  return out
+}
+
 // Take ownership of <steps> and begin running. Hoists the `on` watchers out of the instruction
 // stream so their position in the file does not affect when they arm.
 //
@@ -710,6 +923,10 @@ script_begin :: proc(
   run := &session.script
   run.steps = steps
   run.watchers = make([dynamic]Script_Watcher)
+  // Named BEFORE the appending passes, because two of them ask who is running: the self-borrow guard in
+  // script_attach_doc_watchers, and the cycle check in script_expand_calls, which starts its path here.
+  // (It used to be assigned at the bottom, which quietly made that guard compare against "".)
+  run.name = strings.clone(name)
   // "Is this a hunt chart" - see hunt_steering_on. Asked of the steps once, here, rather than per pick.
   run.sidestep_chart = false
   for step in run.steps {
@@ -724,7 +941,7 @@ script_begin :: proc(
     // names the body, so the body IS the main program here - hoisting it into a region as well would
     // mean the run started by falling off the end of an empty program and only worked because the
     // watcher happened to fire on the first tick. And an escape that can be interrupted by the same
-    // escape re-fires on its own still-true trigger forever; watcher_depth only caps nesting once inside.
+    // escape re-fires on its own still-true trigger forever; the frame stack only caps nesting once inside.
     run.main_len = len(run.steps)
   } else {
     // The main program ends where the inline watcher bodies begin; regions are appended after that, so
@@ -738,6 +955,16 @@ script_begin :: proc(
       script_attach_doc_watchers(session, run, u, "")
     }
     script_attach_global_irqs(session, run)
+  }
+  // Sub-charts LAST of the appending passes, and after the watcher regions on purpose: a borrowed
+  // watcher's body may itself call one, and by now it is in the array to be found.
+  if problems := script_expand_calls(session, run); len(problems) > 0 {
+    fmt.eprintfln("script: '%s' cannot start - %d problem(s) with the sub-charts it calls:", name, len(problems))
+    for p in problems {
+      fmt.eprintfln("  %s", p)
+    }
+    script_run_free(run)
+    return
   }
   // Identity -> position, once, here, AFTER the regions exist so their ids are in the map too.
   // Everything downstream (the walker) reads the derived jump index; nothing downstream knows ids
@@ -762,14 +989,15 @@ script_begin :: proc(
       return
     }
   }
-  run.name = strings.clone(name)
   run.mode = mode
   run.active = true
   run.pc = start
   run.entry_pc = start // where a Loop-mode wrap and `script reset` go back to
   run.entered = false
   run.paused = false
-  run.watcher_depth = 0
+  run.depth = 0
+  run.frames = {}
+  run.call_failed = false
   run.active_watcher = -1
   run.started_at = time.now()._nsec
   run.step_at = run.started_at
@@ -845,7 +1073,7 @@ script_attach_doc_watchers :: proc(session: ^Session, run: ^Script_Run, name: st
     fmt.eprintfln("script: watchers from '%s' are not armed for this run - %s", name, problems[0])
     return
   }
-  base, ok := script_append_irq_region(run, &doc)
+  base, ok := script_append_region(run, &doc)
   if !ok {
     return
   }
@@ -883,23 +1111,28 @@ script_attach_doc_watchers :: proc(session: ^Session, run: ^Script_Run, name: st
   }
 }
 
-// Append <doc>'s program to <run> as interrupt-region code, and return the id OFFSET it was pasted at.
+// Append <doc>'s program to <run> as REGION code, and return the id OFFSET it was pasted at.
 //
 // The ids have to be REMAPPED. Two independently authored charts both start numbering at 1, so
 // pasting one into the other verbatim would give duplicate ids - and script_resolve_ids maps id ->
 // index, so the second copy's edges would silently retarget onto the first's nodes. Offsetting every
 // id (and every edge that names one) by the host's high-water mark keeps each region's edges pointing
-// inside itself. The caller adds the same offset to find a watcher's entry.
+// inside itself. The caller adds the same offset to find the entry it wants.
 //
 // The doc is PARTITIONED on the way in, by the same proc a run's own steps go through, so each of its
 // watcher bodies arrives as its own terminated block. Without that, one borrowed watcher's body would
 // walk off its end straight into the next one's.
+//
+// TWO CALLERS, one mechanism: a borrowed document's watchers and a called sub-chart. They differ only
+// in what points at the pasted code afterwards - a Script_Watcher.entry, or a .Call node's call_entry.
 @(private = "file")
-script_append_irq_region :: proc(run: ^Script_Run, doc: ^Behaviour_Doc) -> (base: Node_Id, ok: bool) {
+script_append_region :: proc(run: ^Script_Run, doc: ^Behaviour_Doc, partition := true) -> (base: Node_Id, ok: bool) {
   if len(doc.steps) == 0 {
     return 0, false
   }
-  script_partition_watcher_bodies(&doc.steps, doc.entry)
+  if partition {
+    script_partition_watcher_bodies(&doc.steps, doc.entry)
+  }
   for s in run.steps {
     base = max(base, s.id)
   }
@@ -912,6 +1145,14 @@ script_append_irq_region :: proc(run: ^Script_Run, doc: ^Behaviour_Doc) -> (base
     c.condition = script_condition_clone(s.condition)
     c.until = script_condition_clone(s.until)
     c.src = strings.clone(s.src)
+    // A call inside the pasted code keeps its OWN name and arguments; its call_entry_id is stamped by
+    // the recursion in script_expand_calls, which runs over the appended steps after this returns.
+    c.call_name = strings.clone(s.call_name)
+    c.call_entry_id = 0
+    for a, i in s.call_args {
+      c.call_args[i].name = strings.clone(a.name)
+      c.call_args[i].value = strings.clone(a.value)
+    }
     c.scratch = {}
     c.condition_state = {}
     append(&run.steps, c)
@@ -924,6 +1165,145 @@ script_append_irq_region :: proc(run: ^Script_Run, doc: ^Behaviour_Doc) -> (base
   }
   append(&run.steps, Script_Step{id = top + 1, op = .Return, src = strings.clone("return")})
   return base, true
+}
+
+// --- sub-chart calls -------------------------------------------------------------------------------
+//
+// Paste in every sub-chart the program calls, so a call is a jump into program text that is already
+// there rather than a load in the middle of a run. Nothing is read from disk once a run has started -
+// which is the same guarantee `uses` gives, and is what makes a run reproducible while you are editing
+// the sub-chart in another window.
+//
+// ONE REGION PER DOCUMENT, not per call site. Two call sites of the same sub-chart share its steps and
+// therefore its per-node Step_Scratch, which is only safe because recursion is refused below: at most
+// one activation of a region is ever live. Per-call-site copies would lift that restriction at the cost
+// of duplicating the callee once per call, and nothing wants recursion badly enough to pay for it.
+
+// Everything script_expand_calls needs to carry through the recursion. A struct because the recursive
+// call already has five arguments and half of them are bookkeeping the caller should not have to spell.
+@(private = "file")
+Expand_Ctx :: struct {
+  session:  ^Session,
+  run:      ^Script_Run,
+  // Where each already-pasted document's entry ended up, by name. This is the dedup.
+  entry_of: map[string]Node_Id,
+  // The names on the path from the main program down to here, for the cycle message. Not a set: the
+  // point of the error is to be able to print the loop in the order you would walk it.
+  path:     [dynamic]string,
+  problems: [dynamic]string,
+}
+
+// Expand every call reachable from the program, depth first. Returns the problems (temp-allocated);
+// a non-empty list means the run must not start.
+@(private = "file")
+script_expand_calls :: proc(session: ^Session, run: ^Script_Run) -> []string {
+  ctx := Expand_Ctx {
+    session  = session,
+    run      = run,
+    entry_of = make(map[string]Node_Id, 8, context.temp_allocator),
+    path     = make([dynamic]string, 0, SUBCHART_MAX_DEPTH + 1, context.temp_allocator),
+    problems = make([dynamic]string, context.temp_allocator),
+  }
+  append(&ctx.path, run.name)
+  // [0, len) over the WHOLE array, not just the main program: a borrowed watcher's body is allowed to
+  // call a sub-chart too, and it was already appended by the time we get here.
+  script_expand_calls_over(&ctx, 0, len(run.steps), 0)
+  return ctx.problems[:]
+}
+
+// Expand the calls in steps[from:to]. <depth> is how many calls deep this range already is.
+//
+// The range is explicit because expanding APPENDS: each pasted document lands past `to`, and its own
+// calls are then expanded by the recursive call over exactly that new range. Walking to len(run.steps)
+// instead would re-visit nodes whose entry is already stamped and, worse, lose track of which depth
+// they are at.
+@(private = "file")
+script_expand_calls_over :: proc(ctx: ^Expand_Ctx, from, to: int, depth: int) {
+  for i in from ..< to {
+    if ctx.run.steps[i].op != .Call {
+      continue
+    }
+    name := ctx.run.steps[i].call_name
+    if name == "" {
+      append(&ctx.problems, "a call node names no sub-chart")
+      continue
+    }
+    if depth >= SUBCHART_MAX_DEPTH {
+      append(&ctx.problems, fmt.tprintf(
+        "'%s' calls '%s' more than %d deep - flatten one of them",
+        ctx.path[len(ctx.path) - 1], name, SUBCHART_MAX_DEPTH,
+      ))
+      continue
+    }
+    // Recursion, direct or indirect. Refused rather than depth-limited because regions are shared per
+    // document: a second live activation would be walking the same nodes with the first one's scratch.
+    if slice.contains(ctx.path[:], name) {
+      b := strings.builder_make(context.temp_allocator)
+      for p in ctx.path {
+        fmt.sbprintf(&b, "%s -> ", p)
+      }
+      strings.write_string(&b, name)
+      append(&ctx.problems, fmt.tprintf("'%s' would call itself: %s", name, strings.to_string(b)))
+      continue
+    }
+    // Already pasted by another call site - just point at it. Deliberately BEFORE the file read, so a
+    // chart calling the same helper ten times opens it once.
+    if entry, done := ctx.entry_of[name]; done {
+      ctx.run.steps[i].call_entry_id = entry
+      continue
+    }
+    doc, dok := bhv_open(name)
+    if !dok {
+      append(&ctx.problems, fmt.tprintf("'%s' calls '%s', which does not exist", ctx.path[len(ctx.path) - 1], name))
+      continue
+    }
+    defer behaviour_doc_free(&doc)
+    if why, bad := subchart_callable_why(&doc); bad {
+      append(&ctx.problems, fmt.tprintf("'%s' cannot be called: %s", name, why))
+      continue
+    }
+    // NOT partitioned: a sub-chart may not declare watchers (subchart_callable_why refuses one), so
+    // there are no bodies to separate, and partitioning would reorder the steps for nothing.
+    region_start := len(ctx.run.steps)
+    base, ok := script_append_region(ctx.run, &doc, partition = false)
+    if !ok {
+      append(&ctx.problems, fmt.tprintf("'%s' has no blocks to run", name))
+      continue
+    }
+    region_end := len(ctx.run.steps)
+    // The entry BY IDENTITY, remapped. `entry == 0` means "the first step", which after the paste is
+    // the first node of the region rather than the first node of the run.
+    entry_id := doc.entry != 0 ? doc.entry + base : ctx.run.steps[region_start].id
+    ctx.run.steps[i].call_entry_id = entry_id
+    ctx.entry_of[strings.clone(name, context.temp_allocator)] = entry_id
+    append(&ctx.path, name)
+    script_expand_calls_over(ctx, region_start, region_end, depth + 1)
+    pop(&ctx.path)
+  }
+}
+
+// Why <doc> may not be used as a sub-chart, or ok. THE one statement of the restrictions - the linter
+// reports them per-document while you author, and this refuses them at run start; two lists would be
+// two chances to disagree about what a sub-chart is.
+subchart_callable_why :: proc(doc: ^Behaviour_Doc) -> (why: string, bad: bool) {
+  if !doc.is_subchart {
+    return "it is a chart, not a block - tick 'Use as a block' in its chart options", true
+  }
+  if len(doc.steps) == 0 {
+    return "it has no blocks", true
+  }
+  if doc.mode == .Loop {
+    return "it loops, so it would never return - set its mode to 'once'", true
+  }
+  for s in doc.steps {
+    if s.op == .On {
+      return "it declares a watcher, and a watcher belongs to the chart you RUN - move the 'on' node to the caller", true
+    }
+  }
+  if len(doc.uses) > 0 {
+    return "it borrows watchers with 'uses', and a watcher belongs to the chart you RUN", true
+  }
+  return "", false
 }
 
 // --- graph reachability, shared by the partitioner and the "is this a chart?" question -------------
@@ -1055,7 +1435,7 @@ script_watcher_body_mask :: proc(steps: []Script_Step, is_body: []bool, assume_f
 // fall-through is positional, and relative order is preserved inside each partition. Then:
 //
 //   - main runs off its end   -> pc >= main_len -> script_program_end. Exactly right.
-//   - a body runs off its end -> watcher_depth > 0  -> script_watcher_return. Also exactly right.
+//   - a body runs off its end -> depth > 0        -> script_frame_pop. Also exactly right.
 //
 // which is the same pair of rules that already governed the regions appended past main_len. Each body
 // still gets an explicit .Return terminator, because two adjacent bodies would otherwise run into each
@@ -1154,16 +1534,17 @@ script_partition_watcher_bodies :: proc(steps: ^[dynamic]Script_Step, entry: Nod
 // the point of the region - the body is ordinary program text, so it polls across ticks and its exit
 // runs like any other step.
 //
-// TWO SHAPES OF BODY, one mechanism. An `.On` that NAMES one (goto_id) already has its subgraph sitting
-// past main_len, put there by script_partition_watcher_bodies; the watcher just points at it. An `.On`
-// that carries a single action instead - which is what builder.on() emits, and what every `on` was
-// before bodies existed - gets a two-step region synthesized here. Everything downstream sees a region.
+// ONE SHAPE OF BODY. An `.On` NAMES its subgraph, which script_partition_watcher_bodies has already
+// moved past main_len; the watcher just points at it.
+//
+// There used to be a second shape - an `.On` carrying a single action and naming no body - and this
+// proc synthesized the missing two-step region for it at run time. That made the shape RUNNABLE while
+// every arming path still refused it (they all require goto_id != 0), so a perfectly good interrupt
+// file could not be switched on and the browser's checkbox appeared to fight you. It is now upgraded
+// on the way in instead, by script_materialize_watcher_bodies, so a document never holds it and there
+// is nothing left to synthesize here.
 @(private = "file")
 script_build_irq_regions :: proc(run: ^Script_Run) {
-  next_id := Node_Id(0)
-  for s in run.steps {
-    next_id = max(next_id, s.id)
-  }
   index_of := make(map[Node_Id]int, len(run.steps), context.temp_allocator)
   defer delete(index_of)
   for s, i in run.steps {
@@ -1181,32 +1562,16 @@ script_build_irq_regions :: proc(run: ^Script_Run) {
     }
     s := run.steps[i]
     w := Script_Watcher {
-      condition      = script_condition_clone(s.condition),
-      action = script_action_clone(s.action),
-      src    = strings.clone(s.src),
-      entry  = -1,
+      condition = script_condition_clone(s.condition),
+      src       = strings.clone(s.src),
+      entry     = -1,
     }
+    // entry stays -1 when nothing is wired: the edge still counts as serviced, so a bodyless watcher
+    // latches instead of re-firing every tick. script_lint warns about one.
     if s.goto_id != 0 {
       if e, ok := index_of[s.goto_id]; ok {
         w.entry = e
       }
-    } else if s.action.kind != .None {
-      w.entry = len(run.steps)
-      next_id += 1
-      body := Script_Step {
-        id     = next_id,
-        op     = .Action,
-        action = script_action_clone(s.action),
-      }
-      body.src = step_label(body)
-      append(&run.steps, body)
-      next_id += 1
-      ret := Script_Step {
-        id  = next_id,
-        op  = .Return,
-        src = strings.clone("return"),
-      }
-      append(&run.steps, ret)
     }
     append(&run.watchers, w)
   }
@@ -1276,8 +1641,8 @@ script_reset :: proc(session: ^Session) -> bool {
   script_exit_current(&ctx)
   keys_release_all(ctx.session) // a key held from the previous pass must not survive the rewind
 
-  run.watcher_depth = 0
-  run.suspended = {}
+  // Unwound, not just zeroed: a rewind from inside a sub-chart owes the caller its variables back.
+  script_frames_unwind(session)
   run.nloop = 0
   run.steps_done = 0
   run.stop_requested = false
@@ -1339,6 +1704,8 @@ cli_script :: proc(session: ^Session, args: []string) {
     script_cmd_trace(session, args[1:])
   case "lint", "check":
     script_cmd_lint(session, args[1:])
+  case "subchart", "block":
+    script_cmd_subchart(args[1:])
   case "pause":
     if !session.script.active {
       fmt.eprintln("script pause: nothing running.")
@@ -1398,10 +1765,17 @@ cli_status_behaviour :: proc(session: ^Session) {
     fmt.printfln("  keys held: %s   ('key release' lets go of all %d)", keys_held_text(session), n)
   }
   saved := bhv_list_names()
+  subchart_registry_refresh(force = true)
+  blocks := len(subchart_registry_rows())
   fmt.printfln(
     "  behaviours: %d in Odin (flyff/behaviours.odin) + %d saved in %s - 'script list'",
     len(BEHAVIOURS), len(saved), bhv_dir_path(),
   )
+  // Counted separately from the saved total it is part of: a block is not something you can run, so a
+  // "12 saved" that turns out to be 3 charts and 9 blocks would misdescribe what is there.
+  if blocks > 0 {
+    fmt.printfln("    ... %d of those are BLOCKS (sub-charts you place in a chart) - 'script list' names them", blocks)
+  }
   cli_status_interrupts(session)
   gated := 0
   for def in ACTIONS {
@@ -1445,7 +1819,7 @@ script_status_line :: proc(session: ^Session) -> string {
   }
   state := "idle"
   if run := &session.script; run.active {
-    what := run.paused ? "PAUSED" : (run.watcher_depth > 0 ? "INTERRUPT" : "RUNNING")
+    what := run.paused ? "PAUSED" : (script_frame_in_watcher(run) ? "INTERRUPT" : (run.depth > 0 ? "IN SUB-CHART" : "RUNNING"))
     state = fmt.tprintf("%s '%s' step %d/%d", what, run.name, min(run.pc + 1, run.main_len), run.main_len)
   }
   sensing := session.bh_sense_on ? ", sensing on" : ""
@@ -1467,8 +1841,17 @@ script_print_status :: proc(session: ^Session) {
   if run.last_line != "" {
     fmt.printfln("  current: %s", run.last_line)
   }
-  if run.watcher_depth > 0 {
-    fmt.printfln("  ^ inside an INTERRUPT; the main program is suspended at step %d and resumes when it returns.", run.suspended.pc + 1)
+  // The whole stack, innermost last, so "why is it not on the step I expect" has an answer that names
+  // every region between here and the main program.
+  for i in 0 ..< min(run.depth, len(run.frames)) {
+    f := run.frames[i]
+    switch f.kind {
+    case .Watcher:
+      fmt.printfln("  ^ inside an INTERRUPT; what it suspended is at step %d and resumes when it returns.", f.pc + 1)
+    case .Call:
+      name := f.pc >= 0 && f.pc < len(run.steps) ? run.steps[f.pc].call_name : "?"
+      fmt.printfln("  ^ inside sub-chart '%s', called from step %d.", name, f.pc + 1)
+    }
   }
   if len(run.watchers) > 0 {
     fmt.printfln("  %d interrupt(s) armed (first match wins):", len(run.watchers))
@@ -1490,6 +1873,16 @@ script_print_blocks :: proc(session: ^Session) {
   for def in EVENTS {
     mark, why := script_avail_mark(session, def.avail, def.not_built, def.not_built_why)
     fmt.printfln("  %s %-16s %s%s", mark, script_sig(def.name, def.params), def.blurb, why)
+  }
+  // The catalog you WROTE, after the one that shipped. Listed here and not only in `script list`
+  // because this command answers "what can a chart do", and a block you made is an answer to that.
+  subchart_registry_refresh(force = true)
+  if blocks := subchart_registry_rows(); len(blocks) > 0 {
+    fmt.println("YOUR BLOCKS (sub-charts - each one is a whole chart, run as a single node):")
+    for &info in blocks {
+      fmt.printfln("  [OK] %-28s %s", subchart_signature(info.name, subchart_info_params(&info)), info.desc)
+    }
+    fmt.println("       'script subchart <name>' makes a saved chart into one, or takes it back.")
   }
   fmt.println("STRUCTURE (nesting - what Odin authoring emits):")
   fmt.println("           if <event> / else / end,  repeat <n> / end,  while <event> / end,")
@@ -1640,9 +2033,396 @@ script_cmd_selftest :: proc(session: ^Session) {
   ed_selftest_insert()
   name_list_selftest()
   script_selftest_alert()
-  // Last, and called from here rather than chained off the end of the others, because it is the one
-  // section that needs the SESSION - it writes and reads real variables.
+  // Last, and called from here rather than chained off the end of the others, because they are the
+  // sections that need the SESSION - they write and read real variables.
   script_selftest_coord(session)
+  script_selftest_subchart(session)
+}
+
+// Sub-charts: the file format, the expansion, and what a call does to the caller's variables.
+//
+// Everything here is built and torn down in a temp directory of its own making - real .bhv files,
+// because the feature IS cross-document and a test that skipped the file would skip the half that
+// carries the parameter declarations. The names all start with the same prefix and are deleted at the
+// end, so running the suite twice cannot leave a chart behind for `script list` to show.
+@(private = "file")
+script_selftest_subchart :: proc(session: ^Session) {
+  fmt.println("  --- sub-charts ---")
+  fails := 0
+  PREFIX :: "zz_selftest_"
+
+  write :: proc(name: string, body: string, fails: ^int) -> bool {
+    os.make_directory(bhv_dir_path())
+    if err := os.write_entire_file(bhv_file_path(name), transmute([]byte)body); err != nil {
+      fmt.eprintfln("  FAIL: could not write the fixture '%s' (%v)", name, err)
+      fails^ += 1
+      return false
+    }
+    return true
+  }
+  // Fixtures are deleted whatever happens - a failure part-way through must not leave three charts in
+  // the user's behaviours folder.
+  written := make([dynamic]string, context.temp_allocator)
+  defer {
+    for n in written {
+      os.remove(bhv_file_path(n))
+    }
+    subchart_registry_refresh(force = true)
+  }
+  add :: proc(written: ^[dynamic]string, name: string, body: string, fails: ^int) -> bool {
+    if !write(name, body, fails) {
+      return false
+    }
+    append(written, name)
+    return true
+  }
+
+  // CONSTANTS, so the fixture bodies below can be built by concatenating literals - the bodies name
+  // each other, and Odin only folds a concatenation of constants.
+  leaf :: PREFIX + "leaf"
+  mid :: PREFIX + "mid"
+  host :: PREFIX + "host"
+  loopy :: PREFIX + "loopy"
+  cyc_a :: PREFIX + "cyc_a"
+  cyc_b :: PREFIX + "cyc_b"
+  slow :: PREFIX + "slow"
+  stopper :: PREFIX + "stopper"
+
+  ok := true
+  ok &= add(&written, leaf, `# memscan behaviour
+subchart
+desc innermost block
+mode once
+entry 1
+param who mob 'Monster' 'which monster this pass is about'
+node 1 action 0 0
+  do var leaf_saw @who
+`, &fails)
+  ok &= add(&written, mid, `# memscan behaviour
+subchart
+desc calls the leaf
+mode once
+entry 1
+param who mob 'Monster' 'passed straight down'
+node 1 call 0 0 goto=2
+  call ` + leaf + `
+  arg who @who
+node 2 action 0 120
+  do var mid_saw @leaf_saw
+`, &fails)
+  ok &= add(&written, host, `# memscan behaviour
+desc calls mid twice
+mode once
+entry 1
+node 1 action 0 0 goto=2
+  do var who HOST_OWN
+node 2 call 0 120 goto=3
+  call ` + mid + `
+  arg who Aibatt
+node 3 action 0 240 goto=4
+  do var first @leaf_saw
+node 4 call 0 360 goto=5
+  call ` + mid + `
+  arg who Mushpang
+node 5 action 0 480
+  do var second @leaf_saw
+`, &fails)
+  ok &= add(&written, loopy, `# memscan behaviour
+subchart
+desc a block that loops, which is not allowed
+mode loop
+entry 1
+node 1 action 0 0
+  do wait 0
+`, &fails)
+  ok &= add(&written, cyc_a, `# memscan behaviour
+subchart
+desc half of a cycle
+mode once
+entry 1
+node 1 call 0 0
+  call ` + cyc_b + `
+`, &fails)
+  ok &= add(&written, cyc_b, `# memscan behaviour
+subchart
+desc the other half
+mode once
+entry 1
+node 1 call 0 0
+  call ` + cyc_a + `
+`, &fails)
+  // A block that parks in a long wait, so the run can be stopped from INSIDE it.
+  ok &= add(&written, slow, `# memscan behaviour
+subchart
+desc parks in a wait so a stop can land mid-call
+mode once
+entry 1
+param who mob 'Monster' 'bound for as long as the wait lasts'
+node 1 action 0 0
+  do wait 600
+`, &fails)
+  ok &= add(&written, stopper, `# memscan behaviour
+desc gets stopped while inside a call
+mode once
+entry 1
+node 1 action 0 0 goto=2
+  do var who CALLER_OWN
+node 2 call 0 120
+  call ` + slow + `
+  arg who CALLEE_OWN
+`, &fails)
+  if !ok {
+    return
+  }
+  subchart_registry_refresh(force = true)
+
+  // 1. The FORMAT round-trips: subchart / desc / param on the way in, call / arg on the way out.
+  {
+    doc, dok := bhv_open(mid)
+    if !dok {
+      fmt.eprintfln("  FAIL: '%s' would not load back", mid)
+      fails += 1
+    } else {
+      defer behaviour_doc_free(&doc)
+      if !doc.is_subchart {
+        fmt.eprintfln("  FAIL: '%s' lost its 'subchart' flag through save/load", mid)
+        fails += 1
+      }
+      if doc.desc != "calls the leaf" {
+        fmt.eprintfln("  FAIL: '%s' description came back as '%s'", mid, doc.desc)
+        fails += 1
+      }
+      if doc.param_count != 1 || doc.params[0].name != "who" || doc.params[0].kind != .Mob {
+        fmt.eprintfln("  FAIL: '%s' parameter did not survive the load (%d declared)", mid, doc.param_count)
+        fails += 1
+      } else if doc.params[0].title != "Monster" || doc.params[0].help != "passed straight down" {
+        fmt.eprintfln("  FAIL: '%s' parameter lost its title or help", mid)
+        fails += 1
+      }
+      // The call node, and its argument. Both come off payload LINES rather than the node line, which
+      // is the part a `key=value` shape would have got wrong for a value with a space in it.
+      found := false
+      for s in doc.steps {
+        if s.op != .Call {
+          continue
+        }
+        found = true
+        if s.call_name != leaf {
+          fmt.eprintfln("  FAIL: the call in '%s' names '%s', want '%s'", mid, s.call_name, leaf)
+          fails += 1
+        }
+        if s.call_arg_count != 1 || s.call_args[0].name != "who" || s.call_args[0].value != "@who" {
+          fmt.eprintfln("  FAIL: the call in '%s' lost its argument", mid)
+          fails += 1
+        }
+      }
+      if !found {
+        fmt.eprintfln("  FAIL: '%s' has no call node after a load - the 'call' line was dropped", mid)
+        fails += 1
+      }
+      // ... and back OUT again. The load half above proves the reader; this proves the WRITER, which is
+      // the half a hand-written fixture cannot exercise - every chart the editor saves goes through it.
+      // Compared as text rather than field by field, because the file is the contract.
+      b := strings.builder_make(context.temp_allocator)
+      bhv_serialize(&doc, &b)
+      again, aok := bhv_deserialize(mid, strings.to_string(b))
+      if !aok {
+        fmt.eprintfln("  FAIL: what bhv_serialize wrote for '%s' would not load back", mid)
+        fails += 1
+      } else {
+        defer behaviour_doc_free(&again)
+        b2 := strings.builder_make(context.temp_allocator)
+        bhv_serialize(&again, &b2)
+        if strings.to_string(b) != strings.to_string(b2) {
+          fmt.eprintfln("  FAIL: '%s' does not survive a second save/load:\n--- once ---\n%s--- twice ---\n%s", mid, strings.to_string(b), strings.to_string(b2))
+          fails += 1
+        }
+      }
+    }
+  }
+
+  // 2. RUNNING it: two calls, two levels, and the caller's own `who` untouched afterwards.
+  //
+  // Run synchronously here rather than by handing it to the watcher tick: the suite is headless and
+  // must not depend on a thread getting scheduled. script_walk_n is the same walker either way.
+  engine.session_var_set(&session.eng, "leaf_saw", "")
+  engine.session_var_set(&session.eng, "who", "")
+  {
+    doc, dok := bhv_open(host)
+    if !dok {
+      fmt.eprintfln("  FAIL: '%s' would not load", host)
+      fails += 1
+    } else {
+      script_begin(session, host, doc.steps, doc.mode, doc.entry, .Chart, doc.uses[:])
+      doc.steps = nil // script_begin took ownership
+      defer behaviour_doc_free(&doc)
+      if !session.script.active {
+        fmt.eprintfln("  FAIL: '%s' refused to start", host)
+        fails += 1
+      } else {
+        ctx := Behaviour_Context {
+          session = session,
+          now     = time.now()._nsec,
+          board   = &session.bh_board,
+        }
+        // Generous, and bounded: the program is ~10 instructions, so anything near this cap means it
+        // is looping rather than finishing.
+        for _ in 0 ..< 200 {
+          if !session.script.active {
+            break
+          }
+          ctx.now = time.now()._nsec
+          script_walk_n(&ctx, 8)
+        }
+        if session.script.active {
+          fmt.eprintfln("  FAIL: '%s' did not finish - a call never returned", host)
+          fails += 1
+          script_stop(session)
+        }
+      }
+    }
+  }
+  expect :: proc(session: ^Session, name, want: string, fails: ^int) {
+    got, _ := engine.session_var_get(&session.eng, name)
+    if got != want {
+      fmt.eprintfln("  FAIL: after the run, %s = '%s', want '%s'", name, got, want)
+      fails^ += 1
+    }
+  }
+  expect(session, "first", "Aibatt", &fails) // the argument reached two levels down
+  expect(session, "second", "Mushpang", &fails) // ... and the second call bound its own
+  expect(session, "mid_saw", "Mushpang", &fails) // the callee saw what the leaf wrote
+  // THE ownership rule: `who` is a parameter of the block, and the caller had its own. It must come
+  // back. Without the save/restore in script_take_call this reads "Mushpang".
+  expect(session, "who", "HOST_OWN", &fails)
+
+  // 3. Expansion produced ONE region per document, with no id collisions. Ids are what edges resolve
+  // through, so a duplicate would silently retarget a jump into the wrong copy.
+  {
+    doc, dok := bhv_open(host)
+    if dok {
+      script_begin(session, host, doc.steps, doc.mode, doc.entry, .Chart, doc.uses[:])
+      doc.steps = nil
+      defer behaviour_doc_free(&doc)
+      run := &session.script
+      seen := make(map[Node_Id]bool, len(run.steps), context.temp_allocator)
+      defer delete(seen)
+      dupes := 0
+      for s in run.steps {
+        if s.id != 0 && seen[s.id] {
+          dupes += 1
+        }
+        seen[s.id] = true
+      }
+      if dupes > 0 {
+        fmt.eprintfln("  FAIL: %d duplicate node id(s) after expanding the calls", dupes)
+        fails += 1
+      }
+      calls, unresolved := 0, 0
+      for s in run.steps {
+        if s.op != .Call {
+          continue
+        }
+        calls += 1
+        if s.call_entry < 0 || s.call_entry >= len(run.steps) {
+          unresolved += 1
+        }
+      }
+      // Three call sites: two in the host, one in the single pasted copy of mid.
+      if calls != 3 {
+        fmt.eprintfln("  FAIL: expanded program has %d call node(s), want 3 (two in the host, one in the single copy of the middle block)", calls)
+        fails += 1
+      }
+      if unresolved > 0 {
+        fmt.eprintfln("  FAIL: %d call node(s) resolved to nothing", unresolved)
+        fails += 1
+      }
+      script_stop(session)
+    }
+  }
+
+  // 4. The refusals. Each must be caught BEFORE the run starts, and each for its own reason.
+  refuse :: proc(session: ^Session, name: string, what: string, fails: ^int) {
+    doc, dok := bhv_open(name)
+    if !dok {
+      fmt.eprintfln("  FAIL: fixture '%s' would not load", name)
+      fails^ += 1
+      return
+    }
+    script_begin(session, name, doc.steps, doc.mode, doc.entry, .Chart, doc.uses[:])
+    doc.steps = nil
+    defer behaviour_doc_free(&doc)
+    if session.script.active {
+      fmt.eprintfln("  FAIL: '%s' started, but %s", name, what)
+      fails^ += 1
+      script_stop(session)
+    }
+  }
+  refuse(session, cyc_a, "it calls itself through another block", &fails)
+
+  // 5. STOPPED MID-CALL. `script stop`, a detach, an interrupt that ends the program - every one of
+  // them leaves the run inside the callee, still owing the caller the values it borrowed. This is the
+  // half script_reset had and script_teardown did not, so a stopped chart left the caller's variables
+  // holding the callee's arguments.
+  engine.session_var_set(&session.eng, "who", "")
+  {
+    doc, dok := bhv_open(stopper)
+    if !dok {
+      fmt.eprintfln("  FAIL: fixture '%s' would not load", stopper)
+      fails += 1
+    } else {
+      script_begin(session, stopper, doc.steps, doc.mode, doc.entry, .Chart, doc.uses[:])
+      doc.steps = nil
+      defer behaviour_doc_free(&doc)
+      ctx := Behaviour_Context {
+        session = session,
+        now     = time.now()._nsec,
+        board   = &session.bh_board,
+      }
+      // Two instructions in: the `var`, then the call, which parks on a ten-minute wait.
+      script_walk_n(&ctx, 4)
+      if session.script.depth == 0 {
+        fmt.eprintfln("  FAIL: the run was not inside the call after four instructions - the fixture is wrong")
+        fails += 1
+      }
+      if got, _ := engine.session_var_get(&session.eng, "who"); got != "CALLEE_OWN" {
+        fmt.eprintfln("  FAIL: inside the call, who = '%s', want 'CALLEE_OWN'", got)
+        fails += 1
+      }
+      script_stop(session)
+      expect(session, "who", "CALLER_OWN", &fails)
+    }
+  }
+  // A loop-mode block: refused as a CALLEE (it would never return), while remaining a perfectly
+  // runnable chart on its own - which is why this checks the call rather than the run.
+  {
+    doc, dok := bhv_open(loopy)
+    if dok {
+      defer behaviour_doc_free(&doc)
+      if _, bad := subchart_callable_why(&doc); !bad {
+        fmt.eprintfln("  FAIL: a block set to 'loop' was accepted as callable - it would never return")
+        fails += 1
+      }
+    }
+  }
+  // And the linter has to say so too, on the document itself - otherwise the first you hear of it is a
+  // run that refuses to start.
+  {
+    doc, dok := bhv_open(loopy)
+    if dok {
+      defer behaviour_doc_free(&doc)
+      if script_lint_count(script_lint(&doc), .Error) == 0 {
+        fmt.eprintfln("  FAIL: the linter passed a block that loops")
+        fails += 1
+      }
+    }
+  }
+
+  if fails == 0 {
+    fmt.println("  PASS: sub-charts round-trip, nest two deep, restore the caller's variables on return AND on stop, and refuse cycles and loops")
+  } else {
+    fmt.eprintfln("  %d sub-chart problem(s)", fails)
+  }
 }
 
 // The alert envelope (alert.odin), checked as arithmetic - it drives a full-window effect that no
@@ -1979,7 +2759,7 @@ probe_fill :: proc(spec: []Param_Spec, nums: ^[4]f64, strs: ^[2]string, blank: b
         nums[num_slot + 1] = 0
         strs[str_slot] = fmt.tprintf("@p%d", i)
       }
-    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
       strs[str_slot] = blank ? "" : probe_str(i)
     }
   }
@@ -2000,7 +2780,7 @@ probe_check :: proc(what: string, spec: []Param_Spec, want_n, got_n: [4]f64, wan
         want_n[slot] != got_n[slot] ||
         want_n[slot + 1] != got_n[slot + 1] ||
         want_s[str_slot] != got_s[str_slot]
-    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
       slot = str_slot
       bad = want_s[slot] != got_s[slot]
     }
@@ -2200,7 +2980,7 @@ script_selftest_meta :: proc() {
             fmt.eprintfln("  FAIL: %s: argument '%s' defaults to 0 but its help never says what 0 means", what, p.name)
             fails^ += 1
           }
-        case .Coord, .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+        case .Coord, .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
         }
       }
     }
@@ -2332,16 +3112,92 @@ script_cmd_list :: proc(session: ^Session) {
   // Named, not listed. They are runnable by name and `script selftest` exercises them; putting nine of
   // them in front of the four you actually pick from is what made this list something to read past.
   fmt.printfln("  (+%d verification charts, hidden - 'script selftest' runs them; 'script show t_flow' names one)", len(TEST_BEHAVIOURS))
+  // Blocks the user made, listed apart from charts because they are a different VERB: you place one in
+  // another chart, you do not run it. Same split the browser draws as its own tab.
+  subchart_registry_refresh(force = true)
+  blocks := subchart_registry_rows()
   if len(saved) == 0 {
     fmt.printfln("saved behaviours: (none yet in %s)", bhv_dir_path())
   } else {
     fmt.printfln("saved behaviours (%s):", bhv_dir_path())
     for n in saved {
-      fmt.printfln("    %s", n)
+      is_block := false
+      for &info in blocks {
+        if info.name == n {
+          is_block = true
+          break
+        }
+      }
+      if !is_block {
+        fmt.printfln("    %s", n)
+      }
+    }
+  }
+  if len(blocks) > 0 {
+    fmt.println("your blocks (sub-charts - place them in a chart, don't run them):")
+    for &info in blocks {
+      fmt.printfln("    %-28s %s", subchart_signature(info.name, subchart_info_params(&info)), info.desc)
     }
   }
   fmt.println("  'script run <name>' to start, 'script show <name>' to see the blocks it builds.")
+  fmt.println("  'script subchart <name>' turns a saved chart into a block, and back.")
   fmt.println("  A saved behaviour WINS over an Odin one of the same name - delete it to get the original back.")
+}
+
+// Flip a saved chart between "a program you run" and "a block you place".
+//
+// The typable twin of the tick-box in the editor's chart options - the browser's rule is that every
+// action in it is a command you could have typed, and this is the one the tick-box issues.
+@(private = "file")
+script_cmd_subchart :: proc(args: []string) {
+  if len(args) == 0 {
+    fmt.eprintln("usage: script subchart <name> [on|off]   (no on/off toggles it)")
+    return
+  }
+  name := args[0]
+  if !bhv_exists(name) {
+    if behaviour_def(name) != nil {
+      fmt.eprintfln("script subchart: '%s' is an Odin behaviour - 'script export %s' first to get an editable copy.", name, name)
+      return
+    }
+    fmt.eprintfln("script subchart: no saved behaviour named '%s'. 'script list' shows what's available.", name)
+    return
+  }
+  doc, ok := bhv_open(name)
+  if !ok {
+    return // bhv_load already reported why
+  }
+  defer behaviour_doc_free(&doc)
+  want := !doc.is_subchart
+  if len(args) >= 2 {
+    switch args[1] {
+    case "on", "yes", "1":
+      want = true
+    case "off", "no", "0":
+      want = false
+    case:
+      fmt.eprintfln("script subchart: expected 'on' or 'off', got '%s'.", args[1])
+      return
+    }
+  }
+  if want == doc.is_subchart {
+    fmt.printfln("script: '%s' is already %s.", name, want ? "a block" : "a chart")
+    return
+  }
+  doc.is_subchart = want
+  // Say what it would refuse BEFORE writing, not after: turning a loop chart into a block is a
+  // reasonable thing to try, and the fix (switch the mode) is one the message can name.
+  if want {
+    if why, bad := subchart_callable_why(&doc); bad {
+      fmt.eprintfln("script subchart: '%s' cannot be a block yet - %s", name, why)
+      return
+    }
+  }
+  if !bhv_save(&doc) {
+    return
+  }
+  subchart_registry_refresh(force = true) // this process just changed the answer; do not wait out the throttle
+  fmt.printfln("script: '%s' is now %s.", name, want ? "a BLOCK - place it in a chart from the palette" : "a chart you run")
 }
 
 // --- file commands ------------------------------------------------------------------------------
@@ -2506,7 +3362,9 @@ script_cmd_trace :: proc(session: ^Session, args: []string) {
     case .Error:
       tag = "ERROR "
     }
-    node := r.node == 0 ? "     " : fmt.tprintf("n%-4d", u32(r.node))
+    // Padded as a STRING, not with a numeric width: `%-4d` fills with '0' here, so node 1 printed as
+    // "n1000" and every trace row named a node that does not exist.
+    node := r.node == 0 ? "     " : fmt.tprintf("%-5s", fmt.tprintf("n%d", u32(r.node)))
     fmt.printfln("  %8.3fs  %s  %s%s", f64(r.at - base) / 1e9, node, tag, script_trace_text(&r))
   }
 }
@@ -2599,8 +3457,10 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
     behaviour_doc_free(&doc)
     return
   }
-  // Refuse UP FRONT if any block it uses isn't usable, rather than dying mid-run.
-  if problems := script_check_avail(session, doc.steps[:]); len(problems) > 0 {
+  // Refuse UP FRONT if any block it uses isn't usable, rather than dying mid-run - and that includes
+  // the blocks inside every sub-chart it calls, however deep. A gated block down there would otherwise
+  // die halfway through a call, which is exactly the mid-run death this gate exists to prevent.
+  if problems := script_check_avail_deep(session, &doc); len(problems) > 0 {
     fmt.eprintfln("script run: '%s' uses %d block(s) that aren't available yet - not started:", label, len(problems))
     for p in problems {
       fmt.eprintfln("  %s", p)
@@ -2608,6 +3468,17 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
     fmt.eprintln("  'script blocks' shows the whole catalog and what each missing one needs.")
     behaviour_doc_free(&doc)
     return
+  }
+  // A BLOCK is allowed to run on its own - that is how you test one without wiring it into a chart
+  // first - but nothing has bound its settings, so every @name it reads stays as literal text. Said out
+  // loud, with the names, because "seen = @who" as the result is a confusing way to find that out.
+  if doc.is_subchart {
+    fmt.printfln("script: '%s' is a BLOCK. Running it on its own is fine for a test, but nothing is filling in its settings:", label)
+    for p in subchart_params(&doc) {
+      if _, set := engine.session_var_get(&session.eng, p.name); !set {
+        fmt.printfln("    @%s is unset - 'var %s <value>' before this, or place the block in a chart", p.name, p.name)
+      }
+    }
   }
   mode := doc.mode
   if mode_override >= 0 {
@@ -2626,6 +3497,13 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
     delete(u)
   }
   delete(doc.uses)
+  // Only when it ACTUALLY started. script_begin has three refusals of its own - a dangling edge, a
+  // start node that is not there, and a sub-chart it cannot expand - and each frees the run and returns.
+  // Announcing "started" after one of those printed the refusal and then contradicted it on the next
+  // line, which reads as the tool ignoring its own error.
+  if !session.script.active {
+    return
+  }
   fmt.printfln(
     "script: '%s' started (%d steps, %s%s).",
     label, n, mode == .Loop ? "loop" : "once", start_stepping ? ", STEPPING - it will not advance until you step it" : "",

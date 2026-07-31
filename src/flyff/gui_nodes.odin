@@ -121,6 +121,21 @@ Gui_Editor :: struct {
   text_buffers_for_node:    Node_Id,
   text_buffers:       [ED_TEXT_BUFFERS_PER_STEP][ED_TEXT_BUFFER_SIZE]u8,
   section_buffer:       [64]u8, // the selected node's section name, seeded alongside text_buffers
+  // Chart-level text, in the options tab: the description every chart may carry, and the name / label /
+  // help of each declared setting when the chart is a block. Re-seeded when the document changes
+  // (desc_buffer_for / param_buffers_for) or when a row is added, removed or reordered
+  // (param_buffers_revision against options_revision) - the same pair of triggers text_buffers uses.
+  desc_buffer:          [128]u8,
+  desc_buffer_for:      string, // temp-allocated; compared by value, never freed
+  param_name_buffers:   [SUBCHART_MAX_PARAMS][32]u8,
+  param_title_buffers:  [SUBCHART_MAX_PARAMS][64]u8,
+  param_help_buffers:   [SUBCHART_MAX_PARAMS][128]u8,
+  param_buffers_for:    string, // temp-allocated; same rule as desc_buffer_for
+  param_buffers_revision: int,
+  // Set by the inspector's "Open '<block>'" button and consumed by the editor window at the top of the
+  // next frame. Deferred rather than immediate because opening a document frees the one whose inspector
+  // is mid-draw. Same reason the palette applies its pick after the list ends.
+  open_request:       string, // temp-allocated, valid for the frame that set it
 
   // Which string field has its suggestion list open, as a hash of the field's ImGui id - one at a
   // time, across both panels. See the header of gui_fields.odin for why it is latched rather than
@@ -346,17 +361,27 @@ gui_editor_open :: proc(ps: ^Panel_State, name: string, options := false) {
 
 // A blank chart. It exists only in memory until Save - there is no empty file to clean up if the
 // user changes their mind, and an empty behaviour could not be run anyway.
-gui_editor_new :: proc(ps: ^Panel_State) {
+gui_editor_new :: proc(ps: ^Panel_State, subchart := false) {
   ed := &ps.ed
   gui_editor_free(ed)
   name := ed_free_name()
   ed.doc = Behaviour_Doc {
-    name  = strings.clone(name),
-    mode  = .Once,
-    steps = make([dynamic]Script_Step),
+    name        = strings.clone(name),
+    mode        = .Once, // the only mode a block may have; the right default for a chart too
+    steps       = make([dynamic]Script_Step),
+    is_subchart = subchart,
   }
   ed_begin(ed, name)
-  ed_msg(ed, "empty chart - right-click the canvas to add a node", false)
+  // Blocks land on the options tab, because the first thing a new block needs is its description and
+  // the settings it takes - and neither of those is on the canvas.
+  ed.tab_options = subchart
+  ed_msg(
+    ed,
+    subchart \
+    ? "empty block - name what it takes in Chart options, then draw it" \
+    : "empty chart - right-click the canvas to add a node",
+    false,
+  )
 }
 
 @(private = "file")
@@ -845,7 +870,7 @@ ed_defaults :: proc(spec: []Param_Spec, nums: ^[4]f64, strs: ^[2]string) {
       nums[num_slot] = 0
       nums[num_slot + 1] = 0
       strs[str_slot] = strings.clone("")
-    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice:
+    case .Str, .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
       strs[str_slot] = strings.clone("")
     }
   }
@@ -863,6 +888,52 @@ ed_set_action_kind :: proc(ed: ^Gui_Editor, s: ^Script_Step, kind: Script_Action
   }
   if def := action_def(kind); def != nil {
     ed_defaults(def.params, &s.action.nums, &s.action.strs)
+  }
+  ed_relabel(s)
+  ed.text_buffers_for_node = 0 // the payload moved under the inspector's buffers - reseed them
+  ed.options_revision += 1 // ... and under the options panel's, which keeps one per node
+  ed.dirty = true
+}
+
+// Point a call node at a sub-chart, and rebuild its argument slots from what that block declares.
+//
+// VALUES ARE CARRIED OVER BY NAME. Re-picking the target - or coming back to a chart after adding a
+// parameter to the block it calls - must not wipe the arguments already filled in, and matching on the
+// name is the only thing that survives a parameter being inserted in the middle. A parameter the new
+// target does not have is dropped here rather than kept as dead weight; lint_call warns about the ones
+// that go stale WITHOUT a re-pick, which is the case this cannot see.
+ed_set_call_target :: proc(ed: ^Gui_Editor, s: ^Script_Step, name: string, snapshot := true) {
+  if snapshot {
+    ed_snapshot(ed)
+  }
+  old := s.call_args
+  old_count := s.call_arg_count
+  delete(s.call_name)
+  s.call_name = strings.clone(name)
+  s.call_args = {}
+  s.call_arg_count = 0
+  if info := subchart_registry_find(name); info != nil {
+    for p in subchart_info_params(info) {
+      if s.call_arg_count >= SUBCHART_MAX_PARAMS {
+        break
+      }
+      value := ""
+      for i in 0 ..< min(old_count, len(old)) {
+        if old[i].name == p.name {
+          value = old[i].value
+          break
+        }
+      }
+      s.call_args[s.call_arg_count] = Call_Arg {
+        name  = strings.clone(p.name),
+        value = strings.clone(value),
+      }
+      s.call_arg_count += 1
+    }
+  }
+  for a in old {
+    delete(a.name)
+    delete(a.value)
   }
   ed_relabel(s)
   ed.text_buffers_for_node = 0 // the payload moved under the inspector's buffers - reseed them
@@ -1165,7 +1236,10 @@ ed_out_ports :: proc(op: Script_Op) -> int {
   #partial switch op {
   case .Goto, .On:
     return 1
-  case .Action, .Wait_For, .Branch, .Loop:
+  // A CALL has the same two an action has, and for the same reason: a sub-chart that fails hands over
+  // through its fail port (script_fail pops the frame with a verdict), so factoring part of a chart out
+  // into a block does not change how the thing is wired.
+  case .Action, .Wait_For, .Branch, .Loop, .Call:
     return 2
   }
   return 0
@@ -1228,6 +1302,17 @@ ed_edges :: proc(ed: ^Gui_Editor, i: int, out: ^[3]Ed_Edge) -> int {
     }
     // The fail edge. Unwired it is not "fall through" - script_take_fail_edge ends the run - so
     // there is deliberately no Seq fallback here the way port 0 has one.
+    if s.else_id != 0 {
+      out[n] = {s.else_id, .Fail, 1}
+      n += 1
+    }
+  case .Call:
+    // Exactly an action's two ports, and deliberately so: a sub-chart succeeds or it fails, and the
+    // whole point of factoring one out is that wiring it is no different from wiring a block.
+    if s.goto_id != 0 {
+      out[n] = {s.goto_id, .Next, 0}
+      n += 1
+    }
     if s.else_id != 0 {
       out[n] = {s.else_id, .Fail, 1}
       n += 1
@@ -1373,7 +1458,9 @@ ed_edge_color :: proc(kind: Ed_Edge_Kind) -> imgui.Vec4 {
 // accent and the chart was a wall of identical blue boxes. The op is the poorer of the two signals
 // here - it is already legible from the node's ports and its title - so colour now carries the block's
 // CATEGORY, and the shape of control flow moved to the icon. Both survive a zoom-out that eats the text.
-@(private = "file")
+//
+// Package-visible, not file-private: the browser tints a block's tile with .Sub too, and a second copy
+// of that colour is how the tile and the node it becomes would drift apart.
 ed_cat_color :: proc(cat: Block_Cat) -> imgui.Vec4 {
   switch cat {
   case .Flow:
@@ -1392,6 +1479,9 @@ ed_cat_color :: proc(cat: Block_Cat) -> imgui.Vec4 {
     return COL_OK // green
   case .System:
     return imgui.Vec4{0.941, 0.560, 0.220, 1} // orange
+  case .Sub:
+    return imgui.Vec4{0.925, 0.435, 0.729, 1} // magenta - the one hue no catalog category uses, so a
+    // block you made yourself never reads as one that shipped with the tool
   }
   return COL_TEXT_DIM
 }
@@ -1415,6 +1505,8 @@ ed_cat_icon :: proc(cat: Block_Cat) -> rune {
     return ICON_CAT_VARS
   case .System:
     return ICON_CAT_SYSTEM
+  case .Sub:
+    return ICON_CAT_SUB
   }
   return ICON_CAT_FLOW
 }
@@ -1903,6 +1995,14 @@ gui_node_editor :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
   imgui.End()
   if !open {
     gui_editor_close(ps)
+    return
+  }
+  // "Open '<block>'" from a call node's inspector, honoured here rather than at the button: opening a
+  // document frees the one whose inspector was mid-draw, and the pane is still on the stack down there.
+  if ed.open_request != "" {
+    name := ed.open_request
+    ed.open_request = ""
+    gui_editor_open(ps, name)
   }
 }
 
@@ -3313,10 +3413,30 @@ gui_ed_palette :: proc(ed: ^Gui_Editor, f: ^Gui_Frame) {
   pick_op := Script_Op.Action
   pick_ak := Script_Action_Kind.None
   pick_ek := Script_Event_Kind.None
+  pick_sub := "" // which sub-chart, for a .Call. Borrowed from the registry, used before it refreshes.
   picked := false
   shown := 0
 
   if imgui.BeginChild("##pallist", {px(ED_PAL_W), px(330)}, {}) {
+    // YOUR BLOCKS FIRST. The two sections under it are fixed and long; this one is what the person
+    // using the editor made, and burying their own work under 74 built-ins is how a feature nobody
+    // finds gets built. Skipped entirely when there are none, so it costs nothing until it earns space.
+    blocks := subchart_registry_rows()
+    if len(blocks) > 0 {
+      imgui.SeparatorText("Your blocks - charts you made into blocks")
+      for &info in blocks {
+        // A block cannot place itself. The run would refuse it (script_expand_calls names the cycle),
+        // but a palette that offers a click it will then reject is a palette that lies.
+        if info.name == ed.doc.name {
+          continue
+        }
+        blurb := info.desc != "" ? info.desc : "a chart of yours, run as one block"
+        sig := subchart_signature(info.name, subchart_info_params(&info))
+        if ed_pal_row(q, .Sub, prose_title_of_name(info.name), sig, blurb, true, "", &shown) {
+          pick_op, pick_sub, picked = .Call, info.name, true
+        }
+      }
+    }
     imgui.SeparatorText("Flow")
     if ed_pal_row(q, .Flow, "Jump", "goto", "jump to another node - this is how a loop is drawn on a canvas", true, "", &shown) {
       pick_op, picked = .Goto, true
@@ -3361,7 +3481,7 @@ gui_ed_palette :: proc(ed: ^Gui_Editor, f: ^Gui_Frame) {
   imgui.PopTextWrapPos()
 
   if picked {
-    ed_pal_create(ed, pick_op, pick_ak, pick_ek)
+    ed_pal_create(ed, pick_op, pick_ak, pick_ek, pick_sub)
     imgui.CloseCurrentPopup()
   }
 }
@@ -3442,7 +3562,7 @@ ed_pal_row :: proc(q: string, cat: Block_Cat, title, sig, blurb: string, ok: boo
 }
 
 @(private = "file")
-ed_pal_create :: proc(ed: ^Gui_Editor, op: Script_Op, ak: Script_Action_Kind, ek: Script_Event_Kind) {
+ed_pal_create :: proc(ed: ^Gui_Editor, op: Script_Op, ak: Script_Action_Kind, ek: Script_Event_Kind, sub := "") {
   // ONE snapshot for the whole creation. Adding a node, giving it its kind and wiring it up are three
   // mutations that are one action to the person doing it, and three Ctrl+Z presses to undo one click
   // is the kind of undo that makes people stop trusting undo.
@@ -3465,6 +3585,9 @@ ed_pal_create :: proc(ed: ^Gui_Editor, op: Script_Op, ak: Script_Action_Kind, ek
   }
   if ek != .None {
     ed_set_event_kind(ed, s, &s.condition, ek, snapshot = false)
+  }
+  if sub != "" {
+    ed_set_call_target(ed, s, sub)
   }
   if ed.pal_wire != 0 {
     ed_wire(ed, ed.pal_wire, ed.pal_port, id, snapshot = false)
@@ -3545,9 +3668,31 @@ gui_ed_inspector :: proc(ps: ^Panel_State, ed: ^Gui_Editor, f: ^Gui_Frame) {
   }
 
   // --- the action
-  if s.op == .Action || s.op == .On {
-    imgui.SeparatorText(s.op == .On ? "interrupt body" : "block")
+  //
+  // NOT for an `.On`. It used to offer one here under the heading "interrupt body", which put the
+  // action ON the watcher - the legacy one-node shape. That shape ran (the VM synthesized the missing
+  // body) but could not be ARMED: every arming path wants an `.On` wired to a body, so `interrupt on`
+  // refused it and the browser's checkbox flipped straight back. An interrupt's body is a NODE you
+  // wire to, and this was the last thing that could author it any other way.
+  if s.op == .Action {
+    imgui.SeparatorText("block")
     ed_action_editor(ed, s, f, ed.text_buffers[0:2])
+  }
+  if s.op == .On {
+    imgui.SeparatorText("what it does")
+    imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
+    if s.goto_id == 0 {
+      imgui.TextWrapped("Nothing yet. Drag from this node's port to the first step of what should happen when it fires.")
+    } else {
+      imgui.TextWrapped("Runs the steps wired to its port. That body is an ordinary part of the chart - it can walk, wait, and take as many ticks as it needs.")
+    }
+    imgui.PopStyleColor(1)
+  }
+
+  // --- the call
+  if s.op == .Call {
+    imgui.SeparatorText("block")
+    ed_call_editor(ed, s, f)
   }
 
   if s.op == .Repeat || s.op == .Loop {
@@ -3682,15 +3827,19 @@ ed_step_option_count :: proc(s: Script_Step) -> int {
     if s.has_until {
       n += condition_param_count(s.until)
     }
-  case .On:
-    n += condition_param_count(s.condition)
-    if def := action_def(s.action.kind); def != nil {
-      n += len(def.params)
-    }
-  case .Branch, .Wait_For, .If, .While:
+  // Its TRIGGER's settings only. A watcher carries no action of its own any more - what it does lives
+  // in the body it is wired to, which is its own node and gets its own row in this panel.
+  case .On, .Branch, .Wait_For, .If, .While:
     n += condition_param_count(s.condition)
   case .Repeat, .Loop:
     n += 1 // the iteration count
+  case .Call:
+    // What the CALLEE declares, not what this node happens to have stored: a block that gained a
+    // parameter should start appearing in the panel straight away, and ed_call_args materialises the
+    // slot for it the moment it is drawn.
+    if info := subchart_registry_find(s.call_name); info != nil {
+      n += info.param_count
+    }
   }
   return n
 }
@@ -3721,6 +3870,16 @@ ed_option_match :: proc(s: Script_Step, query: string) -> bool {
   }
   if def := action_def(s.action.kind); def != nil && spec_hit(def.params, query) {
     return true
+  }
+  // A call matches on the block it runs and on what that block calls its settings - searching "camp"
+  // has to find the argument whether it lives on a catalog block or on one of yours.
+  if s.op == .Call {
+    if hit(s.call_name, query) {
+      return true
+    }
+    if info := subchart_registry_find(s.call_name); info != nil && spec_hit(subchart_info_params(info), query) {
+      return true
+    }
   }
   condition_matches_search :: proc(c: Script_Condition, query: string, spec_hit: proc(spec: []Param_Spec, query: string) -> bool) -> bool {
     for i in 0 ..< condition_row_count(c) {
@@ -3828,6 +3987,170 @@ gui_ed_uses :: proc(ps: ^Panel_State, ed: ^Gui_Editor, f: ^Gui_Frame) {
   imgui.Dummy({0, px(4)})
 }
 
+// Is this document a BLOCK, what does it say it does, and what does it take?
+//
+// It lives at the top of the options tab rather than on the canvas because all three are settings of
+// the DOCUMENT, not of any node - the same reasoning that put "Also watches for" here. And it is the
+// first thing in the pane because turning a chart into a block changes what every other control in
+// here means: a block runs once, has no watchers, and is placed rather than started.
+@(private = "file")
+gui_ed_block_settings :: proc(ed: ^Gui_Editor) {
+  imgui.SeparatorText("What this chart IS")
+  is_block := ed.doc.is_subchart
+  if imgui.Checkbox("Use as a block in other charts", &is_block) {
+    ed_snapshot(ed)
+    ed.doc.is_subchart = is_block
+    if is_block {
+      // A block that loops never returns, so ticking the box picks the only mode that can work rather
+      // than leaving you with a document the linter immediately rejects.
+      ed.doc.mode = .Once
+    }
+    ed.dirty = true
+  }
+  if imgui.IsItemHovered() {
+    imgui.SetTooltip(
+      "%s",
+      cstring(
+        "A block appears in the palette of every other chart, and running it becomes one node.\n\n" +
+        "The rules: it runs once, it cannot declare or borrow watchers, and it cannot call itself.",
+      ),
+    )
+  }
+  imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
+  imgui.TextUnformatted("Description  -  the sentence shown next to it in the palette")
+  imgui.PopStyleColor(1)
+  if ed.desc_buffer_for != ed.doc.name {
+    panel_buf_set(ed.desc_buffer[:], ed.doc.desc)
+    ed.desc_buffer_for = strings.clone(ed.doc.name, context.temp_allocator)
+  }
+  imgui.SetNextItemWidth(-1)
+  if imgui.InputTextWithHint("##optdesc", "what does this chart do?", cstring(raw_data(ed.desc_buffer[:])), len(ed.desc_buffer)) {
+    delete(ed.doc.desc)
+    ed.doc.desc = strings.clone(strings.trim_space(panel_buf_str(ed.desc_buffer[:])))
+    ed.dirty = true
+  }
+  if imgui.IsItemActivated() {
+    ed_snapshot(ed)
+  }
+  if !ed.doc.is_subchart {
+    imgui.Dummy({0, px(6)})
+    return
+  }
+
+  imgui.SeparatorText("Settings this block takes")
+  imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
+  imgui.TextWrapped(
+    "%s",
+    cstring(
+      "Each one becomes a field on the node, and a variable inside this chart: a setting called " +
+      "'who' is read here as @who.  Whoever places the block fills them in.",
+    ),
+  )
+  imgui.PopStyleColor(1)
+
+  drop := -1
+  for pi in 0 ..< min(ed.doc.param_count, SUBCHART_MAX_PARAMS) {
+    p := &ed.doc.params[pi]
+    imgui.PushIDInt(i32(1000 + pi))
+    if ed.param_buffers_for != ed.doc.name || ed.param_buffers_revision != ed.options_revision {
+      panel_buf_set(ed.param_name_buffers[pi][:], p.name)
+      panel_buf_set(ed.param_title_buffers[pi][:], p.title)
+      panel_buf_set(ed.param_help_buffers[pi][:], p.help)
+    }
+    imgui.SetNextItemWidth(px(110))
+    if imgui.InputTextWithHint("##pname", "name", cstring(raw_data(ed.param_name_buffers[pi][:])), len(ed.param_name_buffers[pi])) {
+      delete(p.name)
+      p.name = strings.clone(strings.trim_space(panel_buf_str(ed.param_name_buffers[pi][:])))
+      ed.dirty = true
+    }
+    if imgui.IsItemActivated() {
+      ed_snapshot(ed)
+    }
+    if imgui.IsItemHovered() {
+      imgui.SetTooltip("The variable name. Letters, digits and _ only - it is read as @name inside this chart.")
+    }
+    imgui.SameLine(0, px(6))
+    // Only the kinds a value can actually ARRIVE as. The numeric three are absent by construction
+    // (subchart_param_kind_ok): an argument becomes a variable, and a numeric slot has nowhere to hold
+    // an @name, so a "number" setting would be a field that silently did nothing.
+    imgui.SetNextItemWidth(px(90))
+    if imgui.BeginCombo("##pkind", fmt.ctprintf("%s", BHV_PARAM_KIND_NAMES[p.kind])) {
+      for kind in Param_Kind {
+        if !subchart_param_kind_ok(kind) {
+          continue
+        }
+        if imgui.Selectable(fmt.ctprintf("%s", BHV_PARAM_KIND_NAMES[kind]), kind == p.kind) {
+          ed_snapshot(ed)
+          p.kind = kind
+          ed.dirty = true
+        }
+      }
+      imgui.EndCombo()
+    }
+    imgui.SameLine(0, px(6))
+    imgui.SetNextItemWidth(-px(30))
+    if imgui.InputTextWithHint("##ptitle", "label", cstring(raw_data(ed.param_title_buffers[pi][:])), len(ed.param_title_buffers[pi])) {
+      delete(p.title)
+      p.title = strings.clone(strings.trim_space(panel_buf_str(ed.param_title_buffers[pi][:])))
+      ed.dirty = true
+    }
+    if imgui.IsItemActivated() {
+      ed_snapshot(ed)
+    }
+    imgui.SameLine(0, px(6))
+    if imgui.SmallButton("x") {
+      drop = pi
+    }
+    if imgui.IsItemHovered() {
+      imgui.SetTooltip("Remove this setting")
+    }
+    imgui.SetNextItemWidth(-1)
+    if imgui.InputTextWithHint("##phelp", "one sentence saying what it does", cstring(raw_data(ed.param_help_buffers[pi][:])), len(ed.param_help_buffers[pi])) {
+      delete(p.help)
+      p.help = strings.clone(strings.trim_space(panel_buf_str(ed.param_help_buffers[pi][:])))
+      ed.dirty = true
+    }
+    if imgui.IsItemActivated() {
+      ed_snapshot(ed)
+    }
+    imgui.PopID()
+  }
+  ed.param_buffers_for = strings.clone(ed.doc.name, context.temp_allocator)
+  ed.param_buffers_revision = ed.options_revision
+
+  if drop >= 0 {
+    ed_snapshot(ed)
+    delete(ed.doc.params[drop].name)
+    delete(ed.doc.params[drop].title)
+    delete(ed.doc.params[drop].help)
+    subchart_choices_free(&ed.doc.params[drop].choices)
+    for i in drop ..< ed.doc.param_count - 1 {
+      ed.doc.params[i] = ed.doc.params[i + 1]
+    }
+    ed.doc.params[ed.doc.param_count - 1] = {}
+    ed.doc.param_count -= 1
+    ed.options_revision += 1 // the rows shifted under the buffers above
+    ed.dirty = true
+  }
+  if ed.doc.param_count < SUBCHART_MAX_PARAMS {
+    if imgui.Button("+ Add a setting", {-1, 0}) {
+      ed_snapshot(ed)
+      ed.doc.params[ed.doc.param_count] = Param_Spec {
+        name = strings.clone(fmt.tprintf("setting%d", ed.doc.param_count + 1)),
+        kind = .Str,
+      }
+      ed.doc.param_count += 1
+      ed.options_revision += 1
+      ed.dirty = true
+    }
+  } else {
+    imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
+    imgui.TextUnformatted(fmt.ctprintf("%d settings is the most a block can take.", SUBCHART_MAX_PARAMS))
+    imgui.PopStyleColor(1)
+  }
+  imgui.Dummy({0, px(6)})
+}
+
 // Every ROW's arguments, for the options panel. Which event each row is stays on the canvas - this
 // pane sets values - so a multi-row condition contributes each row's numbers, labelled by its own
 // block title when there is more than one and it would otherwise be ambiguous.
@@ -3881,6 +4204,7 @@ gui_ed_options :: proc(ps: ^Panel_State, ed: ^Gui_Editor, f: ^Gui_Frame) {
   }
   defer imgui.EndChild()
 
+  gui_ed_block_settings(ed)
   gui_ed_uses(ps, ed, f)
 
   // The descriptions are spelled out here rather than left in tooltips: this pane IS what you are
@@ -3906,7 +4230,10 @@ gui_ed_options :: proc(ps: ^Panel_State, ed: ^Gui_Editor, f: ^Gui_Frame) {
     // PushID makes every widget inside unique by NODE, so the fixed "##edact" / "cond" / "until" ids
     // the shared editors use can be reused verbatim for all forty of them.
     imgui.PushIDInt(i32(i))
-    b := i * 6
+    // The stride HAS to be the one ed_seed_options_text_buffers seeded with. It was 6 against a seed of
+    // ED_TEXT_BUFFERS_PER_STEP (18), so every node past the first read another node's buffers - the
+    // second node's fields showed the first node's condition arguments.
+    b := i * ED_TEXT_BUFFERS_PER_STEP
 
     imgui.PushStyleColorImVec4(.Text, ed_node_color(s))
     if imgui.SmallButton(fmt.ctprintf("%s  #%d", block_title(s), u32(s.id))) {
@@ -3933,13 +4260,15 @@ gui_ed_options :: proc(ps: ^Panel_State, ed: ^Gui_Editor, f: ^Gui_Frame) {
         imgui.PopStyleColor(1)
         ed_condition_params(ed, &s, "until", &s.until, ed.options_text_buffers[b + ED_TEXT_UNTIL:b + ED_TEXT_BUFFERS_PER_STEP], f)
       }
-    case .On:
+    // `.On` is its trigger and nothing else - the body it fires is a separate node with its own row.
+    case .On, .Branch, .Wait_For, .If, .While:
       ed_condition_params(ed, &s, "cond", &s.condition, ed.options_text_buffers[b + ED_TEXT_CONDITION:b + ED_TEXT_UNTIL], f)
-      if def := action_def(s.action.kind); def != nil {
-        ed_params(ed, &s, "act", def.params, &s.action.nums, &s.action.strs, ed.options_text_buffers[b + 0:b + 2], f)
+    case .Call:
+      // The arguments only - not the target picker. Swapping which block a node runs is a structural
+      // edit and belongs on the canvas, the same rule that keeps ed_action_editor's combo out of here.
+      if info := subchart_registry_find(s.call_name); info != nil {
+        ed_call_args(ed, &s, info, f, ed.options_text_buffers[b:b + SUBCHART_MAX_PARAMS], true)
       }
-    case .Branch, .Wait_For, .If, .While:
-      ed_condition_params(ed, &s, "cond", &s.condition, ed.options_text_buffers[b + ED_TEXT_CONDITION:b + ED_TEXT_UNTIL], f)
     case .Repeat, .Loop:
       imgui.TextUnformatted("Times")
       n := i32(s.count)
@@ -4046,6 +4375,149 @@ ed_action_editor :: proc(ed: ^Gui_Editor, s: ^Script_Step, f: ^Gui_Frame, text_b
   imgui.TextWrapped("%s", fmt.ctprintf("%s", cur.blurb))
   imgui.PopStyleColor(1)
   ed_params(ed, s, "act", cur.params, &s.action.nums, &s.action.strs, text_buffers, f)
+}
+
+// A CALL: which block, and one field per setting that block declares.
+//
+// THE PARAMETERS ARE NOT IN A TABLE. Every other node in the editor renders from a compile-time
+// []Param_Spec on a catalog row; this one reads the spec out of the sub-chart REGISTRY, so what you
+// see is whatever that document declares right now. That is the whole feature - the user's own
+// document is the catalog row - and it is why nothing here calls action_def.
+//
+// The VALUES are text, always, whatever the declared kind is: an argument becomes a variable, and
+// engine/vars.odin is string-in/string-out. So a numeric-looking field would be a lie about what gets
+// stored, and there deliberately isn't one (subchart_param_kind_ok refuses numeric kinds).
+@(private = "file")
+ed_call_editor :: proc(ed: ^Gui_Editor, s: ^Script_Step, f: ^Gui_Frame) {
+  blocks := subchart_registry_rows()
+  imgui.SetNextItemWidth(-1)
+  label := s.call_name == "" ? "(pick a block)" : fmt.ctprintf("%s", s.call_name)
+  if imgui.BeginCombo("##edcall", label) {
+    if len(blocks) == 0 {
+      imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
+      imgui.TextUnformatted("You have not made any blocks yet.")
+      imgui.PopStyleColor(1)
+    }
+    for &info in blocks {
+      if info.name == ed.doc.name {
+        continue // a block cannot call itself; see the same skip in the palette
+      }
+      if imgui.Selectable(fmt.ctprintf("%s", info.name), info.name == s.call_name) {
+        ed_set_call_target(ed, s, info.name)
+      }
+      if imgui.IsItemHovered() && info.desc != "" {
+        imgui.SetTooltip("%s", fmt.ctprintf("%s", info.desc))
+      }
+    }
+    imgui.EndCombo()
+  }
+  info := subchart_registry_find(s.call_name)
+  if info == nil {
+    imgui.PushStyleColorImVec4(.Text, COL_BAD)
+    imgui.TextWrapped(
+      "%s",
+      s.call_name == "" \
+      ? cstring("Pick which of your blocks this node runs.") \
+      : fmt.ctprintf("There is no block called '%s' any more - it was renamed or deleted.", s.call_name),
+    )
+    imgui.PopStyleColor(1)
+    return
+  }
+  if info.desc != "" {
+    imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
+    imgui.TextWrapped("%s", fmt.ctprintf("%s", info.desc))
+    imgui.PopStyleColor(1)
+  }
+  // Open the block being called. The one navigation this pane owes: the contents of this node live in
+  // another document, and without a door to it a call is a node you cannot look inside.
+  if imgui.Button(fmt.ctprintf("Open '%s'", info.name), {-1, 0}) {
+    ed.open_request = strings.clone(info.name, context.temp_allocator)
+  }
+  params := subchart_info_params(info)
+  if len(params) == 0 {
+    imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
+    imgui.TextWrapped("This block takes no settings.")
+    imgui.PopStyleColor(1)
+    return
+  }
+  imgui.SeparatorText("settings")
+  ed_call_args(ed, s, info, f, ed.text_buffers[0:SUBCHART_MAX_PARAMS], ed.param_help_inline)
+}
+
+// The argument fields themselves. Shared by the inspector and the chart-options panel, the same way
+// ed_params is - the options panel just spells the help out instead of leaving it in a tooltip.
+@(private = "file")
+ed_call_args :: proc(
+  ed: ^Gui_Editor,
+  s: ^Script_Step,
+  info: ^Subchart_Info,
+  f: ^Gui_Frame,
+  text_buffers: [][ED_TEXT_BUFFER_SIZE]u8,
+  inline_help: bool,
+) {
+  // The argument slots are rebuilt from the declaration whenever the target is picked, but a chart
+  // saved before a parameter was ADDED has no slot for it. Materialising it here means the field
+  // appears the moment the block declares it, rather than after a re-pick nobody knows to do.
+  for p in subchart_info_params(info) {
+    found := false
+    for i in 0 ..< min(s.call_arg_count, len(s.call_args)) {
+      if s.call_args[i].name == p.name {
+        found = true
+        break
+      }
+    }
+    if !found && s.call_arg_count < SUBCHART_MAX_PARAMS {
+      s.call_args[s.call_arg_count] = Call_Arg{name = strings.clone(p.name), value = strings.clone("")}
+      s.call_arg_count += 1
+    }
+  }
+  for p, pi in subchart_info_params(info) {
+    slot := -1
+    for i in 0 ..< min(s.call_arg_count, len(s.call_args)) {
+      if s.call_args[i].name == p.name {
+        slot = i
+        break
+      }
+    }
+    if slot < 0 || slot >= len(text_buffers) {
+      continue
+    }
+    title := p.title != "" ? p.title : prose_title_of_name(p.name)
+    id := fmt.ctprintf("call%d_%d", u32(s.id), pi)
+    field_label := fmt.ctprintf("%s##%s", title, id)
+    if inline_help {
+      imgui.TextUnformatted(fmt.ctprintf("%s", title))
+      field_label = fmt.ctprintf("##%s", id)
+    }
+    // One suggestion field per argument, driven by the DECLARED kind - so a `mob` parameter offers
+    // monster names and a `key` parameter offers key names, exactly as the same kind would on a
+    // catalog block. That is what makes a block you made feel like one that shipped.
+    if ed_suggest_field(
+      ed,
+      id,
+      field_label,
+      &s.call_args[slot].value,
+      text_buffers[slot][:],
+      p.kind,
+      p.choices,
+      p.optional ? "optional" : "",
+      inline_help ? f32(-1) : px(200),
+      f,
+    ) {
+      ed_relabel(s)
+      ed.dirty = true
+    }
+    if imgui.IsItemActivated() {
+      ed_snapshot(ed)
+    }
+    if inline_help && p.help != "" {
+      imgui.PushStyleColorImVec4(.Text, tint(COL_TEXT_DIM, 0.85))
+      imgui.TextWrapped("%s", fmt.ctprintf("%s", p.help))
+      imgui.PopStyleColor(1)
+    } else if !inline_help && p.help != "" && imgui.IsItemHovered() {
+      imgui.SetTooltip("%s", fmt.ctprintf("%s\n\n@name works here - it is read when the call is made.", p.help))
+    }
+  }
 }
 
 // A CONDITION, as rows: an All/Any selector and one line per event, each with its own NOT.
@@ -4427,7 +4899,7 @@ ed_params :: proc(
         snap_on_edit_start(ed)
         help_tip(p, title)
       }
-    case .Names, .Mob, .Key, .Var_Name, .Choice:
+    case .Names, .Mob, .Key, .Var_Name, .Choice, .Chart_Name:
       // Everything the catalog says something about the SHAPE of. Storage is identical to .Str - one
       // string slot - and so is the file; the kind only decides what gets offered while you type.
       if slot >= 0 && slot < len(text_buffers) {
@@ -4441,6 +4913,8 @@ ed_params :: proc(
           hint = "F1, 1, space, w ..."
         case .Var_Name:
           hint = "name, not @name"
+        case .Chart_Name:
+          hint = "one of your blocks"
         case .Choice, .Str, .Num, .Duration, .Percent, .Coord:
         }
         if ed_suggest_field(
@@ -4488,6 +4962,15 @@ ed_params :: proc(
 @(private = "file")
 ed_seed_step_text_buffers :: proc(text_buffers: [][ED_TEXT_BUFFER_SIZE]u8, s: Script_Step) {
   if len(text_buffers) < ED_TEXT_BUFFERS_PER_STEP {
+    return
+  }
+  // A CALL has no action and no condition, so it reuses the front of the same window - one buffer per
+  // argument. Seeded here rather than anywhere else so the inspector and the options panel, which
+  // disagree about nothing else, cannot disagree about this either.
+  if s.op == .Call {
+    for i in 0 ..< SUBCHART_MAX_PARAMS {
+      panel_buf_set(text_buffers[i][:], i < min(s.call_arg_count, len(s.call_args)) ? s.call_args[i].value : "")
+    }
     return
   }
   panel_buf_set(text_buffers[0][:], s.action.strs[0])

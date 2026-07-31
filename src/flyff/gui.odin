@@ -99,6 +99,7 @@ ICON_CAT_COMBAT :: rune(0xe3e7) // flash_on
 ICON_CAT_TIMING :: rune(0xe8b5) // schedule
 ICON_CAT_VARS :: rune(0xe24a) // functions
 ICON_CAT_SYSTEM :: rune(0xe869) // build
+ICON_CAT_SUB :: rune(0xe1a1) // widgets - a call into one of your own blocks
 
 // The single source of truth for what gets baked: icon_ranges is DERIVED from this at init, so adding an
 // icon above is the entire change - a glyph can never be referenced but missing from the atlas. gui_init
@@ -143,6 +144,7 @@ ICON_ALL := [?]rune {
   ICON_CAT_TIMING,
   ICON_CAT_VARS,
   ICON_CAT_SYSTEM,
+  ICON_CAT_SUB,
 }
 
 // Glyph ranges for the merge: inclusive pairs, zero-terminated (one degenerate pair per icon). MUST
@@ -283,6 +285,10 @@ Gui_Frame :: struct {
   script_paused: bool,
   script_step:   bool, // single-step debug mode is on
   script_in_watcher:    bool, // an interrupt region is executing
+  // The innermost sub-chart the run is inside, or "" at the top level. Temp-cloned like the other run
+  // strings. The canvas needs it because script_node is a REMAPPED id while a call is live - it belongs
+  // to a copy of another document, so the open chart has no node with that id to highlight.
+  script_in_call:       string,
   script_name:   string, // temp-allocated copies; they outlive the draw, not the frame
   script_pc:     int, // 1-based, for display
   script_len:    int, // main program length (regions are not part of the count)

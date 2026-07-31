@@ -794,3 +794,33 @@ branch_node_condition :: proc(s: ^Seq, c: Script_Condition) -> Node_Id {
 return_node :: proc(s: ^Seq) {
   emit(s, Script_Step{op = .Return})
 }
+
+// Run another DOCUMENT and come back. <args> is name/value pairs, flat: `call_chart(s, "sell", "town",
+// "Flaris")` passes town=Flaris. Wire .False if a failure should go somewhere other than the end.
+//
+// A sub-chart is a thing you author in the EDITOR, so this exists mainly for the verification charts -
+// an Odin behaviour that wants to factor something out has procs, which is the whole reason no `call`
+// node existed before. It is still the real emitter: the file format and the walker cannot tell a call
+// this made from one the palette made.
+call_chart :: proc(s: ^Seq, name: string, args: ..string) -> Node_Id {
+  step := Script_Step {
+    op        = .Call,
+    call_name = strings.clone(name),
+  }
+  if len(args) % 2 != 0 {
+    builder_error(s.b, strings.concatenate({"call_chart '", name, "': arguments come in name/value pairs"}, context.temp_allocator))
+  }
+  for i := 0; i + 1 < len(args); i += 2 {
+    if step.call_arg_count >= SUBCHART_MAX_PARAMS {
+      builder_error(s.b, strings.concatenate({"call_chart '", name, "': more arguments than a block can take"}, context.temp_allocator))
+      break
+    }
+    step.call_args[step.call_arg_count] = Call_Arg {
+      name  = strings.clone(args[i]),
+      value = strings.clone(args[i + 1]),
+    }
+    step.call_arg_count += 1
+  }
+  emit(s, step)
+  return here(s.b)
+}
