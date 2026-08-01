@@ -81,7 +81,9 @@ MOB_NAME_CORPUS := [?]string {
   "Troglodon Warlord", "Troglodon Warrior", "Twinstrike Cobra", "Uncanny Rangda", "Venel Guardian", "Vice Veduque",
   "Vile Flayer", "Vile Thorn", "Violet Magician Troupe", "Violet Trillipy", "Volt", "Wagsaac",
   "Watangka", "Wheelem", "Wildwood Shaman", "Wildwood Stalker", "Worm Veduque", "Yetti",
-  "Zombiger", "Mortom", "Captain Catsy", "Captain Harpy"
+  "Zombiger", "Mortom", "Captain Catsy", "Captain Harpy",
+  "Water Totem pole", "Wind Totem pole", "Earth Totem pole", "Fire Totem pole",
+  "Hanya, the avenger", "Lilieth, legendary thief", "Lord of Nightmare"
 }
 
 // Case-insensitive membership. Used to keep a name that is already a badge out of the suggestions,

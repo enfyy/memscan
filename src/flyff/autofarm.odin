@@ -262,24 +262,24 @@ pause_resume :: proc(session: ^Session, killed_obj: uintptr, now: i64) {
   auto_count_reached(session, now) // 'kills 1' (or a mid-run re-arm at/below current count): stop right away
 }
 
-// Parse a raw target argument into a list of names. Comma-separated; each name may be wrapped
+// Parse a raw target argument into a list of names. Semicolon-separated; each name may be wrapped
 // in single/double quotes and may contain spaces. Empty input (or only whitespace) yields an
 // empty list, meaning "any monster". Allocated in the temp allocator. Examples:
 //   ""                                        -> []            (any monster)
 //   "Aibatt"                                  -> ["Aibatt"]
 //   "Mutant Yetti"                            -> ["Mutant Yetti"]
-//   "'Club-tailed Reptillion', 'Captain ...'" -> ["Club-tailed Reptillion", "Captain ..."]
+//   "'Club-tailed Reptillion'; 'Captain ...'" -> ["Club-tailed Reptillion", "Captain ..."]
 parse_target_names :: proc(raw: string) -> [dynamic]string {
-  out := make([dynamic]string, context.temp_allocator)
-  for part in strings.split(raw, ",", context.temp_allocator) {
-    n := strings.trim_space(part)
-    n = strings.trim(n, "'\"") // strip one layer of surrounding quotes
-    n = strings.trim_space(n)
-    if len(n) > 0 {
-      append(&out, n)
-    }
-  }
-  return out
+	out := make([dynamic]string, context.temp_allocator)
+	for part in strings.split(raw, ";", context.temp_allocator) {
+		n := strings.trim_space(part)
+		n = strings.trim(n, "'\"") // strip one layer of surrounding quotes
+		n = strings.trim_space(n)
+		if len(n) > 0 {
+			append(&out, n)
+		}
+	}
+	return out
 }
 
 // Human-readable description of a target-name list, for status/log lines.
