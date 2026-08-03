@@ -6,7 +6,6 @@ import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
-import "core:thread"
 import "core:time"
 import rl "vendor:raylib"
 
@@ -1589,8 +1588,9 @@ cli_radar :: proc(session: ^Session, args: []string) {
   if audio_ok {
     snd_penya = synth_penya_chime()
     snd_kill = synth_kill_zap()
+    session.alert_sound = rl.LoadSound("uhoh.mp3")
   }
-  defer if audio_ok {rl.UnloadSound(snd_penya); rl.UnloadSound(snd_kill)}
+  defer if audio_ok {rl.UnloadSound(snd_penya); rl.UnloadSound(snd_kill); rl.UnloadSound(session.alert_sound)}
 
   scale := f32(3.0) // pixels per world unit; mouse wheel zooms
   cam := [2]f32{ppos[0], ppos[2]} // world point at screen center; right-drag pans, C recenters on player

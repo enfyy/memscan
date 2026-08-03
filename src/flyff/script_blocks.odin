@@ -4,6 +4,8 @@ import "core:fmt"
 import "core:strconv"
 import "core:strings"
 
+import rl "vendor:raylib"
+
 import "../engine"
 
 // ===========================================================================
@@ -2767,6 +2769,7 @@ act_alert_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Sta
     script_trace(ctx.session, script_current_node(ctx), .Warn, "unknown severity '%s' - using warn", step.action.strs[1])
   }
   alert_show(ctx.session, severity, message, i64(step.action.nums[0] * 1e9), step.action.nums[1] != 0)
+  rl.PlaySound(ctx.session.alert_sound)
   return .Done
 }
 

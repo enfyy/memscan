@@ -13,3 +13,4 @@ CLAUDE.md
 # local captures out of version control too (the client lib lib/odin-tracy/tracy.lib IS tracked).
 *.tracy
 /src/flyff/leaderboard_secret.odin
+/tool/set-lb-hash.bat

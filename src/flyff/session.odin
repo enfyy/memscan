@@ -1,6 +1,7 @@
 package flyff
 
 import "core:mem/virtual"
+import rl "vendor:raylib"
 
 import "../engine"
 
@@ -10,6 +11,9 @@ import "../engine"
 // and recover this struct with an offset-0 cast (see flyff_of in module.odin).
 Session :: struct {
   using eng: engine.Session,
+
+  // Should not be here probably but this codebase is atrocious anyways because claude made it..
+  alert_sound: rl.Sound,
 
   // Live Flyff memory layout (RVAs + offsets). Seeded from flyff_layout_default(), overwritten
   // by flyff.cfg on attach, re-derived by `calibrate`. See flyff.odin Flyff_Layout / layout.odin.
