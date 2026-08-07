@@ -9,14 +9,15 @@ import "core:time"
 
 import "../engine"
 
-// Auto-farm: the REPL surface (auto, timer, kills, stuck, reachgate, pause, hunt, lookalive) plus the
-// pieces the farm BLOCKS are built from - the kill/penya event log, the stats line, the commit and
-// skip helpers, and the look-alive randomness.
+// Auto-farm: the REPL surface (`auto`, `pause`) plus the pieces the farm VERBS are built from - the
+// kill/penya event log, the stats line, the commit and skip helpers, and the walk-point randomness.
 //
-// The farm LOOP itself is not here any more. `auto` builds and runs a behaviour chart (auto_start_chart
-// below -> bh_auto in behaviours.odin), so the priority ladder, the approach and the target-drop
-// watches are nodes in a graph rather than a precedence chain of booleans in a tick function. What
-// survives here is what a block calls into, and what the user types.
+// The farm LOOP itself is not here any more, and neither is the configuration that used to shape it.
+// `auto` is a RULE LIST of one row - "always -> kill" (bh_auto_rules, behaviours.odin) - and the
+// priority ladder, the approach and the target-drop watches all live inside the `kill` verb. The
+// thirty-odd booleans that used to steer this file are gone with it: the ladder IS the policy now, and
+// a behaviour that wants a different one says so with a different verb (`kill in_range`, `kill`
+// sidestep) rather than by flipping a global. What survives here is what a verb calls into.
 
 // A penya-gain / kill event, appended by the watcher and drained by the radar for its juice (the
 // "+penya" pop + chime, the kill laser + zap). Seq-tagged so the radar replays only events newer than
@@ -163,31 +164,14 @@ auto_stats :: proc(session: ^Session, now: i64) -> string {
   return fmt.tprintf("kill #%d  %s  %.1f/min dist_3d: %.1f", session.auto_count, fmt_elapsed(el), kpm, engine.dist_3d(session.last_kill_pos, ppos))
 }
 
-// Stop condition for the 'kills' command: once the run's confirmed-kill count reaches auto_count_limit,
-// turn auto-farm off and self-disarm. Returns true if it fired (so a caller can skip advancing to a
-// next mob). No-op (returns false) while disarmed or below the quota.
-auto_count_reached :: proc(session: ^Session, now: i64) -> bool {
-  if session.auto_count_limit == 0 || session.auto_count < session.auto_count_limit {
-    return false
-  }
-  session.auto_on = false
-  session.auto_count_limit = 0
-  fmt.printf("\n[auto] count reached (%d kills) - auto-farm OFF.  %s\n", session.auto_count, auto_stats(session, now))
-  fmt.print("memscan> ")
-  return true
-}
 
-// Is hunt's commit-and-chase steering live? Hunt never drops a target and side-steps around blockers to
-// keep chasing it - which is exactly the "walk wherever the mob is" behaviour a painted sweep lane must
-// not have, so a live lane suppresses it. hunt_on itself is left alone, so hunt comes straight back when
-// the sweep ends. Gate every hunt-vs-farm BRANCH on this, not on session.hunt_on directly.
-// Is the RUNNING CHART one that commits to its target and steps around jams? That is what has to
+// Is the RUNNING BEHAVIOUR one that commits to its target and steps around jams? That is what has to
 // relax the reach gate: hunt deliberately picks mobs it cannot currently walk to, because side-stepping
 // in is the whole point, and gating them out would leave it nothing to commit to.
 //
-// It used to be `session.hunt_on`, a mode you toggled. There is no mode any more - "hunt" is a chart -
-// so the question is asked of the PROGRAM: does it contain an approach that side-steps? script_begin
-// answers it once at start (script_run.sidestep_chart) rather than re-scanning the steps per pick.
+// It used to be `session.hunt_on`, a mode you toggled. There is no mode any more - "hunt" is a rule -
+// so the question is asked of the PROGRAM: does it contain a `kill` that side-steps? The run answers it
+// once at start (script_run.sidestep_chart) rather than re-scanning the steps per pick.
 // A live sweep still suppresses it: the lane owns the route, and stepping off it to reach something is
 // exactly what sweep must not do.
 hunt_steering_on :: proc(session: ^Session) -> bool {
@@ -196,24 +180,23 @@ hunt_steering_on :: proc(session: ^Session) -> bool {
 
 // THE question every collision check asks: should the proactive reach gate run at all right now?
 //
-// Three ways it can be off, and they are genuinely different things:
-//   - session.reach_gate_on   - the global default (on; nothing turns it off today, see BACKLOG)
-//   - hunt_steering_on        - INFERRED from the chart: it side-steps, so it must be allowed to pick
+// Two ways it can be off, and they are genuinely different things:
+//   - hunt_steering_on        - INFERRED from the behaviour: it side-steps, so it must be allowed to pick
 //                               mobs it cannot currently walk to
 //   - script.ignore_collision - DECLARED by the chart: on this map the gate is simply wrong. Props a
 //                               character walks straight over still produce collider boxes, and
 //                               compute_reach cannot tell those from a wall, so a floor full of them
 //                               excludes the room and the ladder starves.
 //
-// Every site that used to test `session.reach_gate_on` goes through here instead, so the three cannot
-// disagree and a new consumer cannot accidentally honour only one of them. Inert with no chart running:
+// Every collision check goes through here, so the two cannot disagree and a new consumer cannot
+// accidentally honour only one of them. Inert with no behaviour running:
 // script.ignore_collision is false whenever session.script is not a run that declared it.
 //
 // What this does NOT touch: the stuck monitor (a distance plateau is measured, not predicted, so it
 // still catches a real jam), the `target_reachable` block (asking the question explicitly deserves the
 // honest answer), and the radar's reach fade, which is a view toggle of its own.
 reach_gate_active :: proc(session: ^Session) -> bool {
-  return session.reach_gate_on && !session.script.ignore_collision && !hunt_steering_on(session)
+  return !session.script.ignore_collision && !hunt_steering_on(session)
 }
 
 // Blacklist <focus> and clear m_pObjFocus so the next tick advances to a different mob. Shared by the
@@ -281,7 +264,6 @@ pause_resume :: proc(session: ^Session, killed_obj: uintptr, now: i64) {
   session.auto_last = 0 // advance promptly on the next tick
   fmt.printf("\n[auto] resumed (kill).  %s\n", auto_stats(session, now))
   fmt.print("memscan> ")
-  auto_count_reached(session, now) // 'kills 1' (or a mid-run re-arm at/below current count): stop right away
 }
 
 // Parse a raw target argument into a list of names. Semicolon-separated; each name may be wrapped
@@ -405,8 +387,6 @@ auto_stop :: proc(session: ^Session) {
   if session.script.active && session.script.name == "auto" {
     script_stop(session)
   }
-  session.auto_timer_at = 0 // stopping the run cancels any pending auto-off timer
-  session.auto_count_limit = 0 // ...and any pending kill-count limit
   session.auto_avoid_on = false
   session.auto_sel_set = false
   session.auto_start = 0
@@ -414,8 +394,7 @@ auto_stop :: proc(session: ^Session) {
   session.last_kill_set = false
   session.cluster_committed = false
   session.cluster_origin_pos = {}
-  session.lookalive_jump_at = 0 // run-state only; lookalive_on persists (a mode toggle)
-  session.hunt_side_flip = false // hunt side-step state is per-run (hunt_on the mode persists)
+  session.hunt_side_flip = false // side-step state is per-run
   // Sweep: reset the WALK bookkeeping but KEEP the path + cursor, so an F10 pause/resume continues the
   // lane exactly where it left off. Only completing it, 'sweep off', or a radar right-click drops it.
   // The kill baseline is re-zeroed because auto_count is (above), so the tally counts the resumed run.
@@ -530,22 +509,20 @@ cli_auto :: proc(session: ^Session, args: []string) {
   auto_warn_mobgate(session)
 }
 
-// Build the farm chart from the live configuration and start it. THIS IS THE CUTOVER: `auto` is no
-// longer a tick function reading thirty booleans, it is this chart - and every command that used to
-// shape those booleans (priority, preset, density, lookalive, hunt, timer, kills) now shapes which
-// NODES bh_auto emits. See the header on bh_auto in behaviours.odin.
+// Start the farm behaviour. `auto` is no longer a tick function reading thirty booleans, nor the
+// nineteen-node chart that first replaced it - it is one rule, `always -> kill`, and the priority
+// ladder lives inside that verb (see bh_auto in behaviours.odin).
 //
 // Goes through bhv_open rather than straight to the builder, so a saved `auto.bhv` shadows the built-in
 // exactly like every other behaviour: duplicating it in the editor is how you get an editable farm loop,
-// and deleting the file restores the original. That shadowing rule is the whole reason the ladder is
-// "editable" rather than merely "expressed as nodes".
+// and deleting the file restores the original.
 auto_start_chart :: proc(session: ^Session) -> bool {
   doc, ok := bhv_open("auto")
   if !ok {
     fmt.eprintln("auto: the 'auto' behaviour would not build - 'script show auto' says why.")
     return false
   }
-  if problems := script_check_avail(session, doc.steps[:]); len(problems) > 0 {
+  if problems := rules_check_avail(session, doc.rules[:]); len(problems) > 0 {
     fmt.eprintfln("auto: %d block(s) it needs aren't available:", len(problems))
     for p in problems {
       fmt.eprintfln("  %s", p)
@@ -554,16 +531,12 @@ auto_start_chart :: proc(session: ^Session) -> bool {
     behaviour_doc_free(&doc)
     return false
   }
-  entry := doc.entry
-  mode := doc.mode
-  script_begin(session, "auto", doc.steps, mode, entry, .Chart, doc.uses[:], doc.ignore_collision)
-  delete(doc.name)
-  delete(doc.trigger.strs[0])
-  delete(doc.trigger.strs[1])
-  for u in doc.uses {
-    delete(u)
-  }
-  delete(doc.uses)
+  rules := doc.rules
+  doc.rules = nil // handed to the run; behaviour_doc_free must not take it too
+  route := strings.clone(doc.route, context.temp_allocator)
+  ignore_collision := doc.ignore_collision
+  behaviour_doc_free(&doc)
+  rules_begin(session, "auto", rules, route, ignore_collision)
   return true
 }
 
@@ -626,17 +599,6 @@ lookalive_rand_f32 :: proc(lo, hi: f32) -> f32 {
 
 // True if a scheduled travel-jump should actually fire this window. pct is the 0-100 la_jump_chance:
 // <=0 never jumps, >=100 always jumps, in between rolls the seeded RNG. Skipping windows makes the jump
-// cadence sporadic (human) rather than a metronome.
-lookalive_jump_roll :: proc(pct: int) -> bool {
-  if pct >= 100 {
-    return true
-  }
-  if pct <= 0 {
-    return false
-  }
-  lookalive_seed()
-  return rand.int_max(100) < pct
-}
 
 // Silent check that the jump primitive is fully configured (mirrors jump_ready without its eprintln
 // output), so the look-alive hot loop can skip jumps quietly when char-control ('findmove') isn't set up.
@@ -647,39 +609,7 @@ jump_configured :: proc(session: ^Session) -> bool {
   return sendactmsg_rva_sane(session) && session.layout.actmover_off != 0 && session.layout.jump_msg != 0
 }
 
-// Fire one look-alive jump: the client's own SendActMsg(jump), then broadcast the jump state so other
-// clients see it (best-effort - both primitives no-op silently when unconfigured). No console output.
-lookalive_do_jump :: proc(session: ^Session) {
-  if ret, ok := remote_send_actmsg(session, session.layout.jump_msg); ok && ret == 1 {
-    session.jump_fired_at = time.now()._nsec // radar dot-hop animation, same as manual `jump`
-    remote_send_playermoved(session)
-  }
-}
 
-// Shared travel-jump scheduler core (look-alive). Jumps at randomized intervals while travelling toward
-// <tpos> - a locked focus OR the target of an in-progress approach - but only while still >=
-// LA_JUMP_MIN_DIST away so we don't hop in place during melee. Seeds the first interval instead of jumping
-// on the very first tick. Gated on the la_jump_on enable + jump_configured; disabled/unconfigured no-ops.
-lookalive_jump_core :: proc(session: ^Session, tpos: [3]f32, now: i64) {
-  if !session.layout.la_jump_on || !jump_configured(session) {
-    return
-  }
-  if session.lookalive_jump_at == 0 {
-    session.lookalive_jump_at = now + lookalive_rand_ns(la_secs_ns(session.layout.la_jump_min), la_secs_ns(session.layout.la_jump_max))
-    return
-  }
-  if now < session.lookalive_jump_at {
-    return
-  }
-  // Re-arm the next window regardless of whether we jump this time (so a rolled-skip still advances).
-  session.lookalive_jump_at = now + lookalive_rand_ns(la_secs_ns(session.layout.la_jump_min), la_secs_ns(session.layout.la_jump_max))
-  if !lookalive_jump_roll(session.layout.la_jump_chance) {
-    return // rolled to skip this window - keeps jumping sporadic, not metronomic
-  }
-  if ppos, pok := read_player_pos(session); pok && engine.dist_horizontal(ppos, tpos) >= LA_JUMP_MIN_DIST {
-    lookalive_do_jump(session)
-  }
-}
 
 // Silent check that moveto (the CMover dest-field walk) is fully configured - mirrors moveto_ready without
 // its eprintln output, so the look-alive approach can skip walking quietly when 'findmove' isn't set up.
@@ -704,15 +634,10 @@ auto_commit_pick :: proc(session: ^Session, obj: uintptr, live_pos: [3]f32, stag
   session.auto_sel_obj = obj
   session.auto_sel_set = true
   lb_note_commit(session, obj, pack) // carry name + pack to the kill site (no-op unless a run is recording)
-  if session.layout.density_on {
-    _, engage := pick_ranges(session)
-    session.cluster_committed, session.cluster_origin_pos = cluster_advance(
-      session.cluster_committed, session.cluster_origin_pos, stage, live_pos, pack, density_radius(engage),
-    )
-  } else {
-    session.cluster_committed = false
-    session.cluster_origin_pos = {}
-  }
+  _, engage := pick_ranges(session)
+  session.cluster_committed, session.cluster_origin_pos = cluster_advance(
+    session.cluster_committed, session.cluster_origin_pos, stage, live_pos, pack, density_radius(engage),
+  )
   return true
 }
 
@@ -756,28 +681,6 @@ hunt_sidestep_point :: proc(session: ^Session, p, t: [3]f32, left: bool) -> [3]f
   return {p[0] + (-uz) * HUNT_SIDESTEP_DIST * side + ux * fwd, p[1], p[2] + ux * HUNT_SIDESTEP_DIST * side + uz * fwd}
 }
 
-// Persist the layout after a look-alive tuning edit (attach-gated, like cli_preselect - the live layout
-// is defaults until attach loads flyff.cfg, so saving before attach would clobber the file with defaults).
-lookalive_save :: proc(session: ^Session) {
-  if session.attached {
-    flyff_save_cfg(session.layout, flyff_cfg_path())
-  }
-}
-
-// Dump of the current look-alive enables + tuning (shared by 'lookalive show', toggling on, and status).
-lookalive_print_tuning :: proc(session: ^Session) {
-  L := session.layout
-  fmt.printfln(
-    "  enables: hesitate %s  jump %s  step %s  max-range %s",
-    L.la_hesitate_on ? "on" : "off", L.la_jump_on ? "on" : "off", L.la_step_on ? "on" : "off", L.la_maxrange_on ? "on" : "off",
-  )
-  fmt.printfln(
-    "  hesitation %.2f-%.2fs  jump %.2f-%.2fs @ %d%%  step %d%% spread %.1fu  max-range %.1fu%s",
-    L.la_hold_min, L.la_hold_max, L.la_jump_min, L.la_jump_max, L.la_jump_chance,
-    L.la_step_chance, L.la_step_spread, L.la_max_range,
-    moveto_configured(session) ? "" : "  (step/max-range + jumps inert until 'findmove')",
-  )
-}
 
 // Parse an on/off token. ok=false for anything else (so callers can distinguish a toggle from a value).
 la_parse_onoff :: proc(s: string) -> (val: bool, ok: bool) {

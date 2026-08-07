@@ -430,40 +430,27 @@ waypoint_list_names :: proc(allocator := context.temp_allocator) -> []string {
 }
 
 // ===========================================================================
-// Chart import: a set becomes a run of walk_to nodes, one per waypoint, each in a section named
-// after its waypoint. The chain runs ONCE and stops - the last node names no successor, so what
-// happens after the route is something the author wires rather than something this decides.
+// Behaviour import: a set becomes a one-rule behaviour that PATROLS it.
+//
+// It used to become one walk_to node per waypoint, wired in a chain - and that chain was the single
+// biggest thing wrong with the old model: 123 of the 322 nodes in the saved corpus were a route
+// wearing graph clothes, and editing one meant dragging nodes rather than dragging points on a map.
+// A route is already first-class and already has the better editor, so importing one now writes a
+// behaviour that NAMES it. Which is also why the file is three lines instead of forty-five.
 // ===========================================================================
 
-waypoint_build_chart :: proc(set: Waypoint_Set, chart_name: string) -> (doc: Behaviour_Doc, ok: bool) {
+waypoint_build_behaviour :: proc(set: Waypoint_Set, behaviour_name, route_name: string) -> (doc: Behaviour_Doc, ok: bool) {
   if len(set.waypoints) == 0 {
     fmt.eprintln("waypoints import: the set is empty.")
     return {}, false
   }
-  b := builder_begin(chart_name, .Once)
-  s := seq(b)
-  for point, i in set.waypoints {
-    section(b, waypoint_label(set, i))
-    walk(&s, {point.position[0], 0, point.position[1]}) // Y is re-derived at run time, see the header
-  }
-  steps, mode, build_errors := builder_end(b)
-  if len(build_errors) > 0 {
-    fmt.eprintfln("waypoints import: %d authoring problem(s):", len(build_errors))
-    for problem in build_errors {
-      fmt.eprintfln("  %s", problem)
-    }
-    script_steps_free(&steps)
-    return {}, false
-  }
-  doc.name = strings.clone(chart_name)
-  doc.mode = mode
-  doc.steps = steps
-  doc.uses = make([dynamic]string)
-  doc.entry = doc.steps[0].id
-  // `seq` lets adjacency carry the flow, which is the right way to WRITE a program and the wrong way
-  // to EDIT one. Materializing turns each fall-through into a real goto so the canvas can draw the
-  // route as wired nodes - and leaves the LAST node with no successor, which is the "runs once" half.
-  script_materialize_fallthrough(doc.steps[:])
+  b := rules_builder_begin()
+  rule_row(b, "Walk the route", all(always()))
+  rule_step(b, do_patrol())
+  doc.name = strings.clone(behaviour_name)
+  doc.desc = fmt.aprintf("patrol '%s' (%d stops)", route_name, len(set.waypoints))
+  doc.route = strings.clone(route_name)
+  doc.rules = rules_builder_end(b)
   return doc, true
 }
 
@@ -755,7 +742,7 @@ waypoint_cmd_import :: proc(session: ^Session, args: []string) {
       fmt.printfln("waypoints import: NOTE - '%s' was recorded on map %d and you are on map %d; the coordinates will not mean the same place.", set_name, set.map_id, live)
     }
   }
-  doc, built := waypoint_build_chart(set, chart_name)
+  doc, built := waypoint_build_behaviour(set, chart_name, set_name)
   if !built {
     return
   }
@@ -763,5 +750,6 @@ waypoint_cmd_import :: proc(session: ^Session, args: []string) {
   if !bhv_save(&doc) {
     return
   }
-  fmt.printfln("waypoints: imported %d point(s) -> chart '%s'. 'script show %s' to read it.", len(set.waypoints), chart_name, chart_name)
+  fmt.printfln("waypoints: '%s' (%d point(s)) -> behaviour '%s', one rule that patrols it.", set_name, len(set.waypoints), chart_name)
+  fmt.printfln("  'script show %s' to read it; add rules above that one for anything that should interrupt the walk.", chart_name)
 }

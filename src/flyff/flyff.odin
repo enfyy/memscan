@@ -99,49 +99,30 @@ FLYFF_MELEE_RANGE :: f32(3.0)
 // one landscape tile (~512u) would need the mover tile-window widened, hence the cap. Slider in Options.
 FLYFF_RADAR_RANGE :: f32(80)
 
-// Density / cluster steering (NOT memory offsets). density_on gates the whole feature: OFF = the plain
-// nearest-mob cascade (v0.4.0-identical); ON = auto commits to a mob pack until it's wiped
-// (cluster_advance) and only detours to a denser pack past a double gate - at least density_min_gain
-// more pack members AND at most density_max_detour extra walk distance (world units). Tune live with
-// `density mingain <n>` / `density detour <n>` + `tdbg`. density_weight is the RETIRED pre-rework
-// continuous weight, kept only so old flyff.cfg files still parse; a positive value migrates to
-// density_on=true on load (flyff_load_cfg). Default off so the picker is unchanged until you opt in.
+// Cluster steering: the picker commits to a mob pack until it is wiped (cluster_advance) and only
+// detours to a denser pack past a double gate - at least density_min_gain more pack members AND at most
+// density_max_detour extra walk distance (world units). density_weight is the RETIRED pre-rework
+// continuous weight, kept only so old flyff.cfg files still parse.
 FLYFF_DENSITY_WEIGHT :: 0
-FLYFF_DENSITY_ON :: false
 FLYFF_DENSITY_MIN_GAIN :: 3
 FLYFF_DENSITY_MAX_DETOUR :: f32(20)
 // Radar display only (no picker effect): tint each monster dot by its local pack size (# mobs within
 // density_radius) instead of flat red - lone = red, denser = hue-shifted toward green. Persisted.
 FLYFF_DENSITY_HUE_ON :: false
 
-// Persisted runtime toggles (NOT memory offsets). preselect/lookalive/reachgate mirror the Session
-// bools so they survive restarts: session.X stays authoritative at runtime, layout.X exists only for
-// the flyff.cfg round-trip (loaded into the session on attach - see on_attach - and written back by
-// cli_preselect / cli_lookalive / cli_reachgate). sfx_on / fx_laser_on are radar-only juice toggles
+// Persisted runtime toggles (NOT memory offsets). bgkeys mirrors its Session bool so it survives a
+// restart: session.X stays authoritative at runtime, layout.X exists only for the flyff.cfg round-trip
+// (loaded into the session on attach - see on_attach). sfx_on / fx_laser_on are radar-only juice toggles
 // with the layout as their single source of truth (cli_sfx / cli_fxlaser).
-FLYFF_PRESELECT_ON :: true
-FLYFF_LOOKALIVE_ON :: false
-FLYFF_REACH_GATE_ON :: true
-// Hunt mode: commit to ONE target and never drop it for being far/unreachable (farming's opposite).
-// Suppresses the reach-watch/stuck-plateau target-drops and relaxes the selection reach-gate; when a
-// path is blocked it side-steps around the obstacle instead of abandoning. Standalone - works with or
-// without lookalive. Side-stepping walks the character, so it needs 'findmove' (else it just keeps
-// re-issuing the game's walk-in AI without stepping). See Session.hunt_on / cli_hunt.
-FLYFF_HUNT_ON :: false
-// Combat watch: hold off the target-drop fallbacks (stuck-plateau + reach re-watch) for as long as the
-// locked mob's HP is actually falling. Both fallbacks were written for a farm where mobs die in a hit or
-// two, so "we're not closing in" reliably meant "we're jammed"; against a tanky mob you legitimately
-// stand still for 10+ seconds while whittling it down, and they mis-read that as blocked and dropped the
-// target mid-fight. HP dropping is proof the fight is real, so nothing gets skipped; once damage stops
-// landing for combat_grace seconds the fallbacks come back and a genuinely blocked mob is still dropped.
-// combat_grace must comfortably exceed your slowest hit interval (cast time / attack speed).
-// See auto_combat_watch / auto_in_combat (autofarm.odin) + Session.combat_watch_on.
-FLYFF_COMBAT_WATCH_ON :: true
+// Combat watch: hold off the target-drop watches (stuck-plateau + reach re-check) for as long as the
+// locked mob's HP is actually falling. Those watches assume mobs die in a hit or two, so "we are not
+// closing in" means "we are jammed"; against a tanky mob you legitimately stand still for 10+ seconds
+// and they mis-read that as blocked. HP dropping is proof the fight is real. Must comfortably exceed
+// your slowest hit interval (cast time / attack speed).
 FLYFF_COMBAT_GRACE :: f32(4.0) // seconds since the last HP drop that still count as "in a fight"
 
 // Stuck-detection enable. Session-authoritative like the others; the layout mirror exists only so it
 // PERSISTS - before this key it was the one auto toggle that silently reverted to on every restart.
-FLYFF_AUTO_STUCK_ON :: true
 
 // --- Priority ladder (see tc_pick_one) -------------------------------------------------------------
 // The pick cascade is an ordered ladder: each rung answers "is there a mob I should take before even
@@ -153,9 +134,6 @@ FLYFF_AUTO_STUCK_ON :: true
 //   4 pocket - within attack_range, ranked nearest-to-last-kill (pack stickiness)
 //   5/6      - cluster + density detour (owned by `density on|off`)
 //   7 nearest- the always-on fallback
-FLYFF_AGGRO_FIRST_ON :: true // rung 1: a mob that is chasing/attacking us outranks everything
-FLYFF_MELEE_FIRST_ON :: true // rung 2: a mob on top of us outranks the pack-stickiness ranking
-FLYFF_POCKET_ON :: true      // rung 4: in-attack_range pack stickiness (off = fall straight to density/nearest)
 FLYFF_SFX_ON :: true
 FLYFF_FX_LASER_ON :: true
 
@@ -196,32 +174,9 @@ FLYFF_UI_SCALE :: f32(1.0)
 UI_SCALE_MIN :: f32(0.6)
 UI_SCALE_MAX :: f32(3.0)
 
-// Look-alive tuning (see autofarm.odin lookalive_* + the "look-alive" section in the radar Options
-// panel). All persisted to flyff.cfg and editable live via 'lookalive hold|jump|chance' or 'set'.
-// Durations are in SECONDS (converted to ns per event by la_secs_ns); jump_chance is a 0-100 percent.
-//   la_hold_min/max  - the post-kill hesitation window before locking the next target (delayed lock-on).
-//   la_jump_min/max  - the interval between travel-jump attempts while walking to a target.
-//   la_jump_chance   - per-window odds a scheduled travel-jump actually fires (<100 => sporadic, human).
-// Each of the four sub-behaviors also has its own on/off enable (la_*_on) so they toggle independently
-// under the master lookalive_on. step/max-range are the walk-first "approach" behaviors (they drive the
-// character via moveto, so they're inert until 'findmove' is set - see moveto_configured):
-//   la_step_on       - single perpendicular-offset detour waypoint before locking (chance-gated).
-//   la_step_chance   - percent odds any given advance takes that single detour (<100 => sporadic).
-//   la_step_spread   - max perpendicular offset (world units) applied to a step/approach waypoint.
-//   la_maxrange_on   - shrinking-hops approach for far spawns instead of a straight beeline.
-//   la_max_range     - "too far to beeline" distance: hop toward the target until inside this, then lock.
-FLYFF_LA_HOLD_MIN :: f32(0.8)  // s
-FLYFF_LA_HOLD_MAX :: f32(3.0)  // s
-FLYFF_LA_JUMP_MIN :: f32(4.0)  // s
-FLYFF_LA_JUMP_MAX :: f32(12.0) // s
-FLYFF_LA_JUMP_CHANCE :: 65     // percent (0-100)
-FLYFF_LA_HESITATE_ON :: true   // hesitation sub-feature enabled
-FLYFF_LA_JUMP_ON :: true       // travel-jump sub-feature enabled
-FLYFF_LA_STEP_ON :: true       // intermediate-step sub-feature enabled (needs findmove)
-FLYFF_LA_MAXRANGE_ON :: true   // max-range approach sub-feature enabled (needs findmove)
-FLYFF_LA_STEP_CHANCE :: 40     // percent (0-100): odds an advance takes a single detour step
+// Max perpendicular offset (world units) applied to a walk-in waypoint, so an approach path is not
+// machine-straight. Used by lookalive_step_point, which every `kill` approach hop goes through.
 FLYFF_LA_STEP_SPREAD :: f32(8.0)   // world units: max perpendicular waypoint offset
-FLYFF_LA_MAX_RANGE :: f32(40.0)    // world units: beyond this, approach in shrinking hops
 
 // Static CObj* CWorld::m_aobjCull[] - the render on-screen display array (World.cpp:69). The object
 // reach test reads this (fast, ~on-screen count) instead of scanning all of memory for CObj. Found by
@@ -404,37 +359,15 @@ Flyff_Layout :: struct {
   attack_range:      f32,
   radar_range:       f32, // radar display: mob-dot gather/draw radius (world units); slider in Options
   density_weight:    f32, // retired (pre-rework continuous weight); kept so old cfgs parse + migrate
-  density_on:        bool,
   density_min_gain:  int,
   density_max_detour: f32,
   density_hue_on:    bool, // radar display: colour monster dots by local pack size (no picker effect)
-  preselect_on:      bool, // cfg mirror of Session.preselect_on (see FLYFF_PRESELECT_ON note)
-  lookalive_on:      bool, // cfg mirror of Session.lookalive_on
-  la_hold_min:       f32,  // look-alive: min post-kill hesitation before locking the next target (seconds)
-  la_hold_max:       f32,  // look-alive: max post-kill hesitation (seconds)
-  la_jump_min:       f32,  // look-alive: min interval between travel-jump attempts (seconds)
-  la_jump_max:       f32,  // look-alive: max travel-jump interval (seconds)
-  la_jump_chance:    int,  // look-alive: percent chance (0-100) a scheduled travel-jump fires
-  la_hesitate_on:    bool, // look-alive: hesitation sub-feature enable
-  la_jump_on:        bool, // look-alive: travel-jump sub-feature enable
-  la_step_on:        bool, // look-alive: intermediate-step sub-feature enable (needs findmove)
-  la_maxrange_on:    bool, // look-alive: max-range shrinking-hops approach enable (needs findmove)
-  la_step_chance:    int,  // look-alive: percent chance (0-100) an advance takes a single detour step
   la_step_spread:    f32,  // look-alive: max perpendicular waypoint offset (world units)
-  la_max_range:      f32,  // look-alive: beyond this distance, approach in shrinking hops (world units)
-  reach_gate_on:     bool, // cfg mirror of Session.reach_gate_on
   // cfg mirror of Session.bgkeys_on. Defaults ON, which is safe because it is INERT until activeflag_rva is
   // pinned: with no RVA there is nothing to write. Once you HAVE pinned it, "movement keys work" is the
   // state you were after, and needing to type 'bgkeys on' every session reads as the feature being broken.
   bgkeys_on:         bool,
-  hunt_on:           bool, // cfg mirror of Session.hunt_on (commit-to-one-target hunt mode)
-  combat_watch_on:   bool, // cfg mirror of Session.combat_watch_on (hold the drop-fallbacks while HP falls)
-  combat_grace:      f32,  // seconds since the target's last HP drop that still count as "in a fight"
-  auto_stuck_on:     bool, // cfg mirror of Session.auto_stuck_on (stuck-plateau detection enable)
-  aggro_first_on:    bool, // cfg mirror of Session.aggro_first_on (ladder rung 1: mobs coming for us)
-  melee_first_on:    bool, // cfg mirror of Session.melee_first_on (ladder rung 2: mobs on top of us)
   melee_range:       f32,  // rung 2 radius in world units (was the compiled-in MELEE_RANGE)
-  pocket_on:         bool, // cfg mirror of Session.pocket_on (ladder rung 4: in-range pack stickiness)
   sfx_on:            bool, // radar sound effects (penya chime + kill zap)
   fx_laser_on:       bool, // radar kill laser-beam effect
   trail_on:          bool, // radar display: fading player-path trail
@@ -542,34 +475,12 @@ flyff_layout_default :: proc() -> Flyff_Layout {
     attack_range      = FLYFF_ATTACK_RANGE,
     radar_range       = FLYFF_RADAR_RANGE,
     density_weight    = FLYFF_DENSITY_WEIGHT,
-    density_on        = FLYFF_DENSITY_ON,
     density_min_gain  = FLYFF_DENSITY_MIN_GAIN,
     density_max_detour = FLYFF_DENSITY_MAX_DETOUR,
     density_hue_on    = FLYFF_DENSITY_HUE_ON,
-    preselect_on      = FLYFF_PRESELECT_ON,
-    lookalive_on      = FLYFF_LOOKALIVE_ON,
-    la_hold_min       = FLYFF_LA_HOLD_MIN,
-    la_hold_max       = FLYFF_LA_HOLD_MAX,
-    la_jump_min       = FLYFF_LA_JUMP_MIN,
-    la_jump_max       = FLYFF_LA_JUMP_MAX,
-    la_jump_chance    = FLYFF_LA_JUMP_CHANCE,
-    la_hesitate_on    = FLYFF_LA_HESITATE_ON,
-    la_jump_on        = FLYFF_LA_JUMP_ON,
-    la_step_on        = FLYFF_LA_STEP_ON,
-    la_maxrange_on    = FLYFF_LA_MAXRANGE_ON,
-    la_step_chance    = FLYFF_LA_STEP_CHANCE,
     la_step_spread    = FLYFF_LA_STEP_SPREAD,
-    la_max_range      = FLYFF_LA_MAX_RANGE,
-    reach_gate_on     = FLYFF_REACH_GATE_ON,
     bgkeys_on         = true,
-    hunt_on           = FLYFF_HUNT_ON,
-    combat_watch_on   = FLYFF_COMBAT_WATCH_ON,
-    combat_grace      = FLYFF_COMBAT_GRACE,
-    auto_stuck_on     = FLYFF_AUTO_STUCK_ON,
-    aggro_first_on    = FLYFF_AGGRO_FIRST_ON,
-    melee_first_on    = FLYFF_MELEE_FIRST_ON,
     melee_range       = FLYFF_MELEE_RANGE,
-    pocket_on         = FLYFF_POCKET_ON,
     sfx_on            = FLYFF_SFX_ON,
     fx_laser_on       = FLYFF_FX_LASER_ON,
     trail_on          = FLYFF_TRAIL_ON,

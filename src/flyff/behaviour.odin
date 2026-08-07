@@ -474,11 +474,18 @@ behaviour_tick :: proc(session: ^Session) {
     board   = &session.bh_board,
   }
   behaviour_sense_pass(&ctx)
-  // Global interrupts, AFTER the senses (so a trigger reads this tick's board, not last tick's) and
-  // BEFORE the state machine (so an interrupt that fires takes effect on the tick it fired rather
-  // than after one more step of whatever was happening). It is a no-op while a chart is running -
-  // that run's hoisted watchers are the evaluator then. See interrupt.odin.
-  armed_watcher_tick(&ctx)
+  // THE GLOBAL RULE LIST, AFTER the senses (so a trigger reads this tick's board, not last tick's) and
+  // BEFORE the state machine (so an interrupt that fires takes effect on the tick it fired rather than
+  // after one more step of whatever was happening).
+  //
+  // While one has control the behaviour does not advance AT ALL - its in-flight step is left mid-flight
+  // and resumed exactly where it was. That is what makes the globals "a second list above" rather than
+  // a second thing running: higher interrupts lower, and interruption resumes. It used to take a hoist
+  // into the run's watcher array plus a latch handed over in both directions; it is now one early
+  // return. See interrupt.odin.
+  if globals_tick(&ctx) {
+    return
+  }
   // First engagement: run the initial state's Enter, once. The per-tick rebuild below constructs the
   // machine literally instead of via state_machine_create precisely so Enter does NOT re-run every
   // tick - but that means nothing would ever enter the STARTING state (a state returning itself is
@@ -501,6 +508,11 @@ behaviour_tick :: proc(session: ^Session) {
 // or HP drop on the first tick against a new client (the same reasoning as clear_focus dropping
 // the combat-watch anchor).
 behaviour_reset :: proc(session: ^Session) {
+  // A global that was mid-flight belongs to the process it was walking against - the same reasoning
+  // that drops the sense baselines here.
+  session.global_active = -1
+  session.global_pc = 0
+  session.global_entered = false
   session.bh_state = .Idle
   session.bh_state_at = 0
   session.bh_entered = false // the new process's initial state needs its Enter to run again

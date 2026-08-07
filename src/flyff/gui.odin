@@ -293,21 +293,12 @@ Gui_Frame :: struct {
   // behaviour run state (Script_Run, snapshotted - the watcher owns the real one)
   script_active: bool,
   script_paused: bool,
-  script_step:   bool, // single-step debug mode is on
-  script_in_watcher:    bool, // an interrupt region is executing
-  // The innermost sub-chart the run is inside, or "" at the top level. Temp-cloned like the other run
-  // strings. The canvas needs it because script_node is a REMAPPED id while a call is live - it belongs
-  // to a copy of another document, so the open chart has no node with that id to highlight.
-  script_in_call:       string,
+  script_in_watcher:    bool, // a globally armed interrupt has control; the behaviour is suspended
   script_name:   string, // temp-allocated copies; they outlive the draw, not the frame
-  script_pc:     int, // 1-based, for display
-  script_len:    int, // main program length (regions are not part of the count)
+  script_pc:     int, // 1-based, within the ACTIVE RULE's steps - the only position a list has
+  script_len:    int, // how many steps that rule has
   script_line:   string,
   script_node:   Node_Id, // the current step's identity - what the editor highlights
-  // Where this run actually STARTED. Normally the chart's own start node, but `script run <x> from
-  // <node>` overrides it - and when it does, the canvas has to say so, or the START capsule sits on a
-  // node the run never touched and reads as a lie.
-  script_entry:  Node_Id,
 
   // The tail of the run trace (script.odin), for the editor's log strip. A fixed array of POD rows
   // rather than temp-allocated strings, because Gui_Frame is copied BY VALUE and every string in it is
@@ -323,11 +314,10 @@ Gui_Frame :: struct {
   // rodata literals from the avail procs, so holding them past the frame is safe.
   // Enabled global interrupts (interrupt.odin), snapshotted so the browser's checkboxes and the
   // editor's arm/disarm button can read "is this one armed" without touching the session.
-  // The RUNNING chart's watchers - its own, the ones it borrowed, and the globally armed ones, in the
-  // order they are checked. Separate from `armed` below, which is the persisted always-on set and exists
-  // whether anything is running or not.
-  watchers:      [SCRIPT_MAX_WATCHERS]Gui_Watcher_Row,
-  watcher_count:       int,
+  // The RUNNING behaviour's rules, in the order they are read. Separate from `armed` below, which is
+  // the persisted always-on interrupt list and exists whether anything is running or not.
+  rules:         [GUI_MAX_RULE_ROWS]Gui_Rule_Row,
+  rule_count:    int,
   armed:         [FLYFF_MAX_ARMED_WATCHERS]Gui_Armed_Row,
   armed_watcher_count:         int,
 
@@ -383,14 +373,20 @@ Gui_Armed_Row :: struct {
   why:     string,
 }
 
-// One watcher of the RUNNING chart, for the dock. It exists because "an interrupt fired" used to be a
+// How many of a behaviour's rules the dock strip will show. A cap rather than a dynamic list because
+// Gui_Frame is copied BY VALUE into the draw phase; a list long enough to need scrolling is a list you
+// would read in the editor instead.
+GUI_MAX_RULE_ROWS :: 12
+
+// One rule of the RUNNING behaviour, for the dock. It exists because "an interrupt fired" used to be a
 // single boolean on the transport strip: you could tell that something had taken over, never what, and
-// never that a watcher was armed at all until the moment it fired.
-Gui_Watcher_Row :: struct {
-  label:   string, // the watcher's own one-line description
-  fires:   int,
-  live:    bool, // this one has control right now
-  borrowed: bool, // came from another document (uses, or globally armed) rather than this chart
+// never that anything was watching at all until the moment it fired. Now every row is on screen and
+// the one with control is lit, which is the whole "read the list, the first true one wins" claim made
+// visible while it runs.
+Gui_Rule_Row :: struct {
+  label: string, // the rule's own one-line description
+  fires: int,
+  live:  bool, // this one has control right now
 }
 
 // One waypoint as the draw phase sees it. The name is a temp-allocated clone taken under the lock.

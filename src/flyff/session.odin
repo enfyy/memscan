@@ -28,39 +28,13 @@ Session :: struct {
   auto_last:     i64, // time.now()._nsec of the last advance attempt (throttle)
   auto_count:    int, // targets selected since auto turned on (reset on each toggle-on)
   auto_start:    i64, // time.now()._nsec when auto turned on (origin for the run timer)
-  auto_timer_at: i64, // nsec deadline at which 'auto' auto-disables ('timer' cmd); 0 = disarmed
-  auto_count_limit: int, // kill quota at which 'auto' auto-disables ('count' cmd); 0 = disarmed
 
   // Obstacle / stuck detection (see auto_monitor in target.odin). Tracks progress toward the
   // focused mob; if player->target distance plateaus while still far, the mob is blacklisted
   // (auto_blocked, skipped for BLOCKED_NS) and focus is cleared so the next tick re-acquires.
   auto_blocked:     [dynamic]TC_Recent, // mobs flagged unreachable; skipped by the picker for BLOCKED_NS
-  auto_stuck_on:    bool, // stuck-detection enabled (default on; 'stuck off' disables, e.g. for ranged)
   auto_avoid_dir:   [2]f32, // horizontal (x,z) player->last-stuck-mob delta; one-shot steer-away hint
   auto_avoid_on:    bool, // next auto pick prefers a mob on the opposite side (dot < 0) from auto_avoid_dir
-
-  // Priority ladder rung enables (see tc_pick_one / cli_priority). The pick cascade is an ordered
-  // ladder; these switch its top rungs off individually so the targeting policy is one inspectable
-  // thing instead of a set of hardcoded gates. Rung 1 (aggro) needs objid_off + iddest_off - both
-  // already pinned - and goes inert (finds nothing, ladder falls through) if either is missing.
-  // cfg-mirrored like reach_gate_on; the melee radius lives on layout.melee_range.
-  aggro_first_on:   bool, // rung 1: a mob whose m_idDest is US outranks everything, at any distance
-  melee_first_on:   bool, // rung 2: a mob within layout.melee_range of us outranks pack stickiness
-  pocket_on:        bool, // rung 4: in-attack_range, ranked nearest-to-last-kill (pack stickiness)
-
-  // Combat watch (see auto_combat_watch / auto_in_combat). Both target-drop fallbacks above assume a mob
-  // dies fast, so "distance stopped dropping" == "jammed on an obstacle". Against a high-HP mob that's
-  // false: you stand still whittling it down for 10+ seconds and the fallbacks drop the target mid-fight.
-  // While the locked mob's HP is FALLING we're demonstrably fighting it, so both fallbacks are held off;
-  // layout.combat_grace seconds after the last HP drop they resume, so a mob we genuinely can't hit
-  // (blocked, out of reach) is still skipped. Needs hp_off (pinned by `setup`); inert without it.
-  combat_watch_on:  bool,    // cfg-mirrored ('combatwatch off' to get the old drop-on-plateau behavior)
-
-  // Proactive reach gate (see cand_reachable / tc_select). When on, auto skips candidate mobs whose
-  // straight approach is blocked by terrain OR a placed-object OBB (the reach oracle) BEFORE selecting -
-  // complements the reactive stuck-monitor. Inert unless the fast object path (aobjcull_rva) is set, so
-  // it never triggers the slow scan in the pick loop. Default on; 'reachgate off' disables.
-  reach_gate_on:    bool,
 
   // Mesh-accurate reach confirm (see compute_reach / remote_intersect_objline). When on, a candidate the
   // loose OBB marks BLOCKED is re-tested with the client's own IntersectObjLine (OBB + triangle mesh) and
@@ -176,15 +150,6 @@ Session :: struct {
   // kill - removing the ~0.5s post-kill enumeration gap. One precompute per locked target: auto_next_for
   // is the focus obj the cache was computed against. The cached pick is re-validated at commit time
   // (focus_set_obj); if it went stale, auto falls back to the reactive tc_select scan. Default on.
-  preselect_on:     bool,
-
-  // Look-alive mode (see cli_lookalive). Opt-in human-like farming for low-spawn quest grinds. It is
-  // pure CHART SHAPE now: with it on, auto_cfg_from_session emits a wait_random (the hesitation), a
-  // chance branch and an approach node, so the "human" behaviour is nodes you can see and delete rather
-  // than hooks inside a tick. Deliberately less efficient than the snappy loop, so default OFF. The walk
-  // and jump need 'findmove' (moveto_configured). RNG = core:math/rand (see lookalive_rand_ns).
-  lookalive_on:         bool,
-  lookalive_jump_at:    i64, // nsec of the next scheduled travel-jump attempt (0 = (re)seed on next tick)
 
   // Sweep mode (see sweep.odin / cli_sweep): a painted lane the character clears circle-by-circle. While
   // sweep_on, the picker short-circuits to "nearest mob already inside attack_range" (tc_pick_one) so
@@ -205,13 +170,6 @@ Session :: struct {
   sweep_started_at:  i64, // nsec the lane was armed (the run timer)
   sweep_kills_start: int, // auto_count when it was armed - the completion message's kill delta
   sweep_nodes_total: int, // node count at arm time (the progress readout's denominator)
-
-  // Hunt mode (cli_hunt, cfg mirror layout.hunt_on): commit to ONE target and never drop it for being
-  // far/unreachable. As a chart this is one EDGE - hold_target's fail edge goes back to approach instead
-  // of to skip_target (see bh_hunt) - plus `sidestep` on the approach, which walks around a jam rather
-  // than abandoning the mob. It also relaxes the selection reach-gate (script_pick_ctx). hunt_side_flip
-  // alternates the step side so repeated stalls sweep both ways around an obstacle.
-  hunt_on:             bool,
   hunt_side_flip:      bool, // which side the next side-step offsets to (flips every HUNT_SIDESTEP_FLIP stalls)
 
   // Behaviour machine (see behaviour.odin): the declared state machine that will eventually own
@@ -250,11 +208,6 @@ Session :: struct {
   // Pure observation - nothing reads it back to make a decision - so it is never reset on attach.
   script_trace: Script_Trace,
 
-  // What the chart's variables held at each node last time control reached it (see Script_Snapshots).
-  // Session-scoped for the same reason the trace is, and for one more: `script run <x> from <node>`
-  // is a thing you do AFTER a run died, and the snapshot is what makes starting there mean anything.
-  script_snapshots: Script_Snapshots,
-
   // Keys the tool is currently HOLDING DOWN, indexed by virtual-key code (see keys.odin). Only
   // key_down/`key hold` put anything in here: a plain press is a down/up pair inside one step, but a
   // HELD key deliberately outlives the step that pressed it, so this is the record that lets every
@@ -266,6 +219,12 @@ Session :: struct {
   // the latch is why this cannot just be re-derived per tick. Freed in on_close.
   armed_watchers: [FLYFF_MAX_ARMED_WATCHERS]Armed_Watcher,
   armed_watcher_count:  int,
+  // Which global row has control, -1 when none, plus its position within that row's steps. On the
+  // SESSION rather than on Script_Run because the globals outlive any one behaviour: they are watching
+  // whether or not something is running, which is the whole point of a global. See globals_tick.
+  global_active:  int,
+  global_pc:      int,
+  global_entered: bool,
 
   // Terrain calibration (see cli_worldscan in terrain.odin): surviving terrain-offset hypotheses,
   // narrowed across `worldscan` samples until one remains and is pinned into layout. Session-only.
@@ -357,16 +316,10 @@ Session :: struct {
 // Initialise a fresh Session: the generic engine state, then the Flyff automation defaults, then
 // register the flyff module (hooks). Returns false if the engine arena can't be created.
 session_init :: proc(session: ^Session) -> bool {
+  session.global_active = -1 // no global rule has control (0 would claim row 0 does)
   if !engine.session_init(&session.eng) {
     return false
   }
-  session.auto_stuck_on = true // obstacle/stuck detection on by default (see auto_monitor)
-  session.combat_watch_on = true // never drop a target whose HP is falling (see auto_combat_watch)
-  session.aggro_first_on = true // ladder rung 1: kill what is coming for us first (see tc_pick_one)
-  session.melee_first_on = true // ladder rung 2: kill what is on top of us before the pack ranking
-  session.pocket_on = true // ladder rung 4: stay on the pack while it's inside attack_range
-  session.reach_gate_on = true // proactive reach gate on by default (inert until findcull sets aobjcull_rva)
-  session.preselect_on = true // precompute the next target during combat -> instant advance on kill
   // Mesh-accurate reach confirm defaults OFF: it injects a game-code thread (IntersectObjLine) per
   // OBB-blocked candidate, which walks the live collision linkmaps concurrently with the main thread -
   // a real race that correlated with more client crashes during sustained farming. The zero-injection

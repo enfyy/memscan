@@ -1,6 +1,7 @@
 package flyff
 
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import "core:time"
 
@@ -15,47 +16,48 @@ import "../engine"
 // runs. That is the point: an escape hatch you have to remember to paste into every chart is not an
 // escape hatch. It is what finishes peace-out-mode (see BACKLOG.md).
 //
-// TWO EVALUATION SITES, ONE WATCHER. This is the part worth understanding before changing anything.
+// ONE EVALUATION SITE, ONE LIST. The globals are simply A SECOND RULE LIST ABOVE the running
+// behaviour's - evaluated first, every tick, whatever is or is not running. globals_tick below is the
+// only place that reads them, and it runs the winning row's steps with rule_steps_run, the same proc
+// the behaviour's own rules go through.
 //
-//   1. NOTHING RUNNING (idle, or `auto` farming). This file's armed_watcher_tick evaluates the triggers on the
-//      behaviour tick and, on a rising edge, starts the interrupt's chart as an ordinary run.
-//   2. A CHART IS RUNNING. script_begin HOISTS every enabled interrupt into that run's watcher array,
-//      exactly like the chart's own `on` lines, with its body appended as a region past main_len. So
-//      an interrupt can suspend the chart mid-step, walk somewhere, and hand control back where it
-//      left off - the region machinery from P2, supplied with a longer body.
+// WHAT THIS DELETED, and it is the argument for the whole redesign. There used to be TWO evaluation
+// sites for one logical watcher - this file's tick while nothing ran, and a hoist inside script_begin
+// that spliced every enabled interrupt into the running chart's watcher array with its body appended as
+// a region past main_len. Two sites meant two Event_States, so the edge latch had to be handed over in
+// BOTH directions (script_begin seeded it, script_teardown copied it back) or the thing would
+// double-fire across the boundary; it forced a "an interrupt must not hoist interrupts" special case;
+// and it forced this file's tick to no-op whenever a chart was active, a hand-written mutual exclusion
+// between two evaluators. All of it existed only because the watcher was not in the list. It is in the
+// list now, so all of it is gone.
 //
-// Two sites means two Event_States, and an edge latch that lived in only one of them would either
-// double-fire or miss a transition across the boundary. So the latch is HANDED OVER both ways:
-// script_begin seeds the hoisted watcher's latch from the Armed_Watcher, and script_teardown copies it
-// back. The pair therefore behaves as one continuous watcher that never stops watching.
-//
-// WHY AN INTERRUPT DOES NOT HOIST INTERRUPTS. When an interrupt's own chart is the thing running,
-// script_begin skips the hoist. You do not want your escape interrupted by the same escape (it would
-// re-fire on its own still-true trigger, forever), and `watcher_depth` only caps nesting WITHIN one run.
+// A global that fires SUSPENDS the behaviour rather than racing it: behaviour_tick runs the globals
+// first and returns while one has control, so the behaviour's in-flight step is left mid-flight and
+// resumed exactly where it was. That is rule 4 of the model, applied across the two lists.
 // ===========================================================================
 
-// ONE WATCHER of an enabled document, runtime half. A document may hold several `on` nodes, so what is
-// ENABLED is a document and what is WATCHED is a row - the list is flattened here rather than nested,
-// because every consumer (the tick, the status line, the latch handover) works one watcher at a time.
+// ONE GLOBAL RULE of an enabled document. A document may hold several rules, so what is ENABLED is a
+// document and what is EVALUATED is a row - the list is flattened here rather than nested, because
+// every consumer (the tick, the status line) works one row at a time.
 //
 // The persisted half - just the document name - lives in Flyff_Layout.interrupts so it survives a
 // restart; this is rebuilt from it by armed_watcher_reload.
+//
+// IT IS A `Rule`, not a parallel type. That is the whole of this phase: an interrupt was always "a
+// condition, and what to do when it holds", which is exactly a rule - and the only reason it needed its
+// own struct was that it lived OUTSIDE whatever was running and therefore needed its own copy of the
+// edge latch. One list, one latch, one evaluator.
 Armed_Watcher :: struct {
-  doc:      string, // owned - the behaviour this watcher came out of
-  label:    string, // owned - the watcher's own one-line description, for lists
-  condition:     Script_Condition, // owned; the `.On` node's condition
-  body:     Node_Id, // the node its edge points at - where armed_watcher_launch starts
-  condition_state: Condition_State, // the edge latch - the reason this cannot be re-derived every tick
-  fires:    int,
-  ok:       bool, // the document loaded and this row is usable
-  why:      string, // owned - why it is not, for `interrupt list` and `status`
+  using rule: Rule, // owned - condition, latch, steps, label, fires
+  doc:        string, // owned - the behaviour this row came out of
+  ok:         bool, // the document loaded and this row is usable
+  why:        string, // owned - why it is not, for `interrupt list` and `status`
 }
 
 armed_watcher_free_one :: proc(g: ^Armed_Watcher) {
   delete(g.doc)
-  delete(g.label)
-  script_condition_free(&g.condition)
   delete(g.why)
+  rule_free(&g.rule)
   g^ = {}
 }
 
@@ -107,48 +109,37 @@ armed_watcher_reload :: proc(session: ^Session) {
       behaviour_doc_free(&doc)
     }
 
-    // Count first, so a document with nothing to watch produces ONE explanatory row rather than
-    // silently vanishing from `interrupt list` while still being enabled.
-    watchers := 0
-    if dok {
-      for s in doc.steps {
-        if s.op == .On && s.goto_id != 0 {
-          watchers += 1
-        }
-      }
-    }
-    if !dok || watchers == 0 {
+    // Count first, so a document with nothing to arm produces ONE explanatory row rather than silently
+    // vanishing from `interrupt list` while still being enabled.
+    if !dok || len(doc.rules) == 0 {
       g := Armed_Watcher {
         doc = strings.clone(name),
       }
       g.why = !dok \
       ? strings.clone("no behaviour by that name (or it would not parse)") \
-      : strings.clone("it has no watchers - it needs an 'on' node wired to a body")
+      : strings.clone("it has no rules - a global interrupt is a rule list, and this one is empty (a graph chart cannot be armed any more)")
       session.armed_watchers[session.armed_watcher_count] = g
       session.armed_watcher_count += 1
       continue
     }
 
-    for s in doc.steps {
-      if s.op != .On || s.goto_id == 0 {
-        continue
-      }
+    for r in doc.rules {
       if session.armed_watcher_count >= FLYFF_MAX_ARMED_WATCHERS {
         break
       }
       g := Armed_Watcher {
-        doc   = strings.clone(name),
-        label = strings.clone(s.src),
-        condition = script_condition_clone(s.condition),
-        body  = s.goto_id,
-        ok    = true,
+        rule = rule_clone(r),
+        doc  = strings.clone(name),
+        ok   = true,
       }
       script_arm_condition(&ctx, g.condition, &g.condition_state)
-      // Carry the latch (and the fire tally) over from the row this replaces, when it is the same
-      // watcher on the same condition. The rendered condition is the cheap structural comparison - two
+      // Carry the latch (and the fire tally) over from the row this replaces, when it is the same rule
+      // on the same condition. NOT a leftover of the two-site design - this is here because toggling
+      // ANY interrupt rebuilds the whole array, and re-arming a row whose condition is currently TRUE
+      // would fire it again immediately. The rendered condition is the cheap structural comparison: two
       // triggers that print identically are the same trigger.
       for k in 0 ..< old_n {
-        if old[k].doc != g.doc || !old[k].ok || old[k].body != g.body {
+        if old[k].doc != g.doc || !old[k].ok || old[k].id != g.id {
           continue
         }
         if armed_watcher_condition_text(old[k].condition) == armed_watcher_condition_text(g.condition) {
@@ -161,6 +152,10 @@ armed_watcher_reload :: proc(session: ^Session) {
       session.armed_watcher_count += 1
     }
   }
+  // A row that was mid-flight cannot survive a rebuild - the steps it was walking have been freed.
+  session.global_active = -1
+  session.global_pc = 0
+  session.global_entered = false
   for k in 0 ..< old_n {
     armed_watcher_free_one(&old[k])
   }
@@ -179,17 +174,6 @@ armed_watcher_trigger_text :: proc(g: Armed_Watcher, allocator := context.temp_a
   b := strings.builder_make(allocator)
   script_write_condition(&b, g.condition)
   return strings.to_string(b)
-}
-
-// The row a hoisted watcher came from, for the latch handover. Matched on the document AND the body it
-// enters, because one document may contribute several rows and they must not share a latch.
-armed_watcher_find :: proc(session: ^Session, doc: string, body: Node_Id) -> ^Armed_Watcher {
-  for i in 0 ..< session.armed_watcher_count {
-    if session.armed_watchers[i].doc == doc && session.armed_watchers[i].body == body {
-      return &session.armed_watchers[i]
-    }
-  }
-  return nil
 }
 
 // Enable / disable by name. Returns whether anything changed.
@@ -236,80 +220,85 @@ armed_watcher_any :: proc(session: ^Session) -> bool {
   return false
 }
 
-// Evaluate the enabled interrupts and start one if its trigger just went true. Called every behaviour
-// tick. Does nothing while a chart is running - the hoisted watchers own the evaluation then, and
-// evaluating here as well is exactly the double-fire the latch handover exists to prevent.
-armed_watcher_tick :: proc(ctx: ^Behaviour_Context) {
+// THE evaluator. Arbitrate the global list, then walk whatever won - the same two moves rules_tick
+// makes over a behaviour's own rules, and through the same rule_steps_run.
+//
+// Returns true while a global has control, which is how behaviour_tick knows to suspend the behaviour.
+// It is not a lock: the behaviour's in-flight step is simply not polled, so it resumes exactly where it
+// was the moment the global finishes. Rule 4 of the model, applied across the two lists.
+globals_tick :: proc(ctx: ^Behaviour_Context) -> bool {
   session := ctx.session
-  if session.script.active {
-    return
+
+  // Already running one: walk it. It cannot be preempted by another global - an escape hatch that can
+  // be cut off by a second escape hatch is not one, and the old design said the same thing with a
+  // special case ("an interrupt does not hoist interrupts") instead of with the shape.
+  if session.global_active >= 0 {
+    if session.global_active >= session.armed_watcher_count {
+      session.global_active = -1 // the array was rebuilt under us
+      return false
+    }
+    g := &session.armed_watchers[session.global_active]
+    switch rule_steps_run(ctx, g.steps[:], &session.global_pc, &session.global_entered, SCRIPT_MAX_STEPS_PER_TICK) {
+    case .Running:
+      return true
+    case .Done, .Aborted:
+      script_trace(session, g.id, .Note, "interrupt '%s' finished", g.doc)
+      session.global_active = -1
+      session.global_pc = 0
+      session.global_entered = false
+    }
+    return false
   }
+
+  // EVERY row is evaluated, even once a winner is known - a condition row updates its own baseline as a
+  // side effect of being asked. Same reason script_condition_holds evaluates every row of a condition.
+  winner := -1
   for i in 0 ..< session.armed_watcher_count {
     g := &session.armed_watchers[i]
-    if !g.ok {
+    if !g.ok || !g.enabled {
       continue
     }
-    // Through script_event_fired, not def.fired, so `trigger not <event>` negates like everywhere else.
+    // Through script_condition_holds, not def.fired, so `not <event>` negates like everywhere else.
     if !script_condition_holds(ctx, g.condition, &g.condition_state) {
       g.condition_state.latched = false // condition went away - re-arm for the next edge
       continue
     }
+    // Globals are EDGE-triggered whatever the row says: an interrupt is about something HAPPENING, and
+    // a level-triggered escape would re-enter itself every tick its condition stayed true.
     if g.condition_state.latched {
-      continue // still true from a previous fire; not a new edge
+      continue
     }
-    g.condition_state.latched = true
-    g.fires += 1
-    fmt.printf("\n[interrupt] %s fired (%s)\n", g.doc, g.label)
-    fmt.print("memscan> ")
-    armed_watcher_launch(session, g.doc, g.body)
-    return // one per tick, first match wins - same rule as a chart's own watchers
+    if winner < 0 {
+      winner = i
+    }
   }
+  if winner < 0 {
+    return false
+  }
+  g := &session.armed_watchers[winner]
+  g.condition_state.latched = true
+  g.fires += 1
+  session.global_active = winner
+  session.global_pc = 0
+  session.global_entered = false
+  fmt.printf("\n[interrupt] %s fired (%s)\n", g.doc, g.label)
+  fmt.print("memscan> ")
+  script_trace(session, g.id, .Note, "INTERRUPT '%s': %s", g.doc, g.label)
+  return true // one per tick, first match wins
 }
 
-// Run ONE watcher's body standalone, starting at <body>. Separate from script_cmd_run because the
-// refusal paths have to be quiet-ish and non-fatal: this is fired by a condition, not typed, so a
-// document that cannot start must say why once and leave the session alone rather than look like a
-// crash. <body> = 0 means "the first watcher this document declares", which is what `interrupt test`
-// wants.
-armed_watcher_launch :: proc(session: ^Session, name: string, body: Node_Id = 0) {
-  doc, ok := bhv_open(name)
-  if !ok {
-    fmt.eprintfln("[interrupt] '%s' would not load - disable it with 'interrupt off %s'.", name, name)
+// Tear down whatever a global left in flight. Called on detach and when the list is rebuilt, for the
+// same reason script_teardown exists: leaving a step for any reason has to undo what it started.
+globals_stop :: proc(ctx: ^Behaviour_Context) {
+  session := ctx.session
+  if session.global_active < 0 || session.global_active >= session.armed_watcher_count {
+    session.global_active = -1
     return
   }
-  if problems := script_check_avail(session, doc.steps[:]); len(problems) > 0 {
-    fmt.eprintfln("[interrupt] '%s' uses %d block(s) that aren't available - not started:", name, len(problems))
-    for p in problems {
-      fmt.eprintfln("  %s", p)
-    }
-    behaviour_doc_free(&doc)
-    return
-  }
-  entry := body
-  if entry == 0 {
-    for s in doc.steps {
-      if s.op == .On && s.goto_id != 0 {
-        entry = s.goto_id
-        break
-      }
-    }
-  }
-  if entry == 0 {
-    fmt.eprintfln("[interrupt] '%s' has no watcher body to run.", name)
-    behaviour_doc_free(&doc)
-    return
-  }
-  // .Once, and the doc's own mode is ignored: an interrupt that looped would never give control back,
-  // which is the one thing an interrupt must always do. It also does NOT borrow anything - see the
-  // header note on why an escape must not be interruptible by itself.
-  script_begin(session, name, doc.steps, .Once, entry, .Interrupt, nil, doc.ignore_collision)
-  delete(doc.name)
-  delete(doc.trigger.strs[0])
-  delete(doc.trigger.strs[1])
-  for u in doc.uses {
-    delete(u)
-  }
-  delete(doc.uses)
+  g := &session.armed_watchers[session.global_active]
+  rule_steps_exit(ctx, g.steps[:], session.global_pc, &session.global_entered)
+  session.global_active = -1
+  session.global_pc = 0
 }
 
 // --- CLI ------------------------------------------------------------------------------------------
@@ -336,16 +325,11 @@ cli_interrupt :: proc(session: ^Session, args: []string) {
       fmt.eprintfln("interrupt on: no behaviour named '%s'. 'script list' shows what's available.", name)
       return
     }
-    watchers := 0
-    for s in doc.steps {
-      if s.op == .On && s.goto_id != 0 {
-        watchers += 1
-      }
-    }
+    rules := len(doc.rules)
     behaviour_doc_free(&doc)
-    if watchers == 0 {
-      fmt.eprintfln("interrupt on: '%s' has no watchers, so there is nothing to arm.", name)
-      fmt.eprintln("  open it in the node editor and add an 'on' node wired to what it should do.")
+    if rules == 0 {
+      fmt.eprintfln("interrupt on: '%s' has no rules, so there is nothing to arm.", name)
+      fmt.eprintln("  a global interrupt is a rule list: give it a WHEN and what to DO about it.")
       return
     }
     if !armed_watcher_set_enabled(session, name, true) {
@@ -383,11 +367,24 @@ cli_interrupt :: proc(session: ^Session, args: []string) {
       fmt.eprintln("usage: interrupt test <name>   (runs its body now, ignoring the trigger)")
       return
     }
-    if session.script.active {
-      fmt.eprintln("interrupt test: something is already running - 'script stop' first.")
+    // Force the first row of <name> to take control, ignoring its condition. It has to be ENABLED -
+    // the armed list is the only place a global's steps live now, so there is nothing to run otherwise.
+    idx := -1
+    for i in 0 ..< session.armed_watcher_count {
+      if session.armed_watchers[i].doc == args[1] && session.armed_watchers[i].ok {
+        idx = i
+        break
+      }
+    }
+    if idx < 0 {
+      fmt.eprintfln("interrupt test: '%s' is not armed - 'interrupt on %s' first.", args[1], args[1])
       return
     }
-    armed_watcher_launch(session, args[1])
+    session.global_active = idx
+    session.global_pc = 0
+    session.global_entered = false
+    session.armed_watchers[idx].condition_state.latched = true // it has been serviced; do not re-fire on the edge
+    fmt.printfln("interrupt: running '%s' now (%s).", args[1], session.armed_watchers[idx].label)
 
   case:
     fmt.eprintfln("interrupt: unknown subcommand '%s'", args[0])
@@ -395,22 +392,28 @@ cli_interrupt :: proc(session: ^Session, args: []string) {
   }
 }
 
-// How many watchers a saved behaviour declares, without keeping the document. Used by the lists to
-// tell "this is a chart" from "this is something you arm" - which is now a property of the CONTENT, not
-// a header, because there is only one kind of document.
-bhv_watcher_count :: proc(name: string) -> int {
-  doc, ok := bhv_open(name)
-  if !ok {
+// How many rules a saved behaviour has, counted off the file rather than parsed.
+//
+// QUIET ON PURPOSE, which is the whole reason it does not just call bhv_open: this drives a MENU of
+// everything you could arm, and bhv_deserialize reports a file it cannot read - so a directory holding
+// a few pre-cutover graph charts would print a paragraph of refusals in the middle of the list. Those
+// belong in `script lint`, which is the command that exists to say what is wrong with what.
+bhv_rule_count :: proc(name: string) -> int {
+  data, err := os.read_entire_file(bhv_file_path(name), context.temp_allocator)
+  if err != nil {
     return 0
   }
-  defer behaviour_doc_free(&doc)
   n := 0
-  for s in doc.steps {
-    if s.op == .On && s.goto_id != 0 {
+  versioned := false
+  for raw in strings.split_lines(strings.trim_prefix(string(data), BHV_BOM), context.temp_allocator) {
+    line := strings.trim_space(raw)
+    if strings.has_prefix(line, "version ") {
+      versioned = true
+    } else if strings.has_prefix(line, "rule ") {
       n += 1
     }
   }
-  return n
+  return versioned ? n : 0
 }
 
 armed_watcher_print_list :: proc(session: ^Session) {
@@ -426,13 +429,15 @@ armed_watcher_print_list :: proc(session: ^Session) {
       fmt.printfln("  BAD  %-16s %s", g.doc, g.why)
     }
   }
-  // Everything that COULD be turned on, so the list is a menu and not just a receipt.
+  // Everything that COULD be turned on, so the list is a menu and not just a receipt. That is now
+  // every saved behaviour: arming one puts its rules above whatever is running, and there is no
+  // separate kind of document that is allowed to be armed.
   first := true
   for name in bhv_list_names() {
     if armed_watcher_behaviour_enabled(session, name) {
       continue
     }
-    n := bhv_watcher_count(name)
+    n := bhv_rule_count(name)
     if n == 0 {
       continue
     }
@@ -440,10 +445,10 @@ armed_watcher_print_list :: proc(session: ^Session) {
       fmt.println("  --- off ---")
       first = false
     }
-    fmt.printfln("  off  %-16s %d watcher(s)", name, n)
+    fmt.printfln("  off  %-16s %d rule(s)", name, n)
   }
-  fmt.println("  'interrupt on <name>' arms one. Make one in the node editor: add an 'on' node and wire it.")
-  fmt.println("  A chart can also borrow one for itself - `uses <name>` in its file, or the editor's options tab.")
+  fmt.println("  'interrupt on <name>' arms one, and 'interrupt test <name>' runs its top rule right now.")
+  fmt.println("  One edge-triggered rule is the usual shape: a whole farm loop armed here would never hand the tick back.")
 }
 
 // The `status full` detail section (see cli_status_behaviour).
