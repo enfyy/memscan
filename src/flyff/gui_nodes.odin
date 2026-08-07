@@ -3319,24 +3319,90 @@ ed_draw_nodes :: proc(
     // own right, it can only point at one node, and it is the same shape as every other edge on the
     // canvas - so it is read the same way.
     if s.id == entry && !watchers_only {
-      cx := (a.x + b.x) * 0.5
-      cw := max(px(58) * ed.zoom, px(30))
-      ch := title_fs + px(7) * ed.zoom
-      cy := a.y - ch - px(16) * ed.zoom
-      p0 := imgui.Vec2{cx - cw * 0.5, cy}
-      p1 := imgui.Vec2{cx + cw * 0.5, cy + ch}
-      imgui.DrawList_AddRectFilled(dl, p0, p1, u32_of(tint(COL_OK, 0.22)), ch * 0.5)
-      imgui.DrawList_AddRect(dl, p0, p1, u32_of(tint(COL_OK, 0.85)), ch * 0.5, {}, max(px(1.5) * ed.zoom, 1))
-      lw := imgui.CalcTextSize("START").x * (title_fs / imgui.GetFontSize())
-      ed_text(dl, {cx - lw * 0.5, cy + (ch - title_fs) * 0.5}, title_fs, COL_OK, "START")
-      imgui.DrawList_AddLine(dl, {cx, p1.y}, {cx, a.y}, u32_of(tint(COL_OK, 0.8)), max(px(2) * ed.zoom, 1.2))
-      ah := max(px(5) * ed.zoom, 3)
-      imgui.DrawList_AddTriangleFilled(dl, {cx - ah, a.y - ah * 1.6}, {cx + ah, a.y - ah * 1.6}, {cx, a.y}, u32_of(tint(COL_OK, 0.9)))
+      ed_draw_entry_capsule(dl, ed, a, b, title_fs, "START", COL_OK)
+    }
+    // Where the LIVE run actually began, when that is not the chart's start node - `script run <x>
+    // from <node>`. Amber and separately labelled, because the green capsule states a property of the
+    // chart and this states a property of one run; drawing only the green one would leave START
+    // sitting on a node the run never touched.
+    if chart_running && f.script_entry != 0 && f.script_entry != entry && s.id == f.script_entry {
+      ed_draw_entry_capsule(dl, ed, a, b, title_fs, "RUN FROM", COL_WARN)
     }
   }
 }
 
+// The START anchor's shape, shared by the two things that can claim a node as an entry: the chart's
+// own start node and the node a debug run was started at. One proc so they cannot drift into looking
+// like different kinds of object.
+@(private = "file")
+ed_draw_entry_capsule :: proc(
+  dl: ^imgui.DrawList,
+  ed: ^Gui_Editor,
+  a, b: imgui.Vec2,
+  title_fs: f32,
+  label: string,
+  col: imgui.Vec4,
+) {
+  ctext := fmt.ctprintf("%s", label)
+  cx := (a.x + b.x) * 0.5
+  cw := max(imgui.CalcTextSize(ctext).x * (title_fs / imgui.GetFontSize()) + px(18) * ed.zoom, px(30))
+  ch := title_fs + px(7) * ed.zoom
+  cy := a.y - ch - px(16) * ed.zoom
+  p0 := imgui.Vec2{cx - cw * 0.5, cy}
+  p1 := imgui.Vec2{cx + cw * 0.5, cy + ch}
+  imgui.DrawList_AddRectFilled(dl, p0, p1, u32_of(tint(col, 0.22)), ch * 0.5)
+  imgui.DrawList_AddRect(dl, p0, p1, u32_of(tint(col, 0.85)), ch * 0.5, {}, max(px(1.5) * ed.zoom, 1))
+  lw := imgui.CalcTextSize(ctext).x * (title_fs / imgui.GetFontSize())
+  ed_text(dl, {cx - lw * 0.5, cy + (ch - title_fs) * 0.5}, title_fs, col, ctext)
+  imgui.DrawList_AddLine(dl, {cx, p1.y}, {cx, a.y}, u32_of(tint(col, 0.8)), max(px(2) * ed.zoom, 1.2))
+  ah := max(px(5) * ed.zoom, 3)
+  imgui.DrawList_AddTriangleFilled(dl, {cx - ah, a.y - ah * 1.6}, {cx + ah, a.y - ah * 1.6}, {cx, a.y}, u32_of(tint(col, 0.9)))
+}
+
 // --- node context menu -------------------------------------------------------------------------------
+
+// Can a run begin at <s>? The two nodes control can never arrive at first: a watcher, which is checked
+// before every step rather than walked to, and anything in a watcher's body, which script_begin
+// partitions out of the main program entirely. The same pair `script run ... from` refuses in the CLI.
+@(private = "file")
+ed_can_start_at :: proc(ed: ^Gui_Editor, s: ^Script_Step) -> bool {
+  if s.op == .On {
+    return false
+  }
+  index := ed_index(ed, s.id)
+  if index < 0 {
+    return false
+  }
+  is_watcher := make([]bool, len(ed.doc.steps), context.temp_allocator)
+  ed_watcher_mask(ed, is_watcher)
+  return !is_watcher[index]
+}
+
+// "Run from here" - start the chart at this node for THIS run, leaving the saved start node alone.
+//
+// Same sequence as the toolbar's play button: save first (the VM runs what is on disk, not what is on
+// the canvas), stop anything already running, then enqueue the command. Direct calls are not an option
+// here - the walker is on the watcher thread and panel_enqueue is how the GUI has always crossed that.
+@(private = "file")
+ed_run_from_here_item :: proc(ps: ^Panel_State, ed: ^Gui_Editor, s: ^Script_Step) {
+  if !ed_can_start_at(ed, s) {
+    return
+  }
+  id := s.id
+  if imgui.Selectable("Run from here") {
+    if ed_save(ps, ed) {
+      panel_enqueue(ps, "script stop")
+      panel_enqueue(ps, fmt.tprintf("script run %s from %d", strings.trim_space(panel_buf_str(ed.name_buf[:])), u32(id)))
+    }
+  }
+  if imgui.IsItemHovered() {
+    imgui.SetTooltip(
+      "Start the run at this node instead of the top, just this once - the chart file is not changed.\n" +
+      "The variables this node saw last time are put back, and anything still missing is named in the console.\n" +
+      "'loop' wraps here and the rewind button comes back here while the run lasts.",
+    )
+  }
+}
 
 @(private = "file")
 gui_ed_node_menu :: proc(ps: ^Panel_State, ed: ^Gui_Editor) {
@@ -3357,6 +3423,13 @@ gui_ed_node_menu :: proc(ps: ^Panel_State, ed: ^Gui_Editor) {
     ed.doc.entry = s.id
     ed.dirty = true
   }
+  if imgui.IsItemHovered() {
+    imgui.SetTooltip("Make this the chart's start node - an EDIT, saved with the file.")
+  }
+  // The debug twin of "Start here": same destination, but for one run and without touching the file.
+  // Two entries rather than a modifier on one, because they are different verbs - this is the one you
+  // want twenty times while chasing a bug, and it should never leave a mark on the chart.
+  ed_run_from_here_item(ps, ed, s)
   if s.goto_id != 0 || s.else_id != 0 {
     if imgui.Selectable("Disconnect outputs") {
       ed_snapshot(ed)
@@ -3783,6 +3856,25 @@ gui_ed_inspector :: proc(ps: ^Panel_State, ed: ^Gui_Editor, f: ^Gui_Frame) {
     ed.doc.entry = s.id
     ed.dirty = true
   }
+  // The same pair the node's right-click menu offers, and in the same order. "Start here" edits the
+  // chart; this one is for the run in front of you and leaves the file alone - which is why it is
+  // offered even on the node that ALREADY is the start (starting there with the variables that node
+  // last saw is a different thing from starting there cold).
+  if !in_watcher {
+    imgui.Dummy({0, px(4)})
+    if imgui.Button("Run from here", {-1, 0}) {
+      if ed_save(ps, ed) {
+        panel_enqueue(ps, "script stop")
+        panel_enqueue(ps, fmt.tprintf("script run %s from %d", strings.trim_space(panel_buf_str(ed.name_buf[:])), u32(s.id)))
+      }
+    }
+    if imgui.IsItemHovered() {
+      imgui.SetTooltip(
+        "Run the chart starting at this node, just this once - the file is not changed.\n" +
+        "The variables this node saw last time are put back; anything still missing is named in the console.",
+      )
+    }
+  }
   imgui.Dummy({0, px(4)})
   imgui.PushStyleColorImVec4(.Button, tint(COL_BAD, 0.25))
   if imgui.Button("Delete node", {-1, 0}) {
@@ -4032,6 +4124,37 @@ gui_ed_block_settings :: proc(ed: ^Gui_Editor) {
   if imgui.IsItemActivated() {
     ed_snapshot(ed)
   }
+  // Also a property of the DOCUMENT, so it belongs beside the other one rather than on a node. It is
+  // below the description because it is the rarer statement of the two: most charts never want it, and
+  // the ones that do are written for a specific map.
+  imgui.Dummy({0, px(6)})
+  imgui.SeparatorText("Where this chart runs")
+  ignore := ed.doc.ignore_collision
+  if imgui.Checkbox("Ignore collision when picking and approaching", &ignore) {
+    ed_snapshot(ed)
+    ed.doc.ignore_collision = ignore
+    ed.dirty = true
+  }
+  if imgui.IsItemHovered() {
+    imgui.SetTooltip(
+      "%s",
+      cstring(
+        "For maps where the floor is covered in props you actually walk straight over.\n\n" +
+        "Normally a monster is skipped if the straight line to it is blocked by terrain or a collider " +
+        "box. Some dungeons are carpeted with boxes that block nothing, and the chart then finds " +
+        "almost nothing to hit.\n\n" +
+        "With this on, nothing in this chart asks whether the path is clear - it will also walk at a " +
+        "monster behind a REAL wall and jam there until the stuck watch gives up.\n\n" +
+        "Try 'collignore' first if a single prop is the culprit: radar key I, click the offending box.",
+      ),
+    )
+  }
+  if ignore {
+    imgui.PushStyleColorImVec4(.Text, COL_WARN)
+    imgui.TextWrapped("%s", cstring("Walls are ignored too - only use this where they are not the problem."))
+    imgui.PopStyleColor(1)
+  }
+
   if !ed.doc.is_subchart {
     imgui.Dummy({0, px(6)})
     return
@@ -5240,7 +5363,8 @@ gui_ed_trace :: proc(ps: ^Panel_State, ed: ^Gui_Editor, f: ^Gui_Frame) {
       }
       imgui.PushIDInt(i32(i))
       imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
-      imgui.TextUnformatted(fmt.ctprintf("%7.2fs", f64(r.at - base) / 1e9))
+      // Space flag: Odin pads a number with '0' without it, so 1.5s rendered as "0001.50s".
+      imgui.TextUnformatted(fmt.ctprintf("% 7.2fs", f64(r.at - base) / 1e9))
       imgui.PopStyleColor(1)
       imgui.SameLine(0, px(8))
       if r.node != 0 {

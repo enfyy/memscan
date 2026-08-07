@@ -194,6 +194,28 @@ hunt_steering_on :: proc(session: ^Session) -> bool {
   return session.script.sidestep_chart && !session.sweep_on
 }
 
+// THE question every collision check asks: should the proactive reach gate run at all right now?
+//
+// Three ways it can be off, and they are genuinely different things:
+//   - session.reach_gate_on   - the global default (on; nothing turns it off today, see BACKLOG)
+//   - hunt_steering_on        - INFERRED from the chart: it side-steps, so it must be allowed to pick
+//                               mobs it cannot currently walk to
+//   - script.ignore_collision - DECLARED by the chart: on this map the gate is simply wrong. Props a
+//                               character walks straight over still produce collider boxes, and
+//                               compute_reach cannot tell those from a wall, so a floor full of them
+//                               excludes the room and the ladder starves.
+//
+// Every site that used to test `session.reach_gate_on` goes through here instead, so the three cannot
+// disagree and a new consumer cannot accidentally honour only one of them. Inert with no chart running:
+// script.ignore_collision is false whenever session.script is not a run that declared it.
+//
+// What this does NOT touch: the stuck monitor (a distance plateau is measured, not predicted, so it
+// still catches a real jam), the `target_reachable` block (asking the question explicitly deserves the
+// honest answer), and the radar's reach fade, which is a view toggle of its own.
+reach_gate_active :: proc(session: ^Session) -> bool {
+  return session.reach_gate_on && !session.script.ignore_collision && !hunt_steering_on(session)
+}
+
 // Blacklist <focus> and clear m_pObjFocus so the next tick advances to a different mob. Shared by the
 // distance-plateau stuck monitor (auto_monitor) and the locked-target reach re-watch (auto_reach_watch).
 // <reason> feeds the log line; <steer> arms the one-shot opposite-side avoid hint (the stuck case - a
@@ -534,7 +556,7 @@ auto_start_chart :: proc(session: ^Session) -> bool {
   }
   entry := doc.entry
   mode := doc.mode
-  script_begin(session, "auto", doc.steps, mode, entry, .Chart, doc.uses[:])
+  script_begin(session, "auto", doc.steps, mode, entry, .Chart, doc.uses[:], doc.ignore_collision)
   delete(doc.name)
   delete(doc.trigger.strs[0])
   delete(doc.trigger.strs[1])

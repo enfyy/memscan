@@ -302,7 +302,7 @@ armed_watcher_launch :: proc(session: ^Session, name: string, body: Node_Id = 0)
   // .Once, and the doc's own mode is ignored: an interrupt that looped would never give control back,
   // which is the one thing an interrupt must always do. It also does NOT borrow anything - see the
   // header note on why an escape must not be interruptible by itself.
-  script_begin(session, name, doc.steps, .Once, entry, .Interrupt)
+  script_begin(session, name, doc.steps, .Once, entry, .Interrupt, nil, doc.ignore_collision)
   delete(doc.name)
   delete(doc.trigger.strs[0])
   delete(doc.trigger.strs[1])

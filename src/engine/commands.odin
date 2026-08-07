@@ -48,7 +48,10 @@ cmd_ps :: proc(args: []string) {
   results := find_process_id_by_name(filter, context.temp_allocator)
   fmt.printfln("%d process(es):", len(results))
   for r in results {
-    fmt.printfln("  pid=%-6d  %-28s  %s", r.process_id, r.process_name, r.window_title)
+    // '% -6d', not '%-6d'. Odin pads a NUMBER with '0' unless the space flag is present
+    // (fmt.fmt_write_padding), so '%-6d' printed pid 21884 as "218840" and the pid you copied out of
+    // this list did not exist. Strings are unaffected, which is why '%-28s' beside it is plain.
+    fmt.printfln("  pid=% -6d  %-28s  %s", r.process_id, r.process_name, r.window_title)
   }
 }
 

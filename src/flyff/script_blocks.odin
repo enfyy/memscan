@@ -1825,7 +1825,7 @@ script_pick_ctx :: proc(ctx: ^Behaviour_Context, opts: Rung_Opts) -> (pick_conte
     aggro_on           = true,
     melee_on           = true,
     pocket_on          = true,
-    gate               = s.reach_gate_on && !hunt_steering_on(s),
+    gate               = reach_gate_active(s),
     sweep_on           = false, // pick_in_range is the block form of the sweep short-circuit
     fence_on           = s.fence.active,
     avoid_on           = true,
@@ -2232,7 +2232,7 @@ act_approach_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_S
 
   // Reached the waypoint and still short of the target: aim the next leg. The mob has almost certainly
   // moved since the last one was chosen, so this re-reads it rather than continuing an old line.
-  if s.reach_gate_on && !sidestep && !cand_reachable(s, world, ppos, tpos) {
+  if reach_gate_active(s) && !sidestep && !cand_reachable(s, world, ppos, tpos) {
     return .Failed // the next leg is blocked now
   }
   if !script_approach_hop(ctx, step, ppos, tpos) {
@@ -2330,7 +2330,7 @@ act_hold_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Statu
 
   // Reach re-check: a mob can be dragged behind cover after it was locked. Probed on a slow cadence and
   // debounced, since clipping happens transiently while rounding a corner.
-  if s.reach_gate_on && ctx.now >= sc.probe_at {
+  if reach_gate_active(s) && ctx.now >= sc.probe_at {
     sc.probe_at = ctx.now + REACH_RECHECK_NS
     switch {
     case in_combat, d <= ARRIVE_DIST:

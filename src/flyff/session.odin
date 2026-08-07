@@ -250,6 +250,11 @@ Session :: struct {
   // Pure observation - nothing reads it back to make a decision - so it is never reset on attach.
   script_trace: Script_Trace,
 
+  // What the chart's variables held at each node last time control reached it (see Script_Snapshots).
+  // Session-scoped for the same reason the trace is, and for one more: `script run <x> from <node>`
+  // is a thing you do AFTER a run died, and the snapshot is what makes starting there mean anything.
+  script_snapshots: Script_Snapshots,
+
   // Keys the tool is currently HOLDING DOWN, indexed by virtual-key code (see keys.odin). Only
   // key_down/`key hold` put anything in here: a plain press is a down/up pair inside one step, but a
   // HELD key deliberately outlives the step that pressed it, so this is the record that lets every

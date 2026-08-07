@@ -1001,7 +1001,7 @@ tc_finish_select :: proc(
     aggro_on      = session.aggro_first_on, // ladder rung 1 (see tc_pick_one)
     melee_on      = session.melee_first_on, // rung 2
     pocket_on     = session.pocket_on,      // rung 4
-    gate          = require_fresh && session.reach_gate_on && !hunt_steering_on(session), // reach filter (auto only; hunt commits even to a blocked target - it side-steps in)
+    gate          = require_fresh && reach_gate_active(session), // reach filter (auto only; see reach_gate_active for the three ways it comes off)
     sweep_on      = session.sweep_on, // painted lane armed -> in-range-only selection (auto only)
     fence_on      = session.fence.active, // geo-fence gate (auto + manual when active; 'fence off' to override)
     avoid_on      = session.auto_avoid_on,
@@ -1157,7 +1157,7 @@ tc_finish_precompute :: proc(
     aggro_on      = session.aggro_first_on, // ladder rung 1 (see tc_pick_one)
     melee_on      = session.melee_first_on, // rung 2
     pocket_on     = session.pocket_on,      // rung 4
-    gate          = session.reach_gate_on && !hunt_steering_on(session), // hunt commits even to a blocked target (see tc_finish_select)
+    gate          = reach_gate_active(session), // hunt commits even to a blocked target (see tc_finish_select)
     sweep_on      = session.sweep_on, // (sweep_tick disables pre-select outright, but keep the ctx honest)
     fence_on      = session.fence.active,
     avoid_on      = false, // pre-select never runs the one-shot stuck-avoid steer
@@ -1215,7 +1215,7 @@ tc_precompute_still_valid :: proc(session: ^Session, obj: uintptr, cached_pos: [
   if engine.dist_horizontal(lp, cached_pos) > PRESELECT_DRIFT_MAX {
     return {}, false // wandered too far - the precomputed choice may no longer make sense
   }
-  if session.reach_gate_on && !hunt_steering_on(session) && !cand_reachable(session, world, player_pos, lp) {
+  if reach_gate_active(session) && !cand_reachable(session, world, player_pos, lp) {
     return {}, false // approach is blocked NOW (terrain/object), whatever it looked like at precompute (hunt commits anyway)
   }
   if session.fence.active && !fence_contains(session.fence, lp[0], lp[2]) {

@@ -338,6 +338,10 @@ Script_Run :: struct {
   watchers:       [dynamic]Script_Watcher,
   pc:             int,
   entry_pc:       int, // index the run started at (resolved from the doc's entry node); Loop wraps here
+  // Did `script run <x> from <node>` choose that entry, rather than the chart's own start node? Only
+  // affects what gets SAID - the walker cannot tell the difference and should not - but "why did it
+  // begin in the middle" and "why does the rewind button not go to the top" both need this to answer.
+  debug_entry:    bool,
   entered:        bool, // has the current step's start() run?
   started_at:     i64,
   step_at:        i64,
@@ -373,6 +377,17 @@ Script_Run :: struct {
   // pick a mob it cannot currently walk to. Derived from the STEPS, because "is this hunt" stopped being
   // a mode you toggle and became a property of the chart you ran.
   sidestep_chart: bool,
+  // The chart declared `ignore_collision` (Behaviour_Doc.ignore_collision) - the proactive reach gate
+  // is off for this whole run. Copied onto the run beside sidestep_chart, and for the same reason: it
+  // is fixed for the duration, and the pick loop should not be re-reading the document. Zero when no
+  // chart is running, which is what makes reach_gate_active inert outside one.
+  ignore_collision: bool,
+  // The variables this chart WRITES, collected once at script_begin - what a per-node snapshot
+  // records. Derived from the steps for the same reason sidestep_chart is: it is a property of the
+  // program, and asking it per node visit would be a scan of the whole array on the tick. Names are
+  // fixed buffers rather than owned strings because the snapshot writer runs on the watcher tick.
+  snap_names:     [SCRIPT_SNAP_VARS]Saved_Var, // only `name`/`name_len` are used here
+  snap_count:     int,
   kills_by_name:  map[string]int, // per-species kill tally for `kills_of` (keys owned)
 
   // --- the targeting ladder's working set ---
@@ -452,6 +467,92 @@ script_trace_recent :: proc(trace: ^Script_Trace, limit: int, allocator := conte
 // an Odin parameter is immutable and therefore is not one. Callers walk with `for &row in rows`.
 script_trace_text :: proc(row: ^Script_Trace_Row) -> string {
   return string(row.text[:min(int(row.count), SCRIPT_TRACE_TEXT)])
+}
+
+// --- variable snapshots -------------------------------------------------------------------------
+//
+// What the chart's own variables held the last time control arrived at each node, so `script run <x>
+// from <node>` can put them back. The whole reason starting mid-chart looks impossible is that the
+// nodes you skipped are the ones that set things up; a snapshot is the answer that needs no
+// guessing, because it is what those nodes actually produced last time they ran.
+//
+// SESSION-SCOPED for the same reason the trace ring is: the run is freed the instant a program ends,
+// and "start it again from where it broke" is asked AFTER that. See Session.script_snapshots.
+//
+// POD, like the trace ring, and for the same reason - rows are written on the watcher tick, where
+// nothing frees an allocation. Saved_Var is reused rather than a tighter layout invented: it already
+// carries `had`, so a variable that was UNSET comes back unset rather than as "", which var_is
+// distinguishes on purpose.
+//
+// Only the chart's OWN variables (Script_Run.snap_names), not the whole session store. A chart is
+// responsible for what it writes; the `base` you set by hand an hour ago is not state it lost.
+SCRIPT_SNAP_NODES :: 64 // most-recently-visited nodes kept
+SCRIPT_SNAP_VARS :: 16 // per node, capped - the chart's own variables
+
+Script_Var_Snapshot :: struct {
+  node:  Node_Id, // 0 = the row is empty
+  at:    i64,
+  vars:  [SCRIPT_SNAP_VARS]Saved_Var,
+  count: int,
+}
+
+// Which chart the table belongs to, so a different one starting cannot inherit its rows. Node ids are
+// only unique WITHIN a document and are recycled after a delete (ed_next_id is max+1), so keying on
+// the id alone would eventually hand node 12's variables to a different node 12.
+Script_Snapshots :: struct {
+  chart:     [64]u8,
+  chart_len: int,
+  rows:      [SCRIPT_SNAP_NODES]Script_Var_Snapshot,
+}
+
+// The row for <node>, or nil. Linear over 64 - this runs once per `from` run, never on the tick.
+script_snapshot_find :: proc(snapshots: ^Script_Snapshots, node: Node_Id) -> ^Script_Var_Snapshot {
+  if node == 0 {
+    return nil
+  }
+  for &row in snapshots.rows {
+    if row.node == node {
+      return &row
+    }
+  }
+  return nil
+}
+
+// Where <node>'s row goes: its existing one, else an empty slot, else the oldest. Called from the
+// walker, so it is a scan of a fixed array and nothing else.
+script_snapshot_slot :: proc(snapshots: ^Script_Snapshots, node: Node_Id) -> ^Script_Var_Snapshot {
+  oldest := 0
+  for &row, i in snapshots.rows {
+    if row.node == node {
+      return &row
+    }
+    if row.node == 0 {
+      return &row
+    }
+    if row.at < snapshots.rows[oldest].at {
+      oldest = i
+    }
+  }
+  return &snapshots.rows[oldest]
+}
+
+script_snapshots_chart :: proc(snapshots: ^Script_Snapshots) -> string {
+  return string(snapshots.chart[:min(snapshots.chart_len, len(snapshots.chart))])
+}
+
+// Drop everything and re-stamp the owner. Called when a different chart starts and when the editor
+// saves - an edit can renumber nodes, and a snapshot pointing at the wrong node is worse than none.
+script_snapshots_reset :: proc(snapshots: ^Script_Snapshots, chart: string) {
+  snapshots^ = {}
+  snapshots.chart_len = copy(snapshots.chart[:], chart)
+}
+
+script_saved_var_name :: proc(saved: ^Saved_Var) -> string {
+  return string(saved.name[:min(saved.name_len, len(saved.name))])
+}
+
+script_saved_var_value :: proc(saved: ^Saved_Var) -> string {
+  return string(saved.value[:min(saved.value_len, len(saved.value))])
 }
 
 // --- lifetime -----------------------------------------------------------------------------------

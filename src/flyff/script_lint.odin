@@ -116,6 +116,16 @@ lint_document :: proc(doc: ^Behaviour_Doc, out: ^[dynamic]Chart_Problem) {
       })
     }
   }
+  // Not a fault - it is a deliberate declaration - but it changes what every targeting node in the
+  // chart does, and nothing on the canvas shows it. A note is how this pane says "know this about the
+  // document you are reading".
+  if doc.ignore_collision {
+    append(out, Chart_Problem{
+      level = .Note,
+      text  = "this chart ignores collision - monsters are picked and approached without checking the path is clear",
+      hint  = "written for a map whose floor props do not really block; untick it in Chart options for anywhere else",
+    })
+  }
   if doc.is_subchart {
     lint_subchart_document(doc, out)
   }
@@ -663,8 +673,12 @@ chart_variable_names :: proc(doc: ^Behaviour_Doc, allocator := context.temp_allo
 // Which nodes control can actually get to. Seeded from the start node AND from every watcher, because a
 // watcher is hoisted out of the instruction stream (so it is always live) and its body is only ever
 // entered by its own edge.
+//
+// <from> overrides the document's own start node - what `script run <x> from <node>` asks, to work out
+// which half of the chart a debug run will actually see. 0 means "the document's start node", which is
+// the linting case and every other caller.
 @(private = "file")
-lint_reachable :: proc(doc: ^Behaviour_Doc, ids: map[Node_Id]int) -> map[Node_Id]bool {
+lint_reachable :: proc(doc: ^Behaviour_Doc, ids: map[Node_Id]int, from: Node_Id = 0) -> map[Node_Id]bool {
   seen := make(map[Node_Id]bool, len(doc.steps), context.temp_allocator)
   if len(doc.steps) == 0 {
     return seen
@@ -672,7 +686,7 @@ lint_reachable :: proc(doc: ^Behaviour_Doc, ids: map[Node_Id]int) -> map[Node_Id
   pending := make([dynamic]Node_Id, context.temp_allocator)
   defer delete(pending)
 
-  entry := doc.entry != 0 ? doc.entry : doc.steps[0].id
+  entry := from != 0 ? from : (doc.entry != 0 ? doc.entry : doc.steps[0].id)
   append(&pending, entry)
   for s in doc.steps {
     if s.op == .On {
@@ -780,6 +794,120 @@ lint_condition_has :: proc(condition: Script_Condition, kind: Script_Event_Kind)
     }
   }
   return false
+}
+
+// --- starting somewhere other than the top ----------------------------------------------------------
+//
+// What a chart is MISSING when you start it partway down. This is the honest half of `script run <x>
+// from <node>`: the nodes you skipped are usually the ones that set the chart up, and a run that
+// starts after them reads their variables as literal text and behaves like a different chart.
+//
+// The same shape as the warning script_cmd_run already prints when a BLOCK is run on its own with
+// nothing binding its parameters - name what is unset and who would have set it, then let it run.
+
+// One variable a from-here run will read but nothing on its path sets.
+Entry_Gap :: struct {
+  name:         string, // the variable, with no leading '@'
+  set_by:       Node_Id, // the skipped node that writes it, 0 if nothing in the chart does
+  set_by_label: string, // that node's caption, for "(set by node 3 'read my position')"
+}
+
+// Every variable read on some path out of <from> that no node on that path sets.
+//
+// DOCUMENT-ONLY, deliberately - it does not ask the session what happens to be set right now, for the
+// reason chart_variable_names gives: this is a fact about the chart, and the caller is the one that
+// knows whether a value in the store is a restored snapshot or an hour-old leftover. script_cmd_run
+// filters the result against session.vars; a purely static caller does not have to.
+//
+// Strings point into <doc>, so they live exactly as long as it does.
+script_entry_gap :: proc(doc: ^Behaviour_Doc, from: Node_Id, allocator := context.temp_allocator) -> []Entry_Gap {
+  out := make([dynamic]Entry_Gap, 0, 4, allocator)
+  if len(doc.steps) == 0 {
+    return out[:]
+  }
+  ids := make(map[Node_Id]int, len(doc.steps), context.temp_allocator)
+  defer delete(ids)
+  for s, i in doc.steps {
+    ids[s.id] = i
+  }
+  reachable := lint_reachable(doc, ids, from)
+  defer delete(reachable)
+
+  // What the half of the chart you WILL run writes for itself. A variable set downstream of the entry
+  // is not missing, however far downstream - `read my position` two nodes in covers the `@home` a node
+  // after that reads, and reporting it would be noise on every well-formed chart.
+  written := make(map[string]bool, 8, context.temp_allocator)
+  defer delete(written)
+  for s in doc.steps {
+    if !reachable[s.id] {
+      continue
+    }
+    #partial switch s.action.kind {
+    case .Var, .Add, .Read_Value:
+      if name := script_var_name_of(s.action.strs[0]); name != "" {
+        written[name] = true
+      }
+    }
+    if s.op == .Call {
+      for i in 0 ..< min(s.call_arg_count, len(s.call_args)) {
+        if s.call_args[i].name != "" {
+          written[s.call_args[i].name] = true
+        }
+      }
+      // A called block sets things of its own, exactly as lint_variables_set counts them - without
+      // this, the normal way to get a value out of a block would be reported missing at every caller.
+      if info := subchart_registry_find(s.call_name); info != nil {
+        for n in info.sets {
+          written[n] = true
+        }
+      }
+    }
+  }
+
+  seen := make(map[string]bool, 8, context.temp_allocator)
+  defer delete(seen)
+  for s in doc.steps {
+    if !reachable[s.id] {
+      continue
+    }
+    for name in lint_step_references(s) {
+      if name == "" || seen[name] || written[name] {
+        continue
+      }
+      seen[name] = true
+      gap := Entry_Gap {
+        name = name,
+      }
+      // Who WOULD have set it - a node outside the path, i.e. one of the ones being skipped. That is
+      // the actually useful half: "@home_x (set by node 3 'read my position')" tells you both what to
+      // supply and that running from node 3 instead would supply it for you.
+      for other in doc.steps {
+        if reachable[other.id] {
+          continue
+        }
+        writes := false
+        #partial switch other.action.kind {
+        case .Var, .Add, .Read_Value:
+          writes = script_var_name_of(other.action.strs[0]) == name
+        }
+        if !writes && other.op == .Call {
+          for i in 0 ..< min(other.call_arg_count, len(other.call_args)) {
+            if other.call_args[i].name == name {
+              writes = true
+              break
+            }
+          }
+        }
+        if writes {
+          gap.set_by = other.id
+          gap.set_by_label = other.src
+          break
+        }
+      }
+      append(&out, gap)
+    }
+  }
+  return out[:]
 }
 
 // --- the CLI ---------------------------------------------------------------------------------------

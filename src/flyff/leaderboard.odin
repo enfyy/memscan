@@ -589,8 +589,11 @@ lb_print_board :: proc(rows: []Lb_Row, sort: int) {
 	for i in 0 ..< len(rows) {
 		r := &rows[i] // pointer: fixed-array fields aren't sliceable off a for-copy
 		nm := panel_buf_str(r.name[:])
+		// Space flag on every numeric column: Odin pads numbers with '0' without it, so rank 1 printed
+		// as "100" and 42 kills as "00000042" - and the header above, being all strings, space-padded
+		// and lined up with none of it. See cmd_ps for the same fix.
 		fmt.printf(
-			"  %-3d %-16s %8d %10d %6.1f %5d %6d %-12s\n",
+			"  % -3d %-16s % 8d % 10d % 6.1f % 5d % 6d %-12s\n",
 			i + 1, nm, r.kills, r.penya, r.kpm, r.max_density, r.monsters, fmt_elapsed(i64(r.dur_sec) * 1_000_000_000),
 		)
 	}

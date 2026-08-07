@@ -150,6 +150,20 @@ Behaviour_Doc :: struct {
   // for a saved file, so every tile but the built-in ones was a bare name. A sub-chart NEEDS one: it
   // appears in the palette next to blocks that all carry a sentence saying what they do.
   desc:    string, // owned
+  // Run this chart with the proactive collision gate OFF: pick, approach and hold a monster without
+  // ever asking whether the straight line to it is clear. DECLARED, not derived - there is nothing in
+  // a chart's nodes that implies it, and it is the same kind of statement as `subchart`.
+  //
+  // It exists because the gate can be WRONG. compute_reach treats every collider box as a wall, and
+  // some maps - dungeons especially - are carpeted with props that a character walks straight over.
+  // There the gate excludes most of the room and the ladder starves. The narrow fix is `collignore`
+  // (drop one collider KIND, radar key I), and it is the better tool when one prop is the culprit;
+  // this is the blunt one for a map where the whole floor is the problem.
+  //
+  // A property of the CHART rather than a setting on the session, so it travels in the .bhv and is
+  // scoped to the run - a dungeon chart carries it, the field chart next to it does not, and neither
+  // has to remember to put a global back. See reach_gate_active.
+  ignore_collision: bool,
   // --- the sub-chart half -------------------------------------------------------------------------
   // Is this document a BLOCK rather than a program? Declared by a `subchart` line, not derived from
   // content the way "watchers only" is: there is nothing in a chart's nodes from which a parameter list
@@ -413,6 +427,11 @@ bhv_serialize :: proc(doc: ^Behaviour_Doc, b: ^strings.Builder) {
   // A bare flag line, first, so `head -3` on a file answers "is this a block or a program".
   if doc.is_subchart {
     fmt.sbprintln(b, "subchart")
+  }
+  // Same shape and the same reason: a bare flag, high in the file, so what the chart IS reads before
+  // what it does.
+  if doc.ignore_collision {
+    fmt.sbprintln(b, "ignore_collision")
   }
   // Rest-of-line, like `group` - a description is a sentence, and quoting one would be the only place
   // in this format where prose needed escaping.
@@ -704,6 +723,9 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
 
     case "subchart":
       doc.is_subchart = true
+
+    case "ignore_collision":
+      doc.ignore_collision = true
 
     case "desc":
       // Verbatim like `group` - it is a sentence, not a token list.

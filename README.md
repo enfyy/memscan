@@ -25,7 +25,7 @@ build.bat release    # -> .out/release/memscan-<version>-release.exe
 ```
 
 The exe is named after what it is - `memscan-<version>-<mode>[-<module>][-tracy].exe`, e.g.
-`memscan-1.4.0-release-flyff.exe`. The version comes straight from `src/version.odin`, so the
+`memscan-2.0.0-beta-release-flyff.exe`. The version comes straight from `src/version.odin`, so the
 filename always matches what the `version` command prints, and the variants never overwrite (or
 lock) each other.
 
@@ -41,7 +41,7 @@ Naming a module as an extra build argument hands it the process at startup: it o
 immediately and the exe quits when that window closes, so the REPL is never launched.
 
 ```
-build.bat release flyff    # -> .out/release/memscan-1.4.0-release-flyff.exe
+build.bat release flyff    # -> .out/release/memscan-2.0.0-beta-release-flyff.exe
 odin build src ... -define:MAIN_MODULE=flyff
 ```
 

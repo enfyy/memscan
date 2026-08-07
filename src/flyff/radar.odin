@@ -708,6 +708,7 @@ GIANT_NAME_EXCEPTIONS :: []string {
   "General Bearnerky",
   "Great Chef Muffrin",
   "Queen Popcrank",
+  "Boss Cardpuppet",
 }
 
 // True if a mover name marks a giant: either the "Giant" prefix, or one of the prefix-less exceptions
@@ -2206,6 +2207,13 @@ cli_radar :: proc(session: ^Session, args: []string) {
       inv_cap       = inv_cap,
       sfx_on        = L.sfx_on,
       nowalk_on     = L.nowalk_on,
+      hillshade_on  = L.hillshade_on,
+      collmem_on    = L.collider_memory_on,
+      trail_on      = L.trail_on,
+      fxlaser_on    = L.fx_laser_on,
+      // Same predicate the hillshade draw itself gates on (see the nowalk_on branch above), so the
+      // popup's "needs 'worldscan'" note cannot disagree with whether the relief actually renders.
+      worldscan_ready = terrain_ready(session),
       attack_range  = L.attack_range,
       fence_active  = session.fence.active,
       fence_shapes  = len(session.fence.shapes),
@@ -2302,6 +2310,9 @@ cli_radar :: proc(session: ^Session, args: []string) {
       gf.script_line = strings.clone(run.last_line, context.temp_allocator)
       if run.pc >= 0 && run.pc < len(run.steps) {
         gf.script_node = run.steps[run.pc].id
+      }
+      if run.entry_pc >= 0 && run.entry_pc < len(run.steps) {
+        gf.script_entry = run.steps[run.entry_pc].id
       }
       // The run's watchers, in the order they are checked. Same temp-clone rule as the strings above.
       gf.watcher_count = min(len(run.watchers), SCRIPT_MAX_WATCHERS)

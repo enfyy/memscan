@@ -691,8 +691,10 @@ cli_objects :: proc(session: ^Session, args: []string) {
       obb = fmt.tprintf("0x%X", r.obb_off)
       obb_votes[r.obb_off] += 1
     }
+    // Space flag on every numeric column (see cmd_ps): without it Odin pads numbers with '0', so a
+    // coordinate of 12.5 printed as "000012.5". The %08X here DOES want its zeros and keeps them.
     fmt.printfln(
-      "  0x%08X  %-6s(%d)  %-4d  %5.1f  %-4v  %-6s (%8.1f,%8.1f,%8.1f)  (%6.1f,%6.1f,%6.1f)",
+      "  0x%08X  %-6s(%d)  % -4d  % 5.1f  %-4v  %-6s (% 8.1f,% 8.1f,% 8.1f)  (% 6.1f,% 6.1f,% 6.1f)",
       r.obj, ot_name(r.ty), r.ty, r.idx, r.dist, r.has_model, obb, r.center[0], r.center[1], r.center[2], r.ext[0], r.ext[1], r.ext[2],
     )
   }
@@ -1806,7 +1808,7 @@ cli_reachdbg :: proc(session: ^Session, args: []string) {
     in_start := point_in_obb({ax, knee, az}, o)
     hit := seg_vs_obb({ax, knee, az}, {bx, knee, bz}, o)
     fmt.printfln(
-      "    %-6s(%d)  (%8.1f,%8.1f,%8.1f)  (%5.1f,%5.1f,%5.1f)  %5.1f  %-3v  %v",
+      "    %-6s(%d)  (% 8.1f,% 8.1f,% 8.1f)  (% 5.1f,% 5.1f,% 5.1f)  % 5.1f  %-3v  %v",
       ot_name(ty), ty, o.center[0], o.center[1], o.center[2], o.ext[0], o.ext[1], o.ext[2], dseg, in_start, hit,
     )
     shown += 1
@@ -2083,7 +2085,7 @@ cli_collscan :: proc(session: ^Session, args: []string) {
     if r.has_coll {
       if r.coll == GMT_ERROR {n_err += 1} else {n_mesh += 1}
     }
-    fmt.printfln("  0x%08X  %-6s(%d)  %5.1f  %-14s  %s", r.obj, ot_name(r.ty), r.ty, r.dist, coll_s, r.fname)
+    fmt.printfln("  0x%08X  %-6s(%d)  % 5.1f  %-14s  %s", r.obj, ot_name(r.ty), r.ty, r.dist, coll_s, r.fname)
   }
   fmt.printfln("  => %d with a dedicated collision mesh (NORMAL/SKIN/BONE), %d ERROR (render-mesh fallback).", n_mesh, n_err)
   // Consensus inner offsets (only meaningful if most props agree).
@@ -2176,7 +2178,7 @@ collwatch_identify :: proc(session: ^Session, obj: uintptr, ppos: [3]f32, radius
     coll_s = fmt.tprintf("%s '%s'", gmt_name(coll), fname)
   }
   line = fmt.tprintf(
-    "0x%08X %s(%d) d=%4.1f box=(%.1f,%.1f,%.1f) mesh=%s",
+    "0x%08X %s(%d) d=% 4.1f box=(%.1f,%.1f,%.1f) mesh=%s",
     obj, ot_name(ty), ty, d, ext[0], ext[1], ext[2], coll_s,
   )
   return line, is_coll, true, true

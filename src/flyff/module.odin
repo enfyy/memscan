@@ -485,6 +485,9 @@ behaviour scripts (build your own farming behaviour out of blocks; 'auto' become
   script export <b> [as <n>]  build an Odin behaviour and write it out as an editable file - this is how
                              a built-in becomes something you can open and change
   script save <name>         snapshot the RUNNING program to a file
+  script nocollision <name> [on|off]   run that chart with the reach check OFF: pick, approach and hold
+                             without asking whether the path is clear. for maps whose floor props do not
+                             really block (most dungeons) - it ignores REAL walls too, so it is per-chart
   script delete <name>       /  script rename <old> <new>
   behaviours are DATA: <exe-dir>/behaviours/<name>.bhv, written by 'export'/'save' and by the editor.
   there is no text language to learn and no 'script load' - 'show' and 'run' take a saved name directly.

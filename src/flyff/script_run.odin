@@ -667,22 +667,31 @@ script_frames_unwind :: proc(session: ^Session) {
   run.call_failed = false
 }
 
-// Put back what a call frame borrowed. An unset variable comes back UNSET rather than as "", because
-// `var_is` treats those differently on purpose (an unset variable equals nothing, not even "").
-@(private = "file")
-script_restore_saved_vars :: proc(session: ^Session, frame: ^Suspended_Frame) {
-  for i in 0 ..< min(frame.saved_count, len(frame.saved)) {
-    sv := &frame.saved[i]
-    name := string(sv.name[:min(sv.name_len, len(sv.name))])
+// Write a list of remembered variables back into the session store. An unset variable comes back
+// UNSET rather than as "", because `var_is` treats those differently on purpose (an unset variable
+// equals nothing, not even "").
+//
+// Shared by the two things that put variables back: a call frame handing its caller's values back
+// (script_restore_saved_vars) and a `from <node>` run restoring the snapshot that node last saw
+// (script_snapshot_restore). Same rule, so it is written once.
+script_apply_saved_vars :: proc(session: ^Session, saved: []Saved_Var) {
+  for &sv in saved {
+    name := script_saved_var_name(&sv)
     if name == "" {
       continue
     }
     if sv.had {
-      engine.session_var_set(&session.eng, name, string(sv.value[:min(sv.value_len, len(sv.value))]))
+      engine.session_var_set(&session.eng, name, script_saved_var_value(&sv))
     } else {
       engine.session_var_set(&session.eng, name, "") // "" unsets - see engine/vars.odin
     }
   }
+}
+
+// Put back what a call frame borrowed.
+@(private = "file")
+script_restore_saved_vars :: proc(session: ^Session, frame: ^Suspended_Frame) {
+  script_apply_saved_vars(session, frame.saved[:min(frame.saved_count, len(frame.saved))])
   frame.saved_count = 0
 }
 // The pc ran off the end. Returns true if the walker should keep going (the program looped), false
@@ -770,6 +779,112 @@ script_note_line :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
   delete(run.last_line)
   run.last_line = strings.clone(step.src)
   script_trace(ctx.session, step.id, .Step, "%s", step.src)
+  script_snapshot_take(ctx.session, step.id)
+}
+
+// Remember what the chart's variables hold as control arrives at <node>, so a later `script run <x>
+// from <node>` can put them back. Piggy-backs on script_note_line because that is already THE
+// control-arrived-here hook - one call site covers every op that can be entered.
+//
+// MAIN PROGRAM ONLY. A node inside a called sub-chart or a borrowed watcher carries an id that
+// script_append_region REMAPPED by an offset, matching no node in any document you can open - so its
+// snapshot could never be asked for, and keeping it would evict rows that can.
+//
+// Allocation-free: a bounded number of map lookups and two `copy`s into fixed buffers, on the same
+// tick budget as the trace ring.
+@(private = "file")
+script_snapshot_take :: proc(session: ^Session, node: Node_Id) {
+  run := &session.script
+  if node == 0 || run.snap_count == 0 || run.depth != 0 || run.pc >= run.main_len {
+    return
+  }
+  row := script_snapshot_slot(&session.script_snapshots, node)
+  row.node = node
+  row.at = time.now()._nsec
+  row.count = min(run.snap_count, len(row.vars))
+  for i in 0 ..< row.count {
+    name := script_saved_var_name(&run.snap_names[i])
+    dst := &row.vars[i]
+    dst^ = {}
+    dst.name_len = copy(dst.name[:], name)
+    if value, had := engine.session_var_get(&session.eng, name); had {
+      dst.had = true
+      dst.value_len = copy(dst.value[:], value)
+    }
+  }
+}
+
+// Drop the snapshot of every node the chart no longer has. Run at script_begin, against the program
+// that is about to run, so an edit between two runs cannot leave a row behind pointing at a node that
+// was deleted - and, more to the point, cannot let ed_next_id hand that id to a NEW node and have it
+// inherit the old one's variables. (ed_next_id is max+1 over what exists, so a deleted top id does
+// come back round.)
+//
+// The residual case - delete node 12, add a node that becomes 12, run from it inside the same
+// session - is why the restore report prints the values and their age rather than restoring silently.
+@(private = "file")
+script_snapshots_prune :: proc(session: ^Session) {
+  run := &session.script
+  for &row in session.script_snapshots.rows {
+    if row.node == 0 {
+      continue
+    }
+    found := false
+    for &step in run.steps {
+      if step.id == row.node {
+        found = true
+        break
+      }
+    }
+    if !found {
+      row = {}
+    }
+  }
+}
+
+// Put node <node>'s remembered variables back. Returns the row it used, so the caller can report both
+// what came back and when it was recorded - a snapshot from three runs ago is still worth having, but
+// only if you can see that is what it is.
+script_snapshot_restore :: proc(session: ^Session, node: Node_Id) -> ^Script_Var_Snapshot {
+  row := script_snapshot_find(&session.script_snapshots, node)
+  if row == nil {
+    return nil
+  }
+  script_apply_saved_vars(session, row.vars[:min(row.count, len(row.vars))])
+  return row
+}
+
+// The variables this program WRITES, collected once at script_begin. The same set the linter derives
+// from a document (lint_variables_set), asked of the STEPS instead - the run has no document.
+@(private = "file")
+script_collect_snap_names :: proc(run: ^Script_Run) {
+  run.snap_names = {}
+  run.snap_count = 0
+  add :: proc(run: ^Script_Run, name: string) {
+    if name == "" || run.snap_count >= len(run.snap_names) {
+      return
+    }
+    for i in 0 ..< run.snap_count {
+      if script_saved_var_name(&run.snap_names[i]) == name {
+        return
+      }
+    }
+    run.snap_names[run.snap_count].name_len = copy(run.snap_names[run.snap_count].name[:], name)
+    run.snap_count += 1
+  }
+  for &step in run.steps {
+    #partial switch step.action.kind {
+    case .Var, .Add, .Read_Value:
+      add(run, script_var_name_of(step.action.strs[0]))
+    }
+    // A call's arguments are variables the callee is handed, so they are part of the state a node
+    // downstream of it sees - the same reason lint_variables_set counts them as written.
+    if step.op == .Call {
+      for i in 0 ..< min(step.call_arg_count, len(step.call_args)) {
+        add(run, step.call_args[i].name)
+      }
+    }
+  }
 }
 
 script_fail :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, why: string) {
@@ -918,6 +1033,7 @@ script_begin :: proc(
   entry: Node_Id = 0,
   kind: Behaviour_Kind = .Chart,
   uses: []string = nil,
+  ignore_collision := false,
 ) {
   script_run_free(&session.script)
   run := &session.script
@@ -935,6 +1051,10 @@ script_begin :: proc(
       break
     }
   }
+  // The declared one, from the document - see reach_gate_active. It sits beside sidestep_chart because
+  // the two answer the same question from opposite ends: that one INFERS "this chart steps around
+  // obstacles, so relax the gate", this one is told "this map's obstacles are not real, so drop it".
+  run.ignore_collision = ignore_collision
   if kind == .Interrupt {
     // A watcher's body, run on its own because its trigger fired. NOTHING is armed for it: not the
     // globals, not what the host borrowed, and not even the document's own `on` nodes. <entry> already
@@ -1023,6 +1143,16 @@ script_begin :: proc(
   // A fresh run starts a fresh story. Without the clear you cannot tell last run's failure rows from
   // this run's, which is exactly the confusion the ring exists to remove.
   session.script_trace = {}
+  // The snapshots, though, deliberately SURVIVE a re-run of the same chart - that is the whole point
+  // of them (you run it from the top once, then start from the middle as often as you like). They
+  // are dropped only when a different chart takes over, because node ids mean nothing across
+  // documents. Collected after the appending passes, so a borrowed watcher's variables count too.
+  script_collect_snap_names(run)
+  if script_snapshots_chart(&session.script_snapshots) != name {
+    script_snapshots_reset(&session.script_snapshots, name)
+  } else {
+    script_snapshots_prune(session)
+  }
   script_trace(
     session, run.steps[start].id, .Note,
     "RUN '%s' (%s) - %d nodes, %d watcher(s)",
@@ -1702,10 +1832,14 @@ cli_script :: proc(session: ^Session, args: []string) {
     script_cmd_step(session, args[1:])
   case "trace", "log":
     script_cmd_trace(session, args[1:])
+  case "snapshot", "snapshots", "snap":
+    script_cmd_snapshot(session, args[1:])
   case "lint", "check":
     script_cmd_lint(session, args[1:])
   case "subchart", "block":
     script_cmd_subchart(args[1:])
+  case "nocollision", "ignorecollision":
+    script_cmd_ignore_collision(args[1:])
   case "pause":
     if !session.script.active {
       fmt.eprintln("script pause: nothing running.")
@@ -1726,7 +1860,14 @@ cli_script :: proc(session: ^Session, args: []string) {
     if !script_reset(session) {
       fmt.eprintln("script reset: nothing running.")
     } else {
-      fmt.printfln("script: '%s' rewound to the start%s.", session.script.name, session.script.paused ? " (still paused)" : "")
+      run := &session.script
+      // Name the node when it is NOT the chart's start node. "rewound to the start" is a lie on a
+      // debug run - it goes back to where that run began, which is the whole point of `from`.
+      target := "the start"
+      if run.debug_entry && run.entry_pc >= 0 && run.entry_pc < len(run.steps) {
+        target = fmt.tprintf("node %d, where this run started", u32(run.steps[run.entry_pc].id))
+      }
+      fmt.printfln("script: '%s' rewound to %s%s.", run.name, target, run.paused ? " (still paused)" : "")
     }
   case "export":
     script_cmd_export(args[1:])
@@ -1746,8 +1887,9 @@ cli_script :: proc(session: ^Session, args: []string) {
     fmt.printfln("script: '%s' stopped (anything in flight was torn down).", name)
   case:
     fmt.eprintfln("script: unknown subcommand '%s'", args[0])
-    fmt.eprintln("  status | blocks | list | show <name> | run <name> [once|loop] | stop")
+    fmt.eprintln("  status | blocks | list | show <name> | run <name> [once|loop] [step] [from <node>] | stop")
     fmt.eprintln("  pause | resume | reset | step [off] | trace [n|all|clear] | lint [name]")
+    fmt.eprintln("  snapshot [clear] - what each node's variables held, for 'run ... from <node>'")
     fmt.eprintln("  export <builtin> [as] | save <name> | delete <name> | rename <old> <new>")
   }
 }
@@ -1820,7 +1962,14 @@ script_status_line :: proc(session: ^Session) -> string {
   state := "idle"
   if run := &session.script; run.active {
     what := run.paused ? "PAUSED" : (script_frame_in_watcher(run) ? "INTERRUPT" : (run.depth > 0 ? "IN SUB-CHART" : "RUNNING"))
-    state = fmt.tprintf("%s '%s' step %d/%d", what, run.name, min(run.pc + 1, run.main_len), run.main_len)
+    // "from node N" belongs on the ONE-LINE status, not only in the detail: a chart that skipped its
+    // own setup is a different chart, and a status line that hides that is how you spend ten minutes
+    // debugging the run instead of the bug.
+    from := ""
+    if run.debug_entry && run.entry_pc >= 0 && run.entry_pc < len(run.steps) {
+      from = fmt.tprintf(" from node %d", u32(run.steps[run.entry_pc].id))
+    }
+    state = fmt.tprintf("%s '%s'%s step %d/%d", what, run.name, from, min(run.pc + 1, run.main_len), run.main_len)
   }
   sensing := session.bh_sense_on ? ", sensing on" : ""
   return fmt.tprintf("%s%s  |  %d/%d blocks usable ('script blocks')", state, sensing, total - gated, total)
@@ -1840,6 +1989,15 @@ script_print_status :: proc(session: ^Session) {
   fmt.printfln("  step %d/%d, %d executed, %s elapsed", min(run.pc + 1, run.main_len), run.main_len, run.steps_done, fmt_elapsed(now - run.started_at))
   if run.last_line != "" {
     fmt.printfln("  current: %s", run.last_line)
+  }
+  // A DEBUG ENTRY changes two things you would otherwise have to discover by being surprised: half the
+  // chart never runs, and the rewind button does not go to the top.
+  if run.debug_entry && run.entry_pc >= 0 && run.entry_pc < len(run.steps) {
+    fmt.printfln(
+      "  started at node %d, not the chart's start node - 'script reset' rewinds there and %s.",
+      u32(run.steps[run.entry_pc].id),
+      run.mode == .Loop ? "'loop' wraps there" : "the nodes above it never run",
+    )
   }
   // The whole stack, innermost last, so "why is it not on the step I expect" has an answer that names
   // every region between here and the main program.
@@ -2037,6 +2195,235 @@ script_cmd_selftest :: proc(session: ^Session) {
   // sections that need the SESSION - they write and read real variables.
   script_selftest_coord(session)
   script_selftest_subchart(session)
+  script_selftest_entry(session)
+}
+
+// Starting a run somewhere other than the top: `script run <x> from <node>`.
+//
+// The three halves that can each be right on their own and still add up to a lie - the pc lands on
+// the node, the variables that node last saw come back, and what is STILL missing gets named - plus
+// the two entries that must be refused.
+@(private = "file")
+script_selftest_entry :: proc(session: ^Session) {
+  fmt.println("  --- starting from a node ---")
+  fails := 0
+  PREFIX :: "zz_selftest_from_"
+  chart :: PREFIX + "chain"
+  irq :: PREFIX + "irq"
+
+  written := make([dynamic]string, context.temp_allocator)
+  defer {
+    for n in written {
+      os.remove(bhv_file_path(n))
+    }
+    subchart_registry_refresh(force = true)
+  }
+  add :: proc(written: ^[dynamic]string, name: string, body: string, fails: ^int) -> bool {
+    os.make_directory(bhv_dir_path())
+    if err := os.write_entire_file(bhv_file_path(name), transmute([]byte)body); err != nil {
+      fmt.eprintfln("  FAIL: could not write the fixture '%s' (%v)", name, err)
+      fails^ += 1
+      return false
+    }
+    append(written, name)
+    return true
+  }
+
+  // Two setup nodes, then two nodes that READ what they set. Starting at node 3 skips both setters,
+  // which is exactly the shape the feature exists for.
+  ok := add(&written, chart, `# memscan behaviour
+desc from-node fixture
+mode once
+entry 1
+node 1 action 0 0 goto=2
+  do var se_home 6800
+node 2 action 0 120 goto=3
+  do var se_lane north
+node 3 action 0 240 goto=4
+  do var se_seen @se_home
+node 4 action 0 360
+  do var se_done @se_lane
+`, &fails)
+  // Node 1 is a watcher and node 3 is its body; node 2 is the whole main program.
+  ok &= add(&written, irq, `# memscan behaviour
+desc a watcher and its body
+mode once
+entry 2
+node 1 on 0 0 goto=3
+  if always
+node 2 action 0 120
+  do var se_main 1
+node 3 action 0 240
+  do var se_body 1
+`, &fails)
+  if !ok {
+    return
+  }
+
+  // Drive a run to completion the way the sub-chart section does: synchronously, so the suite never
+  // depends on the watcher thread getting scheduled.
+  drain :: proc(session: ^Session) {
+    ctx := Behaviour_Context {
+      session = session,
+      now     = time.now()._nsec,
+      board   = &session.bh_board,
+    }
+    for _ in 0 ..< 400 {
+      if !session.script.active {
+        return
+      }
+      ctx.now = time.now()._nsec
+      script_walk_n(&ctx, 1)
+    }
+  }
+  clear_fixture_vars :: proc(session: ^Session) {
+    for name in ([?]string{"se_home", "se_lane", "se_seen", "se_done", "se_main", "se_body"}) {
+      engine.session_var_set(&session.eng, name, "")
+    }
+  }
+
+  script_stop(session)
+  clear_fixture_vars(session)
+
+  // 1. A full lap from the top - this is what RECORDS the snapshots everything below reads.
+  script_cmd_run(session, []string{chart})
+  if !session.script.active {
+    fmt.eprintfln("  FAIL: '%s' refused to start from the top", chart)
+    fails += 1
+    return
+  }
+  drain(session)
+  if v, _ := engine.session_var_get(&session.eng, "se_seen"); v != "6800" {
+    fmt.eprintfln("  FAIL: the full lap should have left se_seen=6800, got '%s'", v)
+    fails += 1
+  }
+
+  // 2. From node 3, with the setters skipped. The snapshot has to put se_home back, or the `var
+  // se_seen @se_home` on node 3 stores the literal text "@se_home" and the chart quietly means
+  // something else.
+  script_stop(session)
+  clear_fixture_vars(session)
+  script_cmd_run(session, []string{chart, "from", "3", "step"})
+  if !session.script.active {
+    fmt.eprintfln("  FAIL: '%s' refused to start from node 3", chart)
+    fails += 1
+  } else {
+    run := &session.script
+    if run.pc < 0 || run.pc >= len(run.steps) || run.steps[run.pc].id != 3 {
+      fmt.eprintfln("  FAIL: started at node %d, want node 3", run.pc >= 0 && run.pc < len(run.steps) ? u32(run.steps[run.pc].id) : 0)
+      fails += 1
+    }
+    if run.entry_pc != run.pc {
+      fmt.eprintfln("  FAIL: entry_pc is %d but pc is %d - 'loop' and 'script reset' would go somewhere else", run.entry_pc, run.pc)
+      fails += 1
+    }
+    if !run.debug_entry {
+      fmt.eprintln("  FAIL: the run does not know it started at a debug node, so the status will not say so")
+      fails += 1
+    }
+    // The restore happened at START, before a single step ran.
+    if v, _ := engine.session_var_get(&session.eng, "se_home"); v != "6800" {
+      fmt.eprintfln("  FAIL: the snapshot did not put se_home back (got '%s')", v)
+      fails += 1
+    }
+    // ... and rewinding goes to the DEBUG node, not to the top.
+    run.stepping = false
+    drain(session)
+    script_cmd_run(session, []string{chart, "from", "3", "step"})
+    if session.script.active {
+      script_reset(session)
+      r := &session.script
+      if r.pc < 0 || r.pc >= len(r.steps) || r.steps[r.pc].id != 3 {
+        fmt.eprintfln("  FAIL: 'script reset' on a from-node run went to node %d, want node 3", r.pc >= 0 && r.pc < len(r.steps) ? u32(r.steps[r.pc].id) : 0)
+        fails += 1
+      }
+    }
+  }
+  script_stop(session)
+
+  // 3. The GAP: with no snapshot to lean on, the two variables the skipped nodes would have set are
+  // named, along with which node sets each. This is the static half, so it is asked of the document.
+  {
+    doc, dok := bhv_open(chart)
+    if !dok {
+      fmt.eprintfln("  FAIL: '%s' would not load back", chart)
+      fails += 1
+    } else {
+      defer behaviour_doc_free(&doc)
+      gaps := script_entry_gap(&doc, 3)
+      Want :: struct {
+        name:   string,
+        set_by: Node_Id,
+      }
+      want := [?]Want{{"se_home", 1}, {"se_lane", 2}}
+      if len(gaps) != len(want) {
+        fmt.eprintfln("  FAIL: starting at node 3 should be missing %d variable(s), the gap report found %d", len(want), len(gaps))
+        for g in gaps {
+          fmt.eprintfln("        @%s (set by node %d)", g.name, u32(g.set_by))
+        }
+        fails += 1
+      }
+      for g in gaps {
+        known := false
+        for w in want {
+          if w.name != g.name {
+            continue
+          }
+          known = true
+          if g.set_by != w.set_by {
+            fmt.eprintfln("  FAIL: @%s is set by node %d, the gap report blamed node %d", g.name, u32(w.set_by), u32(g.set_by))
+            fails += 1
+          }
+        }
+        if !known {
+          fmt.eprintfln("  FAIL: the gap report named @%s, which nothing above node 3 sets", g.name)
+          fails += 1
+        }
+      }
+      // A start node that IS the entry has nothing missing - the report must not cry wolf on the
+      // ordinary case, which is the whole chart running as written.
+      if from_top := script_entry_gap(&doc, doc.entry); len(from_top) != 0 {
+        fmt.eprintfln("  FAIL: running from the chart's own start node reported %d missing variable(s)", len(from_top))
+        fails += 1
+      }
+    }
+  }
+
+  // 4. The two refusals. Control can never ARRIVE at either of these first, so offering to start there
+  // would be offering a run that cannot happen.
+  {
+    doc, dok := bhv_open(irq)
+    if !dok {
+      fmt.eprintfln("  FAIL: '%s' would not load back", irq)
+      fails += 1
+    } else {
+      defer behaviour_doc_free(&doc)
+      if script_entry_node_ok(&doc, 1) {
+        fmt.eprintln("  FAIL: node 1 is a watcher and was accepted as a start node")
+        fails += 1
+      }
+      if script_entry_node_ok(&doc, 3) {
+        fmt.eprintln("  FAIL: node 3 is a watcher's body and was accepted as a start node")
+        fails += 1
+      }
+      if !script_entry_node_ok(&doc, 2) {
+        fmt.eprintln("  FAIL: node 2 is ordinary main-program text and was refused as a start node")
+        fails += 1
+      }
+      if script_entry_node_ok(&doc, 99) {
+        fmt.eprintln("  FAIL: a node that does not exist was accepted as a start node")
+        fails += 1
+      }
+    }
+  }
+
+  script_stop(session)
+  clear_fixture_vars(session)
+  if fails == 0 {
+    fmt.println("  PASS: a run starts at any node, restores what that node last saw, names what is still missing, and refuses watchers")
+  } else {
+    fmt.eprintfln("  %d from-node check(s) failed", fails)
+  }
 }
 
 // Sub-charts: the file format, the expansion, and what a call does to the caller's variables.
@@ -3088,7 +3475,23 @@ script_cmd_show :: proc(session: ^Session, args: []string) {
   defer behaviour_doc_free(&doc)
   src := bhv_exists(doc.name) ? "saved" : "Odin"
   fmt.printfln("=== %s (%s, %s, %d steps) ===", doc.name, src, doc.mode == .Loop ? "loop" : "once", len(doc.steps))
-  fmt.print(script_render(doc.steps[:], doc.mode))
+  // With a NODE ID gutter, which is what `script run <name> from <node>` needs you to be able to read
+  // off. Rendered here rather than inside script_render, because that one's output is compared for
+  // equality by the round-trip selftest and is the step-label source - ids do not belong in either.
+  entry := doc.entry != 0 ? doc.entry : (len(doc.steps) > 0 ? doc.steps[0].id : 0)
+  for line, i in strings.split_lines(strings.trim_right(script_render(doc.steps[:], doc.mode), "\n"), context.temp_allocator) {
+    // script_render prefixes a "#! loop" header, so the step lines are offset by one on a loop chart.
+    step := doc.mode == .Loop ? i - 1 : i
+    if step < 0 || step >= len(doc.steps) {
+      fmt.printfln("       %s", line)
+      continue
+    }
+    // Padded as a STRING, not with a numeric width - `%4d` fills with '0' here, so node 1 renders as
+    // "0001" and the gutter names ids that do not exist. Same trap script_cmd_trace documents.
+    id := doc.steps[step].id
+    fmt.printfln("%s%4s  %s", id == entry ? ">" : " ", fmt.tprintf("%d", u32(id)), line)
+  }
+  fmt.println("  ^ the number is the node id: 'script run <name> from <id>' starts there; '>' is the start node.")
   if problems := script_check_avail(session, doc.steps[:]); len(problems) > 0 {
     fmt.printfln("%d block(s) not usable right now:", len(problems))
     for p in problems {
@@ -3141,6 +3544,7 @@ script_cmd_list :: proc(session: ^Session) {
   }
   fmt.println("  'script run <name>' to start, 'script show <name>' to see the blocks it builds.")
   fmt.println("  'script subchart <name>' turns a saved chart into a block, and back.")
+  fmt.println("  'script nocollision <name>' drops the reach check for one chart (dungeons with fake floor props).")
   fmt.println("  A saved behaviour WINS over an Odin one of the same name - delete it to get the original back.")
 }
 
@@ -3198,6 +3602,59 @@ script_cmd_subchart :: proc(args: []string) {
   }
   subchart_registry_refresh(force = true) // this process just changed the answer; do not wait out the throttle
   fmt.printfln("script: '%s' is now %s.", name, want ? "a BLOCK - place it in a chart from the palette" : "a chart you run")
+}
+
+// Turn the proactive collision gate off for one saved chart - the typable twin of the tick-box in the
+// editor's chart options, exactly as script_cmd_subchart is for the other one.
+//
+// It is a per-CHART setting and not a global for a reason worth keeping in view: the gate is right
+// nearly everywhere, and a global would silently stay off after you left the map that needed it.
+@(private = "file")
+script_cmd_ignore_collision :: proc(args: []string) {
+  if len(args) == 0 {
+    fmt.eprintln("usage: script nocollision <name> [on|off]   (no on/off toggles it)")
+    fmt.eprintln("  drops the reach check from picking, approaching and holding, for that chart only.")
+    return
+  }
+  name := args[0]
+  if !bhv_exists(name) {
+    if behaviour_def(name) != nil {
+      fmt.eprintfln("script nocollision: '%s' is an Odin behaviour - 'script export %s' first to get an editable copy.", name, name)
+      return
+    }
+    fmt.eprintfln("script nocollision: no saved behaviour named '%s'. 'script list' shows what's available.", name)
+    return
+  }
+  doc, ok := bhv_open(name)
+  if !ok {
+    return // bhv_load already reported why
+  }
+  defer behaviour_doc_free(&doc)
+  want := !doc.ignore_collision
+  if len(args) >= 2 {
+    switch args[1] {
+    case "on", "yes", "1":
+      want = true
+    case "off", "no", "0":
+      want = false
+    case:
+      fmt.eprintfln("script nocollision: expected 'on' or 'off', got '%s'.", args[1])
+      return
+    }
+  }
+  if want == doc.ignore_collision {
+    fmt.printfln("script: '%s' already %s collision.", name, want ? "ignores" : "checks")
+    return
+  }
+  doc.ignore_collision = want
+  if !bhv_save(&doc) {
+    return
+  }
+  if want {
+    fmt.printfln("script: '%s' now IGNORES collision - it will pick and walk at monsters behind real walls too.", name)
+  } else {
+    fmt.printfln("script: '%s' now checks collision again (the normal behaviour).", name)
+  }
 }
 
 // --- file commands ------------------------------------------------------------------------------
@@ -3365,8 +3822,76 @@ script_cmd_trace :: proc(session: ^Session, args: []string) {
     // Padded as a STRING, not with a numeric width: `%-4d` fills with '0' here, so node 1 printed as
     // "n1000" and every trace row named a node that does not exist.
     node := r.node == 0 ? "     " : fmt.tprintf("%-5s", fmt.tprintf("n%d", u32(r.node)))
-    fmt.printfln("  %8.3fs  %s  %s%s", f64(r.at - base) / 1e9, node, tag, script_trace_text(&r))
+    // The elapsed column needs the space flag for the same reason - '%8.3f' printed 1.5s as "0001.500".
+    fmt.printfln("  % 8.3fs  %s  %s%s", f64(r.at - base) / 1e9, node, tag, script_trace_text(&r))
   }
+}
+
+// `script snapshot [clear]` - what each node's variables held last time control reached it. Reading
+// this is how you decide whether `script run <x> from <node>` will start from a state worth starting
+// from, or whether the chart needs one lap from the top first.
+script_cmd_snapshot :: proc(session: ^Session, args: []string) {
+  snapshots := &session.script_snapshots
+  if len(args) >= 1 && (args[0] == "clear" || args[0] == "wipe") {
+    kept := 0
+    for &row in snapshots.rows {
+      if row.node != 0 {
+        kept += 1
+      }
+    }
+    snapshots^ = {}
+    fmt.printfln("script snapshot: cleared (%d node(s)).", kept)
+    return
+  }
+  chart := script_snapshots_chart(snapshots)
+  rows := 0
+  for &row in snapshots.rows {
+    if row.node != 0 {
+      rows += 1
+    }
+  }
+  if rows == 0 {
+    fmt.println("script snapshot: nothing recorded yet - run a chart and every node it reaches gets one.")
+    return
+  }
+  now := time.now()._nsec
+  fmt.printfln("'%s': %d node(s) with a remembered state, newest first:", chart, rows)
+  // Newest first, because the useful one is nearly always where the chart just was. A selection sort
+  // over 64 fixed slots rather than a sorted copy - the rows are big and this is a REPL print.
+  shown := make(map[Node_Id]bool, rows, context.temp_allocator)
+  defer delete(shown)
+  for _ in 0 ..< rows {
+    best: ^Script_Var_Snapshot
+    for &row in snapshots.rows {
+      if row.node == 0 || shown[row.node] {
+        continue
+      }
+      if best == nil || row.at > best.at {
+        best = &row
+      }
+    }
+    if best == nil {
+      break
+    }
+    shown[best.node] = true
+    // Both numbers padded as STRINGS: a numeric width fills with '0' in this fmt, which turned node
+    // 13 into "1300" and "0s ago" into "000000s ago". See the same note in script_cmd_trace.
+    fmt.printfln(
+      "  node %-4s  %5s ago  %d var(s)",
+      fmt.tprintf("%d", u32(best.node)),
+      fmt.tprintf("%.0fs", time.duration_seconds(time.Duration(now - best.at))),
+      best.count,
+    )
+    for i in 0 ..< min(best.count, len(best.vars)) {
+      saved := &best.vars[i]
+      name := script_saved_var_name(saved)
+      if name == "" {
+        continue
+      }
+      fmt.printfln("      @%-14s %s", name, saved.had ? script_saved_var_value(saved) : "(unset)")
+    }
+  }
+  fmt.println("  'script run <name> from <node>' puts one of these back before it starts.")
 }
 
 script_cmd_step :: proc(session: ^Session, args: []string) {
@@ -3417,7 +3942,14 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
   // already somewhere else by the time the step lands - which is exactly what the editor's Step button
   // needs not to happen.
   start_stepping := false
-  for a in args {
+  // `from <id>` - start at that node instead of the chart's own start node, for THIS run only, leaving
+  // the file alone. The editor's "Start here" is the other verb: it edits the document.
+  from_node := Node_Id(0)
+  // Indexed rather than `for a in args`, because `from` consumes the token after it.
+  i := 0
+  for i < len(args) {
+    a := args[i]
+    i += 1
     switch a {
     case "once":
       mode_override = int(Script_Mode.Once)
@@ -3425,6 +3957,18 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
       mode_override = int(Script_Mode.Loop)
     case "step", "stepping", "paused":
       start_stepping = true
+    case "from", "at":
+      if i >= len(args) {
+        fmt.eprintln("script run: 'from' needs a node id - 'script show <name>' lists them, and the editor shows #id on each node.")
+        return
+      }
+      id, ok := strconv.parse_uint(args[i], 10)
+      if !ok || id == 0 {
+        fmt.eprintfln("script run: '%s' is not a node id. 'script show <name>' lists them.", args[i])
+        return
+      }
+      from_node = Node_Id(id)
+      i += 1
     case:
       if name == "" {
         name = a
@@ -3432,7 +3976,7 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
     }
   }
   if name == "" {
-    fmt.eprintln("usage: script run <name> [once|loop] [step]   ('script list' shows what's available)")
+    fmt.eprintln("usage: script run <name> [once|loop] [step] [from <node>]   ('script list' shows what's available)")
     return
   }
   // A saved file wins over an Odin behaviour of the same name; an Odin one is rebuilt FRESH here, so
@@ -3480,14 +4024,30 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
       }
     }
   }
+  // `from <node>` - checked before anything starts, because the two ways it can be wrong have better
+  // answers here than "started at a node that never runs".
+  if from_node != 0 && !script_entry_node_ok(&doc, from_node) {
+    behaviour_doc_free(&doc)
+    return
+  }
   mode := doc.mode
   if mode_override >= 0 {
     mode = Script_Mode(mode_override)
   }
   n := len(doc.steps)
+  // The gap report needs the DOCUMENT, and script_begin is about to take its steps - so ask now and
+  // print after, once it is known the run actually started.
+  gaps: []Entry_Gap
+  if from_node != 0 {
+    gaps = script_entry_gap(&doc, from_node)
+  }
+  entry := from_node != 0 ? from_node : doc.entry
   // script_begin takes ownership of the steps; the doc's own name is all that is left to release.
-  script_begin(session, label, doc.steps, mode, doc.entry, .Chart, doc.uses[:])
+  script_begin(session, label, doc.steps, mode, entry, .Chart, doc.uses[:], doc.ignore_collision)
   // AFTER script_begin, which zeroes the run. Setting it before would be silently discarded.
+  if from_node != 0 && session.script.active {
+    session.script.debug_entry = true
+  }
   if start_stepping && session.script.active {
     session.script.stepping = true
     script_trace(session, script_current_node(&Behaviour_Context{session = session}), .Note, "stepping - the walker will not advance on its own")
@@ -3508,6 +4068,96 @@ script_cmd_run :: proc(session: ^Session, args: []string) {
     "script: '%s' started (%d steps, %s%s).",
     label, n, mode == .Loop ? "loop" : "once", start_stepping ? ", STEPPING - it will not advance until you step it" : "",
   )
+  // Said out loud, every run. A chart that ignores collision will happily pick and walk at a mob behind
+  // a real wall, so "why is it walking into that" needs an answer that is already on screen.
+  if session.script.ignore_collision {
+    fmt.println("  ignoring collision - targets are picked and approached without checking the path is clear.")
+  }
+  if from_node != 0 {
+    script_report_debug_entry(session, from_node, gaps)
+  }
+}
+
+// Say what starting partway down a chart actually did to its state: what came back from the snapshot,
+// and what is still missing. Printed AFTER "started", because both halves describe a run that is
+// already going - none of this refuses anything.
+//
+// Same shape as the warning above for running a BLOCK on its own: name the variables, name who would
+// have set them, then get out of the way.
+@(private = "file")
+script_report_debug_entry :: proc(session: ^Session, from: Node_Id, gaps: []Entry_Gap) {
+  fmt.printfln(
+    "  starting at node %d, NOT the chart's start node - 'loop' wraps here and 'script reset' rewinds here.",
+    u32(from),
+  )
+  if row := script_snapshot_restore(session, from); row != nil {
+    ago := time.duration_seconds(time.Duration(time.now()._nsec - row.at))
+    fmt.printfln("  restored %d variable(s) from what node %d last saw (%.0fs ago):", row.count, u32(from), ago)
+    for i in 0 ..< min(row.count, len(row.vars)) {
+      saved := &row.vars[i]
+      name := script_saved_var_name(saved)
+      if name == "" {
+        continue
+      }
+      if saved.had {
+        fmt.printfln("    @%s = %s", name, script_saved_var_value(saved))
+      } else {
+        fmt.printfln("    @%s was unset then too", name)
+      }
+    }
+  } else {
+    fmt.println("  no snapshot for that node yet - run the chart from the top once and it will have one.")
+  }
+  // AFTER the restore, so a variable the snapshot just supplied is not reported missing. The gap list
+  // is static (it is a fact about the chart); whether each one still matters is this check.
+  missing := 0
+  for gap in gaps {
+    if _, set := engine.session_var_get(&session.eng, gap.name); set {
+      continue
+    }
+    if missing == 0 {
+      fmt.println("  the skipped nodes would have set these, and nothing has:")
+    }
+    missing += 1
+    if gap.set_by != 0 {
+      fmt.printfln("    @%s   (set by node %d '%s')", gap.name, u32(gap.set_by), gap.set_by_label)
+    } else {
+      fmt.printfln("    @%s   (nothing in this chart sets it)", gap.name)
+    }
+  }
+  if missing > 0 {
+    fmt.println("  'var <name> <value>' before running, or start from a node above the one that sets them.")
+  }
+}
+
+// Can a run start at <node>? The same two refusals the editor applies to its "Start here" button, in
+// the one place the CLI can reach - and they are refusals rather than warnings because control can
+// genuinely never begin at either kind of node.
+@(private = "file")
+script_entry_node_ok :: proc(doc: ^Behaviour_Doc, node: Node_Id) -> bool {
+  index := -1
+  for s, i in doc.steps {
+    if s.id == node {
+      index = i
+      break
+    }
+  }
+  if index < 0 {
+    fmt.eprintfln("script run: '%s' has no node %d. 'script show %s' lists them.", doc.name, u32(node), doc.name)
+    return false
+  }
+  body := make([]bool, len(doc.steps), context.temp_allocator)
+  script_watcher_body_mask(doc.steps[:], body)
+  if doc.steps[index].op == .On {
+    fmt.eprintfln("script run: node %d is a watcher - it is checked before every step, so it is never where a chart starts.", u32(node))
+    return false
+  }
+  if body[index] {
+    fmt.eprintfln("script run: node %d is part of a watcher's body - it is reached when the trigger fires, never from a start.", u32(node))
+    fmt.eprintfln("  script_begin hoists those out of the main program, so a run could not sit there.")
+    return false
+  }
+  return true
 }
 
 // Is this document nothing but watchers? True when every step is either an `.On` node or part of some

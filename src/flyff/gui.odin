@@ -16,11 +16,11 @@ import imgui "../../lib/odin-imgui"
 // THE UI. Dear ImGui over the radar window - replaced raygui wholesale in the v1 redesign.
 //
 // Everything here is a floating overlay on top of the map; there is no side panel. The surface is
-// deliberately small: a toolbar (setup traffic light, zone editor, camera follow, no-walk overlay, mute,
-// and the leaderboards trophy once a backend is configured), a recenter puck that only exists while the
-// camera is free, two gauges (penya, bag), and the dialogs behind those buttons. What the old panel
-// carried and this one still does not - the auto section and the Options modal - is REPL-only for now
-// and comes back as scripting-graph content, not as a re-port.
+// deliberately small: a toolbar (setup traffic light, zone editor, camera follow, no-walk overlay, the
+// overlays list, mute, and the leaderboards trophy once a backend is configured), a recenter puck that
+// only exists while the camera is free, two gauges (penya, bag), and the dialogs behind those buttons.
+// What the old panel carried and this one still does not - the auto section and the Options modal - is
+// REPL-only for now and comes back as scripting-graph content, not as a re-port.
 //
 // Window convention: a dialog is closed by the X in its own titlebar and nothing else. No in-body Close
 // buttons, and ESC is not a close key anywhere (raylib's ESC-quits-the-window default is off - see
@@ -59,6 +59,7 @@ ICON_VOLUME_OFF :: rune(0xe04f) // volume_off   - muted
 ICON_VOLUME_UP :: rune(0xe050) // volume_up    - sound on
 ICON_CAMERA :: rune(0xe04b) // videocam     - the map camera (follow the player / free)
 ICON_BLOCKED :: rune(0xe14b) // block        - the no-walk terrain overlay
+ICON_LAYERS :: rune(0xe53b) // layers       - the Overlays popup (what the map is allowed to draw)
 ICON_ZONE :: rune(0xe162) // select_all   - the zone editor (an area, not a pen)
 ICON_FLAG :: rune(0xe153) // flag         - the waypoint route editor (and the editor's import button)
 ICON_INVENTORY :: rune(0xf19c) // backpack     - bag gauge (0xe1a1 'inventory_2' read as an archive box)
@@ -111,6 +112,7 @@ ICON_ALL := [?]rune {
   ICON_VOLUME_UP,
   ICON_CAMERA,
   ICON_BLOCKED,
+  ICON_LAYERS,
   ICON_ZONE,
   ICON_FLAG,
   ICON_INVENTORY,
@@ -264,6 +266,14 @@ Gui_Frame :: struct {
   // toolbar state
   sfx_on:        bool,
   nowalk_on:     bool,
+  // The Overlays popup - display-only radar layers, each with a bare-command toggle behind it. These
+  // were CLI-only until now; the popup is their first control. worldscan_ready gates nothing, it only
+  // lets the hillshade row explain why it is doing nothing.
+  hillshade_on:    bool,
+  collmem_on:      bool,
+  trail_on:        bool,
+  fxlaser_on:      bool,
+  worldscan_ready: bool,
   // tunables shown in a dialog
   attack_range:  f32,
   // fence menu
@@ -294,6 +304,10 @@ Gui_Frame :: struct {
   script_len:    int, // main program length (regions are not part of the count)
   script_line:   string,
   script_node:   Node_Id, // the current step's identity - what the editor highlights
+  // Where this run actually STARTED. Normally the chart's own start node, but `script run <x> from
+  // <node>` overrides it - and when it does, the canvas has to say so, or the START capsule sits on a
+  // node the run never touched and reads as a lie.
+  script_entry:  Node_Id,
 
   // The tail of the run trace (script.odin), for the editor's log strip. A fixed array of POD rows
   // rather than temp-allocated strings, because Gui_Frame is copied BY VALUE and every string in it is
@@ -1178,6 +1192,18 @@ gui_toolbar :: proc(ps: ^Panel_State, f: ^Gui_Frame, view: Gui_View) {
     }
     imgui.SameLine(0, px(6))
 
+    // Everything the map is ALLOWED to draw, in one list. Four of the five were CLI-only until now, and
+    // a display toggle nobody can find is a display toggle nobody uses. No-walk keeps its own button
+    // beside this AND appears in the list: it is the one people reach for constantly, so it earns the
+    // single click, while the list stays the complete answer to "what else can this show me".
+    if gui_icon_button("overlays", ICON_LAYERS, gui_overlays_any_on(f), gui_overlays_tip(f)) {
+      imgui.OpenPopup("##overlays")
+    }
+    // Opened and begun in the SAME window: a popup's id is seeded from the current window's id stack,
+    // so splitting the pair across windows silently never shows anything (see gui_ed_waypoint_pick).
+    gui_overlays_popup(ps, f)
+    imgui.SameLine(0, px(6))
+
     if gui_icon_button("mute", f.sfx_on ? ICON_VOLUME_UP : ICON_VOLUME_OFF, f.sfx_on, f.sfx_on ? "Sound: on  (chime on penya, zap on kill)" : "Sound: muted") {
       panel_enqueue(ps, f.sfx_on ? "sfx off" : "sfx on")
     }
@@ -1197,6 +1223,88 @@ gui_toolbar :: proc(ps: ^Panel_State, f: ^Gui_Frame, view: Gui_View) {
   }
   imgui.End()
   imgui.PopStyleVar(1)
+}
+
+// ===========================================================================
+// Overlays popup (the layers button on the toolbar)
+// ===========================================================================
+
+// One display-only radar layer: the label the popup shows, the flag on Gui_Frame that says whether it
+// is on, and the REPL command that flips it. Every one of these commands toggles when given no
+// argument (cli_nowalk / cli_hillshade / cli_collmem / cli_trail / cli_fxlaser), which is why the row
+// can enqueue a bare word and never has to compute "on" or "off" from a value it only snapshotted.
+@(private = "file")
+Gui_Overlay :: struct {
+  label:   cstring,
+  command: string,
+  on:      proc(f: ^Gui_Frame) -> bool,
+}
+
+@(private = "file")
+GUI_OVERLAYS := [?]Gui_Overlay {
+  {"No-walk terrain  (N)", "nowalk", proc(f: ^Gui_Frame) -> bool {return f.nowalk_on}},
+  {"Hillshade relief  (H)", "hillshade", proc(f: ^Gui_Frame) -> bool {return f.hillshade_on}},
+  {"Obstacle memory  (M)", "collmem", proc(f: ^Gui_Frame) -> bool {return f.collmem_on}},
+  {"Player trail", "trail", proc(f: ^Gui_Frame) -> bool {return f.trail_on}},
+  {"Kill laser", "fxlaser", proc(f: ^Gui_Frame) -> bool {return f.fxlaser_on}},
+}
+
+// True if the map is drawing ANY optional layer - the button's lit state, so the toolbar answers
+// "is something being drawn over the terrain" without opening anything.
+@(private = "file")
+gui_overlays_any_on :: proc(f: ^Gui_Frame) -> bool {
+  for o in GUI_OVERLAYS {
+    if o.on(f) {
+      return true
+    }
+  }
+  return false
+}
+
+// The button tooltip NAMES what is on rather than counting it. "Overlays: hillshade, trail" tells you
+// what you are looking at; "2 overlays on" makes you open the popup to find out.
+@(private = "file")
+gui_overlays_tip :: proc(f: ^Gui_Frame) -> cstring {
+  b := strings.builder_make(context.temp_allocator)
+  for o in GUI_OVERLAYS {
+    if !o.on(f) {
+      continue
+    }
+    if strings.builder_len(b) > 0 {
+      strings.write_string(&b, ", ")
+    }
+    strings.write_string(&b, o.command)
+  }
+  if strings.builder_len(b) == 0 {
+    return "Overlays - extra layers the map can draw"
+  }
+  return fmt.ctprintf("Overlays: %s", strings.to_string(b))
+}
+
+// The list itself. Each row is a checkbox over a value we only SNAPSHOTTED, so it cannot own the bool
+// it toggles: the local flips for one frame, the command is queued, and the next frame's snapshot
+// carries the real state back. Same deferred-command discipline as every other control here - the draw
+// phase runs unlocked and must never touch `session`.
+@(private = "file")
+gui_overlays_popup :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
+  if !imgui.BeginPopup("##overlays") {
+    return
+  }
+  imgui.SeparatorText("Overlays")
+  for o in GUI_OVERLAYS {
+    want := o.on(f)
+    if imgui.Checkbox(o.label, &want) {
+      panel_enqueue(ps, o.command)
+    }
+    // The one row that can be ticked and still draw nothing. Say so under it rather than disabling the
+    // row: ticking it now and running `worldscan` later is a perfectly reasonable order to work in.
+    if o.command == "hillshade" && !f.worldscan_ready {
+      imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
+      imgui.TextUnformatted("      needs 'worldscan' first")
+      imgui.PopStyleColor(1)
+    }
+  }
+  imgui.EndPopup()
 }
 
 // ===========================================================================
