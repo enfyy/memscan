@@ -333,6 +333,10 @@ session_init :: proc(session: ^Session) -> bool {
   // set, and any flyff_save_cfg reached while detached wrote those defaults straight over your file.
   // on_attach still re-reads it fresh over defaults per process; this is the floor under that.
   flyff_load_cfg(&session.layout, flyff_cfg_path()) // absent file = built-in defaults, and that is fine
+  // Write the default behaviours out if they are not there. A behaviour is a FILE - there is no
+  // built-in kind any more - so `auto` has to exist on disk before `auto on` or F10 can open it. Only
+  // fills gaps; an edited auto.bhv is never overwritten. See bhv_seed_defaults.
+  bhv_seed_defaults()
   flyff_register(session)
   return true
 }

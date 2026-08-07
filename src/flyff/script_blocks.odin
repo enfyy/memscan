@@ -987,7 +987,7 @@ ACTIONS := [?]Action_Def {
   {
     kind = .Aoe, name = "aoe", title = "Area attack", cat = .Combat, params = PARAMS_AOE[:], can_fail = true,
     blurb = "press one key for as long as anything is close enough to be caught by it - no target, no walking",
-    avail = avail_press_key, start = act_aoe_start, poll = act_aoe_poll,
+    avail = avail_press_key, start = act_aoe_start, poll = act_aoe_poll, exit = act_aoe_exit,
   },
   {
     kind = .Patrol, name = "patrol", title = "Patrol a route", cat = .Move, params = PARAMS_PATROL[:], can_fail = true,
@@ -2122,6 +2122,57 @@ PARAMS_KILL := [?]Param_Spec {
   },
 }
 
+// Press a key on a cadence, with a real DWELL between the down and the up.
+//
+// THE BUG THIS FIXES, because it is not obvious from the code that was here: both verbs used to do
+// `key_post(down)` immediately followed by `key_post(up)`, and the client never saw it. Neuz samples
+// its key table once a frame, so a key that goes down and comes back up inside the same instant is
+// down on no frame at all - `kill` with an attack key would target, walk in, and never hit anything.
+// KEY_HOLD_NS is the sampling margin press_key has always used; this is the same press, driven from a
+// poll loop instead of from a step's start/exit pair.
+//
+// scratch.vk holds the key that is currently DOWN (0 = none) and scratch.deadline is when it went
+// down, so one timestamp answers both "time to let go" and "time to press again". Going through
+// key_hold rather than key_post registers the hold, so the run-level release-all still catches it on
+// any path an exit cannot - a detach mid-press, most of all.
+@(private = "file")
+verb_press_tick :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, raw: string) {
+  s := ctx.session
+  if step.scratch.vk != 0 && ctx.now - step.scratch.deadline >= KEY_HOLD_NS {
+    key_release(s, step.scratch.vk)
+    step.scratch.vk = 0
+  }
+  // Still down, or not due yet. The cadence is measured press-to-press, so the dwell comes out of the
+  // interval rather than being added to it.
+  if step.scratch.vk != 0 || ctx.now - step.scratch.deadline < KILL_REPRESS_NS {
+    return
+  }
+  // A blank key means something else is doing the damage - an armed interrupt, or the player. That is
+  // what `auto` has always done, so it has to stay expressible.
+  key := script_arg(ctx, raw)
+  if key == "" {
+    return
+  }
+  vk, ok := vk_from_name(key)
+  if !ok {
+    return
+  }
+  step.scratch.deadline = ctx.now
+  if key_hold(s, vk) {
+    step.scratch.vk = vk
+  }
+}
+
+// Let go of whatever verb_press_tick left down. Called from both verbs' exits, which is every path a
+// step can leave by; keys_release_all behind that catches the rest.
+@(private = "file")
+verb_press_release :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
+  if step.scratch.vk != 0 {
+    key_release(ctx.session, step.scratch.vk)
+    step.scratch.vk = 0
+  }
+}
+
 @(private = "file")
 kill_opts :: proc(step: ^Script_Step) -> Approach_Opts {
   return Approach_Opts {
@@ -2230,15 +2281,7 @@ act_kill_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Statu
       // Re-press on a cadence. The client keeps swinging on its own, but a re-press is what recovers
       // from a swing that was interrupted, and it is what every chart in the corpus did by hand with a
       // press_key / wait 1.2 pair.
-      // A blank key means something else is doing the damage - an armed interrupt, or the player.
-      // That is what `auto` has always done, so it has to stay expressible.
-      if key := script_arg(ctx, step.action.strs[1]); key != "" && ctx.now - step.scratch.deadline >= KILL_REPRESS_NS {
-        step.scratch.deadline = ctx.now
-        if vk, ok := vk_from_name(key); ok {
-          key_post(s, vk, true)
-          key_post(s, vk, false)
-        }
-      }
+      verb_press_tick(ctx, step, step.action.strs[1])
       switch hold_poll(ctx, step, 0) {
       case .Done:
         step.scratch.phase = int(Kill_Phase.Count)
@@ -2268,6 +2311,7 @@ act_kill_exit :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
   if Kill_Phase(step.scratch.phase) == .Approach {
     move_stop(ctx.session)
   }
+  verb_press_release(ctx, step)
 }
 
 @(private = "file")
@@ -2464,14 +2508,12 @@ act_aoe_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status
   if !aoe_in_range(ctx, step) {
     return .Done // nothing left in the circle
   }
-  if ctx.now - step.scratch.deadline >= KILL_REPRESS_NS {
-    step.scratch.deadline = ctx.now
-    if vk, ok := vk_from_name(script_arg(ctx, step.action.strs[0])); ok {
-      key_post(s, vk, true)
-      key_post(s, vk, false)
-    }
-  }
+  verb_press_tick(ctx, step, step.action.strs[0])
   return .Running
+}
+
+act_aoe_exit :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
+  verb_press_release(ctx, step)
 }
 
 // --- the painted lane ---------------------------------------------------------------------------

@@ -30,18 +30,16 @@ TILE_PAD :: f32(12) // inside padding, all four sides
 TILE_GUTTER :: f32(30) // the icon column, between the left padding and the text column
 TILE_LINE_GAP :: f32(4) // between the title line and the line under it
 
-// One row in the browser. Both kinds of behaviour appear here: the ones compiled into the exe and the
-// ones saved as files, because "which behaviours exist" is a single question with a single answer.
+// One row in the browser. Every behaviour is a FILE, so there is exactly one row per file and no
+// second kind to distinguish - the `builtin` / `shadowed` pair went with the built-in registry, and
+// with it the state where two tiles were both called `hunt`.
 Gui_Bhv_Row :: struct {
-  name:     string, // owned
-  blurb:    string, // owned ("" when a saved file carries no `desc`)
-  builtin:  bool, // defined in Odin: read-only, duplicate it to edit
-  shadowed: bool, // a saved file of the same name wins over this built-in
-  test:     bool, // runs with nothing attached (the verification set)
+  name:    string, // owned
+  blurb:   string, // owned ("" when the file carries no `desc`)
   // The FIRST rule's WHEN, as one line. Shown in the Interrupts tab, where the question is "what would
   // this take over on" - and the answer is the top rule's condition, because arming a behaviour arms
   // its whole list and the list is read in order.
-  trigger:  string, // owned
+  trigger: string, // owned
 }
 
 gui_free_bhv_rows :: proc(ps: ^Panel_State) {
@@ -53,32 +51,11 @@ gui_free_bhv_rows :: proc(ps: ^Panel_State) {
   clear(&ps.browser_rows)
 }
 
-// Rebuild the row list: every Odin behaviour, then every saved file. Mirrors `script list` exactly,
-// including the shadowing rule, so the browser and the console can never disagree about what exists.
+// Rebuild the row list from the behaviours DIRECTORY, which is the whole of what exists. Mirrors
+// `script list` exactly, so the browser and the console can never disagree about what is there.
 gui_scan_behaviours :: proc(ps: ^Panel_State) {
   gui_free_bhv_rows(ps)
-  saved := bhv_list_names()
-  for d in BEHAVIOURS {
-    shadowed := false
-    for s in saved {
-      if s == d.name {
-        shadowed = true
-        break
-      }
-    }
-    append(
-      &ps.browser_rows,
-      Gui_Bhv_Row {
-        name = strings.clone(d.name),
-        blurb = strings.clone(d.blurb),
-        builtin = true,
-        shadowed = shadowed,
-        test = d.test,
-        trigger = gui_bhv_trigger_text(d.name),
-      },
-    )
-  }
-  for s in saved {
+  for s in bhv_list_names() {
     row := Gui_Bhv_Row {
       name  = strings.clone(s),
       blurb = strings.clone(""),
@@ -86,7 +63,7 @@ gui_scan_behaviours :: proc(ps: ^Panel_State) {
     // Read the CONTENT for the blurb and the top rule's condition. This is a file parse per saved
     // behaviour per scan, which is why the scan is throttled to BROWSER_SCAN_INTERVAL - the same
     // reasoning as the directory listing itself (see the note at the top of this file).
-    if doc, ok := bhv_open(s); ok {
+    if doc, ok := bhv_open(s, quiet = true); ok {
       delete(row.blurb)
       row.blurb = strings.clone(doc.desc)
       row.trigger = gui_bhv_rules_trigger_text(&doc)
@@ -109,21 +86,6 @@ gui_bhv_rules_trigger_text :: proc(doc: ^Behaviour_Doc) -> string {
   b := strings.builder_make(context.temp_allocator)
   script_write_condition(&b, doc.rules[0].condition, true)
   return strings.clone(strings.to_string(b))
-}
-
-// Same, for a built-in - which has to be BUILT before it can be asked. Only run on a browser rescan.
-@(private = "file")
-gui_bhv_trigger_text :: proc(name: string) -> string {
-  def := behaviour_def(name)
-  if def == nil {
-    return strings.clone("")
-  }
-  doc, ok := bhv_from_builtin(def)
-  if !ok {
-    return strings.clone("")
-  }
-  defer behaviour_doc_free(&doc)
-  return gui_bhv_rules_trigger_text(&doc)
 }
 
 // ===========================================================================
@@ -591,9 +553,6 @@ gui_bhv_new_tile :: proc(ps: ^Panel_State) {
 @(private = "file")
 gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
   running := f.script_active && f.script_name == r.name
-  // A shadowed built-in is not the behaviour that would run under its own name, so it is drawn as the
-  // inert thing it is rather than as a button that lies about what it does.
-  inert := r.builtin && r.shadowed
 
   // ctprintf, not raw_data(r.name): an Odin string is not NUL-terminated, so handing its bytes to a
   // cstring parameter reads past the end.
@@ -638,11 +597,8 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
   tile_min := imgui.GetItemRectMin()
   tile_max := imgui.GetItemRectMax()
 
-  icon_col := r.builtin ? COL_TEXT_DIM : COL_ACCENT
-  if inert {
-    icon_col = tint(COL_TEXT_DIM, 0.5)
-  }
-  tag := r.builtin ? (r.shadowed ? "Odin (shadowed)" : "Odin") : "saved"
+  icon_col := COL_ACCENT
+  tag := ""
   tag_col := COL_TEXT_DIM
   if running {
     tag = f.script_paused ? "PAUSED" : "running"
@@ -652,21 +608,18 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
   // it fits the title and right-aligns the badge against whatever rect it is given, so the button's
   // width comes off the box rather than being special-cased inside the one layout proc.
   text_max := tile_max
-  if !inert {
-    text_max.x -= load_w + px(TILE_PAD)
-  }
+  text_max.x -= load_w + px(TILE_PAD)
   gui_bhv_tile_body(
     tile_min,
     text_max,
     {
-      icon = r.builtin ? ICON_CODE : ICON_FILE,
+      icon = ICON_FILE,
       icon_col = icon_col,
       title = r.name,
-      title_col = inert ? COL_TEXT_DIM : COL_TEXT,
+      title_col = COL_TEXT,
       tag = tag,
       tag_col = tag_col,
       sub = r.blurb,
-      tail = r.test ? "test" : "",
     },
   )
 
@@ -678,7 +631,7 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
     }
   }
   // The tile itself opens the editor - the one click on this row that cannot start anything.
-  if clicked && !inert {
+  if clicked {
     name := strings.clone(r.name, context.temp_allocator)
     ps.browser_open = false
     gui_editor_open(ps, name)
@@ -687,7 +640,7 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
   // The right-click menu binds to the LAST ITEM, so it has to be claimed here while that is still the
   // tile - after the Load button it would bind to the button and the tile would stop answering.
   if imgui.BeginPopupContextItem("##ctx") {
-    if !inert && imgui.Selectable("Run") {
+    if imgui.Selectable("Run") {
       panel_enqueue(ps, fmt.tprintf("script run %s", r.name))
     }
     if running {
@@ -695,19 +648,13 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
         panel_enqueue(ps, "script stop")
       }
     }
-    // Opening a built-in is allowed and is how you make one editable: the editor loads the built
-    // program and saving it writes a file that shadows the Odin original (which the editor says out
-    // loud). Deleting that file gets the original back - the same deal `script export` documents.
-    // Two doors into the same editor. "Configure" lands on the settings tab and is the one you want
-    // nine times out of ten - you are retuning a chart, not rewiring it - so it goes first.
+    // Two doors into the same editor. "Configure" lands on the Options tab and is the one you want nine
+    // times out of ten - you are retuning a behaviour, not rewriting it - so it goes first.
     if imgui.Selectable("Configure...") {
       name := strings.clone(r.name, context.temp_allocator)
       ps.browser_open = false
       gui_editor_open(ps, name, true)
     }
-    // Opening a built-in is allowed and is how you make one editable: the editor loads the built
-    // program and saving it writes a file that shadows the Odin original (which the editor says out
-    // loud). Deleting that file gets the original back - the same deal `script export` documents.
     if imgui.Selectable("Open in editor") {
       name := strings.clone(r.name, context.temp_allocator)
       ps.browser_open = false
@@ -719,16 +666,17 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
       ps.dup_from = strings.clone(r.name)
       panel_buf_set(ps.dup_buf[:], fmt.tprintf("%s_copy", r.name))
     }
-    if !r.builtin {
-      if imgui.Selectable("Rename...") {
-        delete(ps.rename_from)
-        ps.rename_from = strings.clone(r.name)
-        panel_buf_set(ps.rename_buf[:], r.name)
-      }
-      if imgui.Selectable("Delete") {
-        panel_enqueue(ps, fmt.tprintf("script delete %s", r.name))
-        ps.browser_rescan = true
-      }
+    if imgui.Selectable("Rename...") {
+      delete(ps.rename_from)
+      ps.rename_from = strings.clone(r.name)
+      panel_buf_set(ps.rename_buf[:], r.name)
+    }
+    // Deleting one of the three DEFAULTS (auto, hunt, sweep) is not destructive: the next start writes
+    // it back, and `script reseed` does it now. That is what replaced "delete the file to get the
+    // built-in back" when the built-ins stopped existing.
+    if imgui.Selectable("Delete") {
+      panel_enqueue(ps, fmt.tprintf("script delete %s", r.name))
+      ps.browser_rescan = true
     }
     imgui.EndPopup()
   }
@@ -741,7 +689,7 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
   // immediately by an item, which is the condition ImGui asks for. Because the button is shorter than
   // the tile and centred in it, the row still advances by the tile's height and the grid is unchanged.
   //
-  if !inert {
+  {
     imgui.SameLine(0, 0)
     imgui.SetCursorPosX(row_x + tile_w - load_w - px(TILE_PAD))
     imgui.SetCursorPosY(row_y + (tile_h - px(load_h)) * 0.5)

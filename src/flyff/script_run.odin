@@ -408,6 +408,16 @@ cli_script :: proc(session: ^Session, args: []string) {
     script_cmd_trace(session, args[1:])
   case "lint", "check":
     script_cmd_lint(session, args[1:])
+  case "reseed", "defaults":
+    // The replacement for "delete the file to get the built-in back", now that there are no built-ins.
+    // Only fills GAPS - an edited auto.bhv is yours and is never overwritten - so this is safe to run
+    // at any time, which is what makes it a usable answer to "I broke auto".
+    if n := bhv_seed_defaults(quiet = false); n > 0 {
+      fmt.printfln("script: wrote %d missing default behaviour(s).", n)
+    } else {
+      fmt.println("script: nothing to write - every default behaviour already exists.")
+      fmt.println("  'script delete <name>' one first if you want it back at its default.")
+    }
   case "nocollision", "ignorecollision":
     script_cmd_ignore_collision(args[1:])
   case "pause":
@@ -453,7 +463,8 @@ cli_script :: proc(session: ^Session, args: []string) {
     fmt.eprintfln("script: unknown subcommand '%s'", args[0])
     fmt.eprintln("  status | blocks | list | show <name> | run <name> | stop")
     fmt.eprintln("  pause | resume | reset | trace [n|all|clear] | lint [name]")
-    fmt.eprintln("  export <builtin> [as] | save <name> | delete <name> | rename <old> <new>")
+    fmt.eprintln("  export <name> [as <new>] | save <name> | delete <name> | rename <old> <new>")
+    fmt.eprintln("  reseed - write the default behaviours (auto, hunt, sweep) back if any are missing")
   }
 }
 
@@ -484,11 +495,7 @@ cli_status_behaviour :: proc(session: ^Session) {
   if n := keys_held_count(session); n > 0 {
     fmt.printfln("  keys held: %s   ('key release' lets go of all %d)", keys_held_text(session), n)
   }
-  saved := bhv_list_names()
-  fmt.printfln(
-    "  behaviours: %d in Odin (flyff/behaviours.odin) + %d saved in %s - 'script list'",
-    len(BEHAVIOURS), len(saved), bhv_dir_path(),
-  )
+  fmt.printfln("  behaviours: %d in %s - 'script list'", len(bhv_list_names()), bhv_dir_path())
   cli_status_interrupts(session)
   gated := 0
   for def in ACTIONS {
@@ -838,8 +845,8 @@ script_selftest_roundtrip :: proc() {
   // BOTH registries: the hidden verification set is most of the coverage here, because it is the only
   // thing that puts every kind of payload - numbers, strings, multi-row conditions, `until` - through
   // the writer and the reader in one pass.
-  all := make([dynamic]Behaviour_Def, 0, len(BEHAVIOURS) + len(TEST_BEHAVIOURS), context.temp_allocator)
-  append(&all, ..BEHAVIOURS[:])
+  all := make([dynamic]Behaviour_Def, 0, len(SEED_BEHAVIOURS) + len(TEST_BEHAVIOURS), context.temp_allocator)
+  append(&all, ..SEED_BEHAVIOURS[:])
   append(&all, ..TEST_BEHAVIOURS[:])
   for &d in all {
     doc, ok := bhv_from_builtin(&d)
@@ -1306,16 +1313,16 @@ script_selftest_lint :: proc() {
       fails^ += 1
     }
   }
-  for &def in BEHAVIOURS {
+  for &def in SEED_BEHAVIOURS {
     one(&def, &checked, &fails)
   }
   for &def in TEST_BEHAVIOURS {
     one(&def, &checked, &fails)
   }
   if fails == 0 {
-    fmt.printfln("  PASS: all %d built-in charts lint clean (no dangling edges, no blank required arguments)", checked)
+    fmt.printfln("  PASS: all %d shipped behaviours lint clean (the seeded defaults and the verification set)", checked)
   } else {
-    fmt.eprintfln("  %d lint problem(s) in the shipped charts", fails)
+    fmt.eprintfln("  %d lint problem(s) in the shipped behaviours", fails)
   }
 }
 
@@ -1335,35 +1342,35 @@ script_cmd_show :: proc(session: ^Session, args: []string) {
     return
   }
   defer behaviour_doc_free(&doc)
-  script_show_rules(session, &doc, bhv_exists(doc.name) ? "saved" : "Odin")
+  script_show_rules(session, &doc, bhv_exists(doc.name) ? "saved" : "verification")
 }
 
 
 script_cmd_list :: proc(session: ^Session) {
   saved := bhv_list_names()
-  fmt.println("behaviours:")
-  for d in BEHAVIOURS {
-    shadow := ""
-    if slice.contains(saved, d.name) {
-      shadow = "   <- shadowed by the saved copy of the same name"
-    }
-    fmt.printfln("  %-14s %s%s", d.name, d.blurb, shadow)
-  }
-  fmt.printfln("  ^ defined in Odin (flyff/behaviours.odin).")
-  // Named, not listed. They are runnable by name and `script selftest` exercises them; putting nine of
-  // them in front of the four you actually pick from is what made this list something to read past.
-  fmt.printfln("  (+%d verification behaviours, hidden - 'script selftest' runs them; 'script show t_vars' names one)", len(TEST_BEHAVIOURS))
   if len(saved) == 0 {
-    fmt.printfln("saved behaviours: (none yet in %s)", bhv_dir_path())
+    fmt.printfln("behaviours: (none in %s)", bhv_dir_path())
+    fmt.println("  'script reseed' writes the defaults (auto, hunt, sweep) back.")
   } else {
-    fmt.printfln("saved behaviours (%s):", bhv_dir_path())
+    fmt.printfln("behaviours (%s):", bhv_dir_path())
     for n in saved {
-      fmt.printfln("    %s", n)
+      // A file that will not OPEN is named as such rather than shown with a blank description, which
+      // would read as "no desc" and not as "this cannot run". The reason is left to `script lint <name>`,
+      // where you have asked about that one file - see the quiet flag on bhv_open.
+      desc := fmt.tprintf("(will not load - 'script lint %s' says why)", n)
+      if doc, ok := bhv_open(n, quiet = true); ok {
+        desc = strings.clone(doc.desc, context.temp_allocator)
+        behaviour_doc_free(&doc)
+      }
+      fmt.printfln("  %-22s %s", n, desc)
     }
   }
+  // Named, not listed. They are runnable by name and `script selftest` exercises them; they are
+  // fixtures rather than behaviours, which is the one reason anything is still resolved by name.
+  fmt.printfln("  (+%d verification behaviours, hidden - 'script selftest' runs them; 'script show t_vars' names one)", len(TEST_BEHAVIOURS))
   fmt.println("  'script run <name>' to start, 'script show <name>' to see its rules.")
   fmt.println("  'script nocollision <name>' drops the reach check for one behaviour (dungeons with fake floor props).")
-  fmt.println("  A saved behaviour WINS over an Odin one of the same name - delete it to get the original back.")
+  fmt.println("  Every behaviour is a FILE. Delete one of the defaults and 'script reseed' (or a restart) writes it back.")
 }
 
 // Turn the proactive collision gate off for one saved behaviour - the typable twin of the tick-box in
@@ -1446,11 +1453,7 @@ script_cmd_export :: proc(args: []string) {
     return
   }
   defer behaviour_doc_free(&doc)
-  if out == src && !bhv_exists(src) {
-    // Exporting a built-in onto its own name is the "make this editable" case, and it is worth saying
-    // out loud that the file now wins.
-    fmt.println("script: the copy has the same name as the Odin behaviour, so it will SHADOW it ('script delete' undoes that).")
-  } else if out == src {
+  if out == src {
     fmt.eprintfln("script export: '%s' would overwrite itself - pass 'as <newname>'.", src)
     return
   }

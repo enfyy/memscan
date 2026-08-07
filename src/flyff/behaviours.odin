@@ -6,15 +6,22 @@ import "core:time"
 import "../engine"
 
 // ===========================================================================
-// Built-in behaviours - the registry `script run <name>` selects from.
+// The SEEDED behaviours, and the verification set.
 //
-// Each is a plain Odin proc that builds a rule list. This is the library surface in use: Odin's own
-// control flow does the static work (factoring into procs, repeating over config), and only a genuine
-// runtime decision becomes a rule.
+// THERE IS NO SUCH THING AS A BUILT-IN BEHAVIOUR ANY MORE. `auto`, `hunt` and `sweep` used to be Odin
+// procs the runtime resolved by name, with a saved file of the same name SHADOWING one - which meant
+// two kinds of behaviour, two rows in the browser called `hunt`, and a Save button that silently
+// created the second one. Every behaviour is a file now. These procs survive only to WRITE those files
+// when they are missing (bhv_seed_defaults, called at startup and by `script reseed`), and nothing
+// resolves a name through them.
 //
-// The first group are the ones a person picks from. The second are the VERIFICATION behaviours - they
-// use no game state, so they run fully detached and are what `script selftest` proves the block
-// vocabulary with.
+// So editing `auto` is editing auto.bhv, full stop. Delete it and the next start writes the default
+// back - which is the same escape hatch "delete the file to get the original" always was, minus the
+// shadowing.
+//
+// TEST_BEHAVIOURS is the one registry that is still resolved by name, and deliberately: those are test
+// FIXTURES rather than behaviours you run, and seeding them would put two files in the browser that
+// exist only for the suite.
 // ===========================================================================
 
 Behaviour_Def :: struct {
@@ -25,8 +32,9 @@ Behaviour_Def :: struct {
   route: string, // the waypoint set `patrol` walks, for a behaviour that has one
 }
 
-// The behaviours a PERSON picks from.
-BEHAVIOURS := [?]Behaviour_Def {
+// Written to behaviours/ when the file is not there. Not a lookup table - nothing resolves a run
+// through this; see bhv_seed_defaults.
+SEED_BEHAVIOURS := [?]Behaviour_Def {
   {
     name = "auto", blurb = "the farm loop: kill whatever is around, nearest threat first",
     build = bh_auto,
@@ -67,21 +75,43 @@ TEST_BEHAVIOURS := [?]Behaviour_Def {
   },
 }
 
-// Resolve a name across BOTH registries. The test set is hidden from the LISTS, not from the tool:
-// `script run t_vars` and `script show t_random` still work, which is what makes them usable as
-// verification at all.
+// The verification set, by name. Hidden from the LISTS, not from the tool: `script run t_vars` and
+// `script show t_random` still work, which is what makes them usable as verification at all.
+//
+// This is the ONLY name resolution that does not go through the filesystem, and the only reason it
+// survives is that these are fixtures rather than behaviours.
 behaviour_def :: proc(name: string) -> ^Behaviour_Def {
-  for &d in BEHAVIOURS {
-    if d.name == name {
-      return &d
-    }
-  }
   for &d in TEST_BEHAVIOURS {
     if d.name == name {
       return &d
     }
   }
   return nil
+}
+
+// Write the default behaviours out for any that are missing. Called at startup and by `script reseed`.
+//
+// MISSING, not different: a file that exists is yours, and re-seeding over an edit would be the tool
+// silently reverting your work. Deleting one is how you ask for the default back.
+bhv_seed_defaults :: proc(quiet := true) -> int {
+  written := 0
+  for &def in SEED_BEHAVIOURS {
+    if bhv_exists(def.name) {
+      continue
+    }
+    doc, ok := bhv_from_builtin(&def)
+    if !ok {
+      continue
+    }
+    defer behaviour_doc_free(&doc)
+    if bhv_save(&doc) {
+      written += 1
+      if !quiet {
+        fmt.printfln("  wrote %s", bhv_file_path(def.name))
+      }
+    }
+  }
+  return written
 }
 
 // ===========================================================================

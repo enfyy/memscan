@@ -415,7 +415,7 @@ bhv_parse_event :: proc(toks_in: []string) -> (ev: Script_Event, ok: bool, err: 
 // Parse a whole document. Reports every problem it finds rather than the first, because a file that a
 // node editor wrote is data the user cannot fix by hand-editing one line - they want to know the shape
 // of the damage. Returns ok=false if anything was rejected; <doc> is then empty and already freed.
-bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, ok: bool) {
+bhv_deserialize :: proc(name: string, content: string, quiet := false) -> (doc: Behaviour_Doc, ok: bool) {
   doc.name = strings.clone(name)
   doc.rules = make([dynamic]Rule)
   problems := 0
@@ -424,8 +424,14 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
   rule_index := -1
   saw_version := false
 
-  report :: proc(problems: ^int, lineno: int, msg: string) {
-    fmt.eprintfln("  line %d: %s", lineno, msg)
+  // <quiet> suppresses the WHOLE report, and the split is about who asked. A path that ENUMERATES -
+  // `script list`, the browser scan - is not asking about this file in particular, and a directory
+  // holding one pre-cutover chart should not print a refusal into the middle of a listing. A path where
+  // you NAMED the behaviour (run, show, lint, open) stays loud, because there the complaint is the answer.
+  report :: proc(problems: ^int, lineno: int, msg: string, quiet: bool) {
+    if !quiet {
+      fmt.eprintfln("  line %d: %s", lineno, msg)
+    }
     problems^ += 1
   }
 
@@ -450,8 +456,10 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
     }
   }
   if !saw_version {
-    fmt.eprintln("  this is an old GRAPH behaviour (no 'version 2' line) and this build only runs rule lists.")
-    fmt.eprintln("  charts were converted by hand at the cutover - see BACKLOG.md; there is no automatic upgrade.")
+    if !quiet {
+      fmt.eprintln("  this is an old GRAPH behaviour (no 'version 2' line) and this build only runs rule lists.")
+      fmt.eprintln("  charts were converted by hand at the cutover - see BACKLOG.md; there is no automatic upgrade.")
+    }
     behaviour_doc_free(&doc)
     return {}, false
   }
@@ -475,25 +483,25 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
     // an empty behaviour. The version number is not a compatibility knob to negotiate.
     case "version":
       if len(toks) < 2 {
-        report(&problems, lineno, "version: expected a number")
+        report(&problems, lineno, "version: expected a number", quiet)
         continue
       }
       v, vok := strconv.parse_int(toks[1])
       if !vok {
-        report(&problems, lineno, fmt.tprintf("version: '%s' is not a number", toks[1]))
+        report(&problems, lineno, fmt.tprintf("version: '%s' is not a number", toks[1]), quiet)
         continue
       }
       if v != 2 {
-        report(&problems, lineno, fmt.tprintf("version %d: this build only reads version 2 (a rule list)", v))
+        report(&problems, lineno, fmt.tprintf("version %d: this build only reads version 2 (a rule list)", v), quiet)
       }
 
     case "route":
       if len(toks) < 2 {
-        report(&problems, lineno, "route: expected the name of a waypoint set to patrol")
+        report(&problems, lineno, "route: expected the name of a waypoint set to patrol", quiet)
         continue
       }
       if !bhv_name_ok(toks[1]) {
-        report(&problems, lineno, fmt.tprintf("route: '%s' is not a usable name - %s", toks[1], BHV_NAME_RULE))
+        report(&problems, lineno, fmt.tprintf("route: '%s' is not a usable name - %s", toks[1], BHV_NAME_RULE), quiet)
         continue
       }
       delete(doc.route)
@@ -505,12 +513,12 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
     // ...followed by its steps, as ordinary `node` lines.
     case "rule":
       if len(toks) < 2 {
-        report(&problems, lineno, "rule: expected 'rule <id> [once|while] [match=any] [off]'")
+        report(&problems, lineno, "rule: expected 'rule <id> [once|while] [match=any] [off]'", quiet)
         continue
       }
       id, id_ok := strconv.parse_u64(toks[1])
       if !id_ok || id == 0 {
-        report(&problems, lineno, fmt.tprintf("rule: '%s' is not an id (ids start at 1)", toks[1]))
+        report(&problems, lineno, fmt.tprintf("rule: '%s' is not an id (ids start at 1)", toks[1]), quiet)
         continue
       }
       rule := Rule {
@@ -533,7 +541,7 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
           rule.condition.match_any = true
         case "match=all":
         case:
-          report(&problems, lineno, fmt.tprintf("rule: unknown token '%s' - written by a newer build?", t))
+          report(&problems, lineno, fmt.tprintf("rule: unknown token '%s' - written by a newer build?", t), quiet)
           bad_rule = true
         }
         if bad_rule {
@@ -549,7 +557,7 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
 
     case "name", "when":
       if rule_index < 0 {
-        report(&problems, lineno, fmt.tprintf("'%s' before any rule line", toks[0]))
+        report(&problems, lineno, fmt.tprintf("'%s' before any rule line", toks[0]), quiet)
         continue
       }
       rule := &doc.rules[rule_index]
@@ -561,11 +569,11 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
       }
       ev, eok, eerr := bhv_parse_event(toks[1:])
       if !eok {
-        report(&problems, lineno, eerr)
+        report(&problems, lineno, eerr, quiet)
         continue
       }
       if rule.condition.row_count >= SCRIPT_MAX_CONDITION_ROWS {
-        report(&problems, lineno, fmt.tprintf("when: more than %d conditions on one rule", SCRIPT_MAX_CONDITION_ROWS))
+        report(&problems, lineno, fmt.tprintf("when: more than %d conditions on one rule", SCRIPT_MAX_CONDITION_ROWS), quiet)
         delete(ev.strs[0])
         delete(ev.strs[1])
         continue
@@ -579,21 +587,21 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
 
     case "node":
       if len(toks) < 3 {
-        report(&problems, lineno, "node: expected 'node <id> <op> [key=value ...]'")
+        report(&problems, lineno, "node: expected 'node <id> <op> [key=value ...]'", quiet)
         continue
       }
       if rule_index < 0 {
-        report(&problems, lineno, "node: a step has to belong to a rule - put a 'rule' line above it")
+        report(&problems, lineno, "node: a step has to belong to a rule - put a 'rule' line above it", quiet)
         continue
       }
       id, id_ok := strconv.parse_u64(toks[1])
       op, op_ok := bhv_op_from_name(toks[2])
       if !id_ok || id == 0 {
-        report(&problems, lineno, fmt.tprintf("node: '%s' is not a node id (ids start at 1)", toks[1]))
+        report(&problems, lineno, fmt.tprintf("node: '%s' is not a node id (ids start at 1)", toks[1]), quiet)
         continue
       }
       if !op_ok {
-        report(&problems, lineno, fmt.tprintf("node: unknown op '%s' - a rule's steps are 'action' or 'wait_for'", toks[2]))
+        report(&problems, lineno, fmt.tprintf("node: unknown op '%s' - a rule's steps are 'action' or 'wait_for'", toks[2]), quiet)
         continue
       }
       step := Script_Step {
@@ -604,7 +612,7 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
       for kv in toks[3:] {
         eq := strings.index_byte(kv, '=')
         if eq < 0 {
-          report(&problems, lineno, fmt.tprintf("node: '%s' is not key=value", kv))
+          report(&problems, lineno, fmt.tprintf("node: '%s' is not key=value", kv), quiet)
           bad_key = true
           break
         }
@@ -622,13 +630,13 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
               step.until.match_any = true
             }
           case:
-            report(&problems, lineno, fmt.tprintf("%s: expected 'all' or 'any', got '%s'", key, val))
+            report(&problems, lineno, fmt.tprintf("%s: expected 'all' or 'any', got '%s'", key, val), quiet)
             bad_key = true
           }
         case:
           // Loud, not silent: a key this build does not know means the file was written by a newer
           // one, and quietly dropping it would produce a behaviour that runs but does something else.
-          report(&problems, lineno, fmt.tprintf("node: unknown key '%s' - written by a newer build?", key))
+          report(&problems, lineno, fmt.tprintf("node: unknown key '%s' - written by a newer build?", key), quiet)
           bad_key = true
         }
         if bad_key {
@@ -642,7 +650,7 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
 
     case "do", "if", "until":
       if rule_index < 0 || len(doc.rules[rule_index].steps) == 0 {
-        report(&problems, lineno, fmt.tprintf("'%s' before any node line", toks[0]))
+        report(&problems, lineno, fmt.tprintf("'%s' before any node line", toks[0]), quiet)
         continue
       }
       steps := &doc.rules[rule_index].steps
@@ -651,7 +659,7 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
       case "do":
         act, aok, aerr := bhv_parse_action(toks[1:])
         if !aok {
-          report(&problems, lineno, aerr)
+          report(&problems, lineno, aerr, quiet)
           continue
         }
         step.action = act
@@ -661,11 +669,11 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
       case "if":
         ev, eok, eerr := bhv_parse_event(toks[1:])
         if !eok {
-          report(&problems, lineno, eerr)
+          report(&problems, lineno, eerr, quiet)
           continue
         }
         if step.condition.row_count >= SCRIPT_MAX_CONDITION_ROWS {
-          report(&problems, lineno, fmt.tprintf("if: more than %d conditions on one node", SCRIPT_MAX_CONDITION_ROWS))
+          report(&problems, lineno, fmt.tprintf("if: more than %d conditions on one node", SCRIPT_MAX_CONDITION_ROWS), quiet)
           delete(ev.strs[0])
           delete(ev.strs[1])
           continue
@@ -675,11 +683,11 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
       case "until":
         ev, eok, eerr := bhv_parse_event(toks[1:])
         if !eok {
-          report(&problems, lineno, eerr)
+          report(&problems, lineno, eerr, quiet)
           continue
         }
         if step.until.row_count >= SCRIPT_MAX_CONDITION_ROWS {
-          report(&problems, lineno, fmt.tprintf("until: more than %d conditions on one node", SCRIPT_MAX_CONDITION_ROWS))
+          report(&problems, lineno, fmt.tprintf("until: more than %d conditions on one node", SCRIPT_MAX_CONDITION_ROWS), quiet)
           delete(ev.strs[0])
           delete(ev.strs[1])
           continue
@@ -690,7 +698,7 @@ bhv_deserialize :: proc(name: string, content: string) -> (doc: Behaviour_Doc, o
       }
 
     case:
-      report(&problems, lineno, fmt.tprintf("unknown line '%s'", toks[0]))
+      report(&problems, lineno, fmt.tprintf("unknown line '%s'", toks[0]), quiet)
     }
   }
 
@@ -733,15 +741,17 @@ bhv_save :: proc(doc: ^Behaviour_Doc) -> bool {
   return true
 }
 
-bhv_load :: proc(name: string) -> (doc: Behaviour_Doc, ok: bool) {
+bhv_load :: proc(name: string, quiet := false) -> (doc: Behaviour_Doc, ok: bool) {
   path := bhv_file_path(name)
   data, err := os.read_entire_file(path, context.temp_allocator)
   if err != nil {
     return {}, false
   }
-  d, dok := bhv_deserialize(name, string(data))
+  d, dok := bhv_deserialize(name, string(data), quiet)
   if !dok {
-    fmt.eprintfln("behaviour '%s' was not loaded (see the problems above): %s", name, path)
+    if !quiet {
+      fmt.eprintfln("behaviour '%s' was not loaded (see the problems above): %s", name, path)
+    }
     return {}, false
   }
   return d, true
@@ -784,12 +794,12 @@ bhv_from_builtin :: proc(def: ^Behaviour_Def) -> (doc: Behaviour_Doc, ok: bool) 
   return doc, true
 }
 
-// THE resolver every caller goes through: a saved file wins over a built-in of the same name. User data
-// beats compiled-in data, so editing a copy of a built-in actually takes effect; `script list` marks the
-// shadowing so it is never a mystery, and deleting the file restores the original.
-bhv_open :: proc(name: string) -> (doc: Behaviour_Doc, ok: bool) {
+// THE resolver every caller goes through. A behaviour is a FILE; the built-in fallback below is only
+// the hidden verification set (t_vars, t_random), which are fixtures rather than behaviours and are
+// deliberately not on disk. See bhv_seed_defaults for how auto/hunt/sweep get there.
+bhv_open :: proc(name: string, quiet := false) -> (doc: Behaviour_Doc, ok: bool) {
   if bhv_exists(name) {
-    return bhv_load(name)
+    return bhv_load(name, quiet)
   }
   if def := behaviour_def(name); def != nil {
     return bhv_from_builtin(def)

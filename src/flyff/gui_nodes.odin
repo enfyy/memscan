@@ -37,7 +37,6 @@ ED_INSPECTOR_W :: f32(330)
 Gui_Editor :: struct {
   open:       bool,
   doc:        Behaviour_Doc, // OWNED while open
-  shadowing:  bool, // the doc was built from Odin: saving writes a file that shadows the built-in
   dirty:      bool,
   msg:        string, // owned - the last save / validation result
   msg_bad:    bool,
@@ -279,7 +278,6 @@ gui_editor_open :: proc(ps: ^Panel_State, name: string, options := false) {
     return
   }
   ed.doc = doc
-  ed.shadowing = !bhv_exists(name) && behaviour_def(name) != nil
   ed_begin(ed, name)
   ed.tab_options = options
 }
@@ -1152,8 +1150,6 @@ ed_status_banner :: proc(ed: ^Gui_Editor, running: bool) {
   switch {
   case ed.msg != "" && rl.GetTime() - ed.msg_at < 8:
     msg, col = fmt.ctprintf("%s", ed.msg), ed.msg_bad ? COL_BAD : COL_OK
-  case ed.shadowing:
-    msg, col = fmt.ctprintf("built in Odin - saving writes a file that SHADOWS '%s'", ed.doc.name), COL_WARN
   case running && ed.dirty:
     msg, col = "it is running the SAVED version - save and re-run to apply these edits", COL_TEXT_DIM
   case:
@@ -1206,7 +1202,6 @@ ed_save :: proc(ps: ^Panel_State, ed: ^Gui_Editor) -> bool {
     return false
   }
   ed.dirty = false
-  ed.shadowing = behaviour_def(name) != nil
   // THE LINTER, rather than the two checks that used to live here by hand (a blank required argument and
   // a watcher with no body). Both are still reported - script_lint covers them and eight more - and the
   // point of routing through it is that the save message and the Problems tab can never disagree about

@@ -419,15 +419,12 @@ script_print_problems :: proc(name: string, size: string, problems: []Chart_Prob
   }
 }
 
-// Every behaviour the tool can run, saved files and built-ins alike. Prints one line per clean chart and
-// the full report for anything that is not.
+// Every behaviour the tool can run: every saved file, plus the hidden verification set. Prints one line
+// per clean behaviour and the full report for anything that is not.
 @(private = "file")
 script_lint_all :: proc() {
   names := make([dynamic]string, context.temp_allocator)
   defer delete(names)
-  for &d in BEHAVIOURS {
-    append(&names, d.name)
-  }
   for &d in TEST_BEHAVIOURS {
     append(&names, d.name)
   }
@@ -435,7 +432,7 @@ script_lint_all :: proc() {
     already := false
     for existing in names {
       if existing == n {
-        already = true // a saved file that SHADOWS a built-in: bhv_open returns the file, so lint it once
+        already = true // a saved file named like a verification fixture: bhv_open returns the file
         break
       }
     }
