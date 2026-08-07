@@ -2292,37 +2292,27 @@ cli_radar :: proc(session: ^Session, args: []string) {
     if run := &session.script; run.active {
       gf.script_active = true
       gf.script_paused = run.paused
-      gf.script_step = run.stepping
-      gf.script_in_watcher = script_frame_in_watcher(run)
-      // Which sub-chart, if any, the live node belongs to - the editor's canvas highlights a node by id,
-      // and inside a call that id is a REMAPPED copy no open document contains. Naming the document is
-      // what stops "the chart is running but nothing lights up" from looking like a bug.
-      gf.script_in_call = ""
-      for i in 0 ..< min(run.depth, len(run.frames)) {
-        f := run.frames[i]
-        if f.kind == .Call && f.pc >= 0 && f.pc < len(run.steps) {
-          gf.script_in_call = strings.clone(run.steps[f.pc].call_name, context.temp_allocator)
-        }
-      }
+      // A GLOBAL interrupt has control - the behaviour is suspended mid-step, not advancing. Read off
+      // the session rather than the run, because a global outlives any one behaviour.
+      gf.script_in_watcher = session.global_active >= 0
       gf.script_name = strings.clone(run.name, context.temp_allocator)
-      gf.script_pc = min(run.pc + 1, run.main_len)
-      gf.script_len = run.main_len
       gf.script_line = strings.clone(run.last_line, context.temp_allocator)
-      if run.pc >= 0 && run.pc < len(run.steps) {
-        gf.script_node = run.steps[run.pc].id
+      // Position WITHIN the active rule, which is the only position a rule list has.
+      if rule := run.active_rule >= 0 && run.active_rule < len(run.rules) ? &run.rules[run.active_rule] : nil; rule != nil {
+        gf.script_pc = min(run.pc + 1, len(rule.steps))
+        gf.script_len = len(rule.steps)
       }
-      if run.entry_pc >= 0 && run.entry_pc < len(run.steps) {
-        gf.script_entry = run.steps[run.entry_pc].id
+      if step := rules_current_step(run); step != nil {
+        gf.script_node = step.id
       }
-      // The run's watchers, in the order they are checked. Same temp-clone rule as the strings above.
-      gf.watcher_count = min(len(run.watchers), SCRIPT_MAX_WATCHERS)
-      for i in 0 ..< gf.watcher_count {
-        w := &run.watchers[i]
-        gf.watchers[i] = Gui_Watcher_Row {
-          label    = strings.clone(w.src, context.temp_allocator),
-          fires    = w.fires,
-          live     = script_frame_in_watcher(run) && run.active_watcher == i,
-          borrowed = w.global_source != "" || strings.contains(w.src, ": "),
+      // The whole rule list, in the order it is read. Same temp-clone rule as the strings above.
+      gf.rule_count = min(len(run.rules), GUI_MAX_RULE_ROWS)
+      for i in 0 ..< gf.rule_count {
+        r := &run.rules[i]
+        gf.rules[i] = Gui_Rule_Row {
+          label = strings.clone(r.label, context.temp_allocator),
+          fires = r.fires,
+          live  = run.active_rule == i,
         }
       }
     }

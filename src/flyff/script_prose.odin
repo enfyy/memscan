@@ -145,33 +145,13 @@ event_cat :: proc(ev: Script_Event) -> Block_Cat {
   return .Flow
 }
 
-// The headline on a node. The OP decides the SHAPE of the sentence; the block decides its subject.
+// The headline on a step. The OP decides the SHAPE of the sentence; the block decides its subject.
 block_title :: proc(s: Script_Step, allocator := context.temp_allocator) -> string {
   switch s.op {
   case .Action:
     return action_title(s.action.kind, allocator)
-  case .Branch, .If:
-    return fmt.aprintf("%s?", condition_title(s.condition, allocator), allocator = allocator)
-  case .While:
-    return fmt.aprintf("While %s", condition_title(s.condition, allocator), allocator = allocator)
   case .Wait_For:
     return fmt.aprintf("Wait until %s", condition_title(s.condition, allocator), allocator = allocator)
-  case .On:
-    return fmt.aprintf("Whenever %s", condition_title(s.condition, allocator), allocator = allocator)
-  case .Else:
-    return "Otherwise"
-  case .End:
-    return "End of block"
-  case .Repeat, .Loop:
-    return "Repeat"
-  case .Goto:
-    return "Jump"
-  case .Return:
-    return "Hand control back"
-  case .Call:
-    // The DOCUMENT's name, prettified the same way a block with no catalog title is. A sub-chart's
-    // description is a sentence and belongs in the tooltip; a node headline wants the noun.
-    return prose_title_of_name(s.call_name, allocator)
   }
   return "?"
 }
@@ -183,18 +163,8 @@ block_cat :: proc(s: Script_Step) -> Block_Cat {
       return def.cat
     }
     return .Flow
-  case .Branch, .If, .While, .Wait_For:
+  case .Wait_For:
     return event_cat(s.condition.first_row)
-  case .On:
-    // An interrupt is control flow whatever it watches for: what matters at a glance is that this
-    // node is not in the program's path at all.
-    return .Flow
-  case .Else, .End, .Repeat, .Loop, .Goto, .Return:
-    return .Flow
-  case .Call:
-    // Its own category rather than .Flow: a call IS control flow, but what a reader needs to see at a
-    // glance is "this is one of mine", because that is the node whose contents live somewhere else.
-    return .Sub
   }
   return .Flow
 }
@@ -318,8 +288,7 @@ condition_params_line :: proc(condition: Script_Condition, allocator := context.
   return strings.to_string(b)
 }
 
-// What a step's payload says, for the node body. Structured ops carry no block of their own, so they
-// describe their own shape instead.
+// What a step's payload says, under its title.
 step_params_line :: proc(s: Script_Step, allocator := context.temp_allocator) -> string {
   line := ""
   switch s.op {
@@ -327,40 +296,8 @@ step_params_line :: proc(s: Script_Step, allocator := context.temp_allocator) ->
     if def := action_def(s.action.kind); def != nil {
       line = prose_params(def.params, s.action.nums, s.action.strs, allocator)
     }
-  // A watcher's title is its TRIGGER, so its body line is what happens when it fires - and that is
-  // always the wire now. It used to have a second answer, for a watcher carrying one action instead
-  // of naming a body; nothing can author that shape any more.
-  case .On:
-    return s.goto_id != 0 ? "takes over and runs its own steps" : "nothing wired - it would fire and do nothing"
-  case .Branch, .If, .While, .Wait_For:
+  case .Wait_For:
     line = condition_params_line(s.condition, allocator)
-  case .Repeat, .Loop:
-    return fmt.aprintf("%d times", s.count, allocator = allocator)
-  case .End:
-    return s.close == .If ? "end of the if" : "back to the top"
-  case .Else, .Goto, .Return:
-    return ""
-  case .Call:
-    // The arguments as `who Aibatt   spot 6800,3300`, the same two-space-separated shape prose_params
-    // gives a catalog block - a call node should read like any other node with settings on it. A
-    // sub-chart that takes nothing says so, rather than leaving an empty body under the title.
-    if s.call_arg_count == 0 {
-      return "takes no settings"
-    }
-    b := strings.builder_make(allocator)
-    n := 0
-    for i in 0 ..< min(s.call_arg_count, len(s.call_args)) {
-      a := s.call_args[i]
-      if a.name == "" {
-        continue
-      }
-      if n > 0 {
-        strings.write_string(&b, "   ")
-      }
-      fmt.sbprintf(&b, "%s %s", prose_words(a.name, allocator), a.value == "" ? "(blank)" : a.value)
-      n += 1
-    }
-    return strings.to_string(b)
   }
   if s.has_until {
     u := fmt.aprintf("until %s", condition_title(s.until, allocator), allocator = allocator)
@@ -396,37 +333,21 @@ step_body_line :: proc(s: Script_Step, allocator := context.temp_allocator) -> (
   if line := step_params_line(s, allocator); line != "" {
     return line, false
   }
-  #partial switch s.op {
-  case .Goto, .Return, .Else, .End:
-    return "", false // these say everything they have to say in their title and their wire
-  }
   return prose_lead_sentence(block_blurb(s), allocator), true
 }
 
 // The one-paragraph explanation, for the hover card. Straight off the catalog row, so it can never
 // drift from what the block does.
 block_blurb :: proc(s: Script_Step) -> string {
-  #partial switch s.op {
-  case .Action, .On:
+  switch s.op {
+  case .Action:
     if def := action_def(s.action.kind); def != nil {
       return def.blurb
     }
-  case .Branch, .If, .While, .Wait_For:
+  case .Wait_For:
     if def := event_def(s.condition.kind); def != nil {
       return def.blurb
     }
-  case .Goto:
-    return "jump to another node - how a loop is drawn"
-  case .Return:
-    return "end an interrupt and hand control back to where the program was suspended"
-  case .Repeat:
-    return "run the nodes below a fixed number of times"
-  case .Loop:
-    return "take the 'each pass' edge a fixed number of times, then leave by 'when done'"
-  case .End:
-    return "closes the block above it"
-  case .Else:
-    return "the other arm of the if above it"
   }
   return ""
 }
@@ -434,12 +355,12 @@ block_blurb :: proc(s: Script_Step) -> string {
 // The catalog spelling, for the surfaces that also have to tell you what to TYPE (the palette, the
 // inspector's kind picker). Kept next to the prose so the pairing is obvious.
 block_name :: proc(s: Script_Step) -> string {
-  #partial switch s.op {
-  case .Action, .On:
+  switch s.op {
+  case .Action:
     if def := action_def(s.action.kind); def != nil {
       return def.name
     }
-  case .Branch, .If, .While, .Wait_For:
+  case .Wait_For:
     if def := event_def(s.condition.kind); def != nil {
       return def.name
     }

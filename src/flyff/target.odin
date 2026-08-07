@@ -128,9 +128,6 @@ Pick_Ctx :: struct {
   now:           i64,
   name_filtered: bool, // len(names) > 0 (reported by tdbg; no longer gates the melee rung)
   require_fresh: bool, // auto (true) vs manual target_closest (false)
-  aggro_on:      bool, // ladder rung 1 enabled (session.aggro_first_on)
-  melee_on:      bool, // ladder rung 2 enabled (session.melee_first_on)
-  pocket_on:     bool, // ladder rung 4 enabled (session.pocket_on)
   gate:          bool, // proactive reach filter on
   sweep_on:      bool, // a painted lane is armed (session.sweep_on) - in-range-only selection, see tc_pick_one
   fence_on:      bool, // geo-fence gate on (session.fence.active) - skip mobs outside the fenced area
@@ -143,7 +140,6 @@ Pick_Ctx :: struct {
   recent:        []TC_Recent, // cooldown set (skip just-killed); session.tc_recent live, a copy in sim
   blocked:       []TC_Recent, // stuck-blacklist set; session.auto_blocked live, a copy in sim
   density:       []int, // per-candidate local pack size (index-aligned to cands); nil when density is off
-  density_on:    bool, // master enable for the cluster/density stages; false = the v0.4.0 cascade exactly
   min_gain:      int, // extra pack members a farther pack needs to steal the pick (density stage gate 1)
   max_detour:    f32, // max extra walk distance (world units) for that detour (density stage gate 2)
   cluster_committed:  bool, // a previous pick locked onto a pack; keep eating it (cluster stage)
@@ -196,7 +192,7 @@ tc_cand_skip :: proc(session: ^Session, ctx: Pick_Ctx, cands: []TC_Cand, i: int,
 // is a wrapper around rung_aggro. Sharing the proc is what stops a node and the built-in ladder from
 // drifting apart - the same reason tc_pick_one was factored out of tc_select in the first place.
 //
-// The ENABLE checks (ctx.aggro_on, ctx.melee_on, ctx.density_on, ...) deliberately stay in
+// The remaining enable checks (ctx.avoid_on, ctx.sweep_on) deliberately stay in
 // tc_pick_one rather than moving into the rungs: in a chart the node's PRESENCE is the enable, so a
 // rung called directly must just run. Preconditions that are logic rather than configuration - is
 // there a cluster commitment, is the density array sized - stay inside their rung.
@@ -424,10 +420,10 @@ rung_nearest :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: 
 // (-1, .None) when nothing is eligible. Pure: reads ctx + game memory, mutates neither session nor ctx.
 // The PRIORITY LADDER, in the order it actually runs (each rung fully answers the pick; only if it
 // finds nothing does the next get a say):
-//   1 aggro   - a mob that is coming for US (ctx.aggro_on)
-//   2 melee   - a mob on top of us, within ctx.melee (ctx.melee_on)
+//   1 aggro   - a mob that is coming for US
+//   2 melee   - a mob on top of us, within ctx.melee
 //   3 avoid   - one-shot post-stuck steer to the opposite side (part of stuck recovery)
-//   4 pocket  - inside attack_range, ranked nearest-to-last-kill / pack stickiness (ctx.pocket_on)
+//   4 pocket  - inside attack_range, ranked nearest-to-last-kill / pack stickiness
 //   5 cluster - keep eating a committed pack (density on)
 //   6 density - detour to a denser pack past the mingain/detour gate (density on)
 //   7 nearest - always-on fallback
@@ -443,27 +439,25 @@ tc_pick_one :: proc(session: ^Session, cands: []TC_Cand, ctx: Pick_Ctx, alive: [
   if ctx.require_fresh && ctx.sweep_on {
     return rung_sweep(session, cands, ctx, alive)
   }
-  if ctx.require_fresh && ctx.aggro_on {
+  // AUTO ONLY from here down. An explicit `tc` / `target_at` is the user naming a mob by hand and gets
+  // the plain nearest-eligible answer; everything above that is the farm brain deciding for itself.
+  if ctx.require_fresh {
     if i, st := rung_aggro(session, cands, ctx, alive); i >= 0 {
       return i, st
     }
-  }
-  if ctx.require_fresh && ctx.melee_on {
     if i, st := rung_melee(session, cands, ctx, alive); i >= 0 {
       return i, st
     }
-  }
-  if ctx.require_fresh && ctx.avoid_on {
-    if i, st := rung_avoid(session, cands, ctx, alive); i >= 0 {
-      return i, st
+    // The one rung with a precondition outside the candidate list: it only means anything right after
+    // a skip armed the opposite-side hint.
+    if ctx.avoid_on {
+      if i, st := rung_avoid(session, cands, ctx, alive); i >= 0 {
+        return i, st
+      }
     }
-  }
-  if ctx.require_fresh && ctx.pocket_on {
     if i, st := rung_pocket(session, cands, ctx, alive); i >= 0 {
       return i, st
     }
-  }
-  if ctx.require_fresh && ctx.density_on {
     if i, st := rung_cluster(session, cands, ctx, alive); i >= 0 {
       return i, st
     }
@@ -981,7 +975,7 @@ tc_finish_select :: proc(
   // Density steering (auto only): precompute per-candidate pack sizes so the cluster/density stages can
   // read them. Skipped entirely when off or for manual picks, so tc pays no O(n^2) cost.
   dens: []int = nil
-  if require_fresh && session.layout.density_on {
+  if require_fresh {
     dens = compute_densities(cands, density_radius(engage))
   }
   recent := session.tc_recent[:]
@@ -998,9 +992,6 @@ tc_finish_select :: proc(
     now           = now,
     name_filtered = len(names) > 0,
     require_fresh = require_fresh,
-    aggro_on      = session.aggro_first_on, // ladder rung 1 (see tc_pick_one)
-    melee_on      = session.melee_first_on, // rung 2
-    pocket_on     = session.pocket_on,      // rung 4
     gate          = require_fresh && reach_gate_active(session), // reach filter (auto only; see reach_gate_active for the three ways it comes off)
     sweep_on      = session.sweep_on, // painted lane armed -> in-range-only selection (auto only)
     fence_on      = session.fence.active, // geo-fence gate (auto + manual when active; 'fence off' to override)
@@ -1013,7 +1004,6 @@ tc_finish_select :: proc(
     recent        = recent,
     blocked       = session.auto_blocked[:],
     density       = dens,
-    density_on    = session.layout.density_on,
     min_gain      = session.layout.density_min_gain,
     max_detour    = session.layout.density_max_detour,
     cluster_committed  = session.cluster_committed,
@@ -1043,17 +1033,11 @@ tc_finish_select :: proc(
     session.auto_sel_obj = chosen.obj
     session.auto_sel_set = true
     lb_note_commit(session, chosen.obj, len(dens) == len(cands) ? dens[idx] : 0) // leaderboard kill attribution (no-op unless recording)
-    // Carry the cluster commitment forward (density feature). Forced off when the toggle is off, so
-    // switching density off mid-run cleans the state up immediately.
-    if session.layout.density_on {
-      pack := len(dens) == len(cands) ? dens[idx] : 0
-      session.cluster_committed, session.cluster_origin_pos = cluster_advance(
-        session.cluster_committed, session.cluster_origin_pos, stage, chosen.pos, pack, density_radius(engage),
-      )
-    } else {
-      session.cluster_committed = false
-      session.cluster_origin_pos = {}
-    }
+    // Carry the cluster commitment forward.
+    pack := len(dens) == len(cands) ? dens[idx] : 0
+    session.cluster_committed, session.cluster_origin_pos = cluster_advance(
+      session.cluster_committed, session.cluster_origin_pos, stage, chosen.pos, pack, density_radius(engage),
+    )
   }
   return .Picked, chosen.obj, chosen.d, sel, total
 }
@@ -1139,10 +1123,7 @@ tc_finish_precompute :: proc(
   }
   now := time.now()._nsec
   melee, engage := pick_ranges(session)
-  dens: []int = nil
-  if session.layout.density_on {
-    dens = compute_densities(cands, density_radius(engage))
-  }
+  dens := compute_densities(cands, density_radius(engage))
   // Exclude the current focus from the pick via a local cooldown copy (never mutate session state here).
   local_recent := make([dynamic]TC_Recent, context.temp_allocator)
   append(&local_recent, ..session.tc_recent[:])
@@ -1154,9 +1135,6 @@ tc_finish_precompute :: proc(
     now           = now,
     name_filtered = len(names) > 0,
     require_fresh = true,
-    aggro_on      = session.aggro_first_on, // ladder rung 1 (see tc_pick_one)
-    melee_on      = session.melee_first_on, // rung 2
-    pocket_on     = session.pocket_on,      // rung 4
     gate          = reach_gate_active(session), // hunt commits even to a blocked target (see tc_finish_select)
     sweep_on      = session.sweep_on, // (sweep_tick disables pre-select outright, but keep the ctx honest)
     fence_on      = session.fence.active,
@@ -1168,7 +1146,6 @@ tc_finish_precompute :: proc(
     recent        = local_recent[:],
     blocked       = session.auto_blocked[:],
     density       = dens,
-    density_on    = session.layout.density_on,
     min_gain      = session.layout.density_min_gain,
     max_detour    = session.layout.density_max_detour,
     cluster_committed  = session.cluster_committed, // READ only - commit-time cluster_advance mutates it

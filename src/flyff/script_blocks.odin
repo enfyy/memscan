@@ -279,6 +279,9 @@ Step_Scratch :: struct {
   // the argument, and an argument can be `@dir` - so a variable that changed in between would release a
   // key that was never pressed and leave the real one down.
   vk:          u32,
+  // Which leg of a multi-phase verb is running (Kill_Phase). One integer rather than a phase per verb:
+  // a step is only ever in one verb, and the alternative is a field here per coarse block.
+  phase:       int,
   // Target-holding actions (hold_target, approach) keep their whole watch state here rather than on
   // Session. That is the point of the migration: the stuck window, the combat-grace stamp and the
   // reach debounce belong to the BLOCK that is watching, so they are torn down with it and two charts
@@ -313,23 +316,14 @@ Script_Action_Kind :: enum {
   Stop,
   Fail,
   Wait_Random,
-  // The targeting ladder, one block per rung of tc_pick_one. Scan once, then ask each rung in turn;
-  // a rung that finds nothing FAILS, so its fail edge is the wire to the next rung.
-  Scan_Mobs,
-  Pick_Aggro,
-  Pick_Melee,
-  Pick_Avoid,
-  Pick_Pocket,
-  Pick_Cluster,
-  Pick_Density,
-  Pick_Nearest,
-  Pick_In_Range,
+  // THE VERB. One block for the whole kill chain - scan, pick, lock, walk in, fight, count. It replaces
+  // the fourteen fine-grained blocks below it, which existed because a graph had to draw the chain as
+  // wires. A list does not, and the chain was never actually varied: `dungeon_aoe` spends eight nodes
+  // saying "kill something", twice. See script_kill.odin.
+  Kill,
+  Aoe, // press one key while anything is in the circle
+  Patrol, // walk to the next stop of a route, then hand control back
   Sweep_Lane,
-  Lock_Target,
-  Approach,
-  Hold_Target,
-  Count_Kill,
-  Skip_Target,
   Walk_To,
   Walk_By,
   Jump,
@@ -345,15 +339,6 @@ Script_Action_Kind :: enum {
   Press_Key,
   Key_Down,
   Key_Up,
-  // --- not implemented yet (see the NOT-YET block section); registered so they parse and are
-  // discoverable, and so `script run` refuses up front instead of dying mid-run.
-  Attack_Once,
-  Say,
-  Whisper,
-  Npc_Talk,
-  Npc_Menu,
-  Sweep_Record,
-  Sweep_Play,
 }
 
 Script_Event_Kind :: enum {
@@ -390,10 +375,6 @@ Script_Event_Kind :: enum {
   Var_Is,
   Var_Above,
   Var_Below,
-  // --- not implemented yet (see the NOT-YET block section)
-  Chat_Msg,
-  Whisper_From,
-  Captcha,
 }
 
 // --- definitions ----------------------------------------------------------------------------
@@ -822,7 +803,11 @@ PARAMS_PENYA := [?]Param_Spec {
 @(rodata)
 PARAMS_MOB_RANGE := [?]Param_Spec {
   {
-    name = "names", kind = .Names, title = "Monster names",
+    // OPTIONAL, because the help sentence beside it says empty is a legitimate value - "any monster".
+    // The two disagreed until a rule's WHEN started going through lint_arguments, which then reported
+    // the built-in `sweep` behaviour as having an unfilled required field. The block was right and the
+    // spec was wrong.
+    name = "names", kind = .Names, optional = true, title = "Monster names",
     help = "Comma-separated list to look for. Leave empty to accept any monster.",
   },
   {
@@ -949,21 +934,6 @@ PARAMS_VAR_BELOW := [?]Param_Spec {
   },
 }
 
-@(rodata)
-PARAMS_CHAT_TEXT := [?]Param_Spec {
-  {
-    name = "text", kind = .Str, title = "Text",
-    help = "The message fragment to watch for in chat.",
-  },
-}
-
-@(rodata)
-PARAMS_WHISPER_FROM := [?]Param_Spec {
-  {
-    name = "name", kind = .Str, title = "Player name",
-    help = "Exact character name whose whisper to watch for.",
-  },
-}
 
 // --- the action catalog ---------------------------------------------------------------------
 // Not @(rodata): the rows hold proc pointers and param slices, which aren't constant initializers,
@@ -1010,79 +980,24 @@ ACTIONS := [?]Action_Def {
 
   // --- the targeting ladder ---------------------------------------------------------------------
   {
-    kind = .Scan_Mobs, name = "scan_mobs", title = "Look around", cat = .Sense, params = PARAMS_SCAN_NAMES[:], can_fail = true,
-    blurb = "collect the nearby monsters once, for the pick_* rungs to choose from (no names = any)",
-    avail = avail_attached, start = act_scan_start, poll = act_scan_poll,
+    kind = .Kill, name = "kill", title = "Kill it", cat = .Combat, params = PARAMS_KILL[:], can_fail = true,
+    blurb = "find a monster, walk to it and fight it until it is dead - the whole chain. Fails when there is nothing to kill or it cannot be reached",
+    avail = avail_moveto, start = act_kill_start, poll = act_kill_poll, exit = act_kill_exit,
   },
   {
-    kind = .Pick_Aggro, name = "pick_aggro", title = "One coming at me", cat = .Target, params = {}, can_fail = true,
-    blurb = "rung 1: a monster already coming for you (any distance). Fails if none",
-    avail = avail_attached, start = act_pick_aggro,
+    kind = .Aoe, name = "aoe", title = "Area attack", cat = .Combat, params = PARAMS_AOE[:], can_fail = true,
+    blurb = "press one key for as long as anything is close enough to be caught by it - no target, no walking",
+    avail = avail_press_key, start = act_aoe_start, poll = act_aoe_poll,
   },
   {
-    kind = .Pick_Melee, name = "pick_melee", title = "One in melee reach", cat = .Target, params = PARAMS_MELEE_RANGE[:], can_fail = true,
-    blurb = "rung 2: a monster on top of you (default melee_range). Fails if none",
-    avail = avail_attached, start = act_pick_melee,
-  },
-  {
-    kind = .Pick_Avoid, name = "pick_avoid", title = "One the other way", cat = .Target, params = {}, can_fail = true,
-    blurb = "rung 3: after a blocked skip, one on the opposite side. Fails unless a skip just armed it",
-    avail = avail_attached, start = act_pick_avoid,
-  },
-  {
-    kind = .Pick_Pocket, name = "pick_pocket", title = "One right here", cat = .Target, params = {}, can_fail = true,
-    blurb = "rung 4: within attack_range of where you stand, nearest the last kill. Fails if none",
-    avail = avail_attached, start = act_pick_pocket,
-  },
-  {
-    kind = .Pick_Cluster, name = "pick_cluster", title = "Stay on this pack", cat = .Target, params = {}, can_fail = true,
-    blurb = "rung 5: keep eating the pack you committed to. Fails if there is no live commitment",
-    avail = avail_attached, start = act_pick_cluster,
-  },
-  {
-    kind = .Pick_Density, name = "pick_density", title = "Densest pack", cat = .Target, params = PARAMS_DENSITY[:], can_fail = true,
-    blurb = "rung 6: detour to a denser pack, if it clears both the gain and detour gates",
-    avail = avail_attached, start = act_pick_density,
-  },
-  {
-    kind = .Pick_Nearest, name = "pick_nearest", title = "Nearest one", cat = .Target, params = {}, can_fail = true,
-    blurb = "rung 7: the nearest eligible monster - the fallback. Fails only if nothing is eligible",
-    avail = avail_attached, start = act_pick_nearest,
-  },
-  {
-    kind = .Pick_In_Range, name = "pick_in_range", title = "Only what's in reach", cat = .Target, params = PARAMS_IN_RANGE[:], can_fail = true,
-    blurb = "only what is already in reach of where you stand - never proposes a walk (sweep lanes)",
-    avail = avail_attached, start = act_pick_in_range,
+    kind = .Patrol, name = "patrol", title = "Patrol a route", cat = .Move, params = PARAMS_PATROL[:], can_fail = true,
+    blurb = "walk to the next stop of a saved route, then hand control back - so anything more urgent gets its turn between stops",
+    avail = avail_moveto, start = act_patrol_start, poll = act_patrol_poll, exit = act_patrol_exit,
   },
   {
     kind = .Sweep_Lane, name = "sweep_lane", title = "Drive the lane", cat = .Move, params = {}, can_fail = true,
     blurb = "drive the painted lane: erase what you cover, hop forward once the circle is clear",
     avail = avail_attached, start = act_sweep_lane_start, poll = act_sweep_lane_poll, exit = act_sweep_lane_exit,
-  },
-  {
-    kind = .Lock_Target, name = "lock_target", title = "Select it", cat = .Target, params = {}, can_fail = true,
-    blurb = "select the monster the rungs picked. Fails if it died or moved out from under the pick",
-    avail = avail_attached, start = act_lock_target,
-  },
-  {
-    kind = .Approach, name = "approach", title = "Walk to it", cat = .Move, params = PARAMS_APPROACH[:], can_fail = true,
-    blurb = "walk to the picked monster before locking it (jittered waypoints). Fails when blocked",
-    avail = avail_moveto, start = act_approach_start, poll = act_approach_poll, exit = act_approach_exit,
-  },
-  {
-    kind = .Hold_Target, name = "hold_target", title = "Stay on target", cat = .Combat, params = PARAMS_GRACE_OPT[:], can_fail = true,
-    blurb = "stay on the locked monster until it is gone; fails if the approach jams or it goes unreachable",
-    avail = avail_attached, start = act_hold_start, poll = act_hold_poll,
-  },
-  {
-    kind = .Count_Kill, name = "count_kill", title = "Count the kill", cat = .Combat, params = {},
-    blurb = "count the picked monster as killed (stats, leaderboard, kill anchor, radar zap)",
-    avail = avail_attached, start = act_count_kill,
-  },
-  {
-    kind = .Skip_Target, name = "skip_target", title = "Blacklist and drop", cat = .Target, params = PARAMS_REASON_OPT[:],
-    blurb = "blacklist the picked monster and deselect, so the next pass takes a different one",
-    avail = avail_attached, start = act_skip_target,
   },
 
   {
@@ -1162,65 +1077,6 @@ ACTIONS := [?]Action_Def {
     avail = avail_press_key, start = act_key_up_start,
   },
 
-  // --- NOT YET IMPLEMENTED --------------------------------------------------------------------
-  // These are the blocks the design calls for whose underlying capability does not exist in the tool
-  // yet. They are listed on purpose: `script blocks` doubles as the roadmap, the parser accepts them
-  // so a script can be written ahead of the capability, and script_check_avail refuses the run up
-  // front with the reason - which beats discovering it halfway through a farm. Each `not_built_why`
-  // names the recon that would unblock it. Implementing one = clearing not_built and swapping in a
-  // real `start`, nothing else changes.
-  //
-  // These are also the ONLY blocks the editor refuses to place. Everything above is placeable whether
-  // or not a process is attached - see Action_Def.not_built.
-  {
-    kind = .Attack_Once, name = "attack_once", title = "Swing once", cat = .Combat, params = {}, can_fail = true,
-    blurb = "swing once at the current target, then move on (for AoE pulls)",
-    not_built = true,
-    not_built_why = "no attack primitive yet (you hold the attack key today) - needs SendActMsg(OBJMSG_ATTACK..) recon, like derive_jump_msg did for jump",
-    start = act_not_implemented,
-  },
-  {
-    kind = .Say, name = "say", title = "Say in chat", cat = .System, params = PARAMS_SAY[:], can_fail = true,
-    blurb = "write a message in chat",
-    not_built = true,
-    not_built_why = "needs chat-send recon (the client's own say/whisper packet builder)",
-    start = act_not_implemented,
-  },
-  {
-    kind = .Whisper, name = "whisper", title = "Whisper", cat = .System, params = PARAMS_WHISPER[:], can_fail = true,
-    blurb = "whisper a message to one player",
-    not_built = true,
-    not_built_why = "needs chat-send recon (the client's own say/whisper packet builder)",
-    start = act_not_implemented,
-  },
-  {
-    kind = .Npc_Talk, name = "npc_talk", title = "Talk to an NPC", cat = .System, params = PARAMS_NPC_NAME[:], can_fail = true,
-    blurb = "open dialogue with a named NPC",
-    not_built = true,
-    not_built_why = "needs NPC interaction + menu recon (dialogue open / menu select packets)",
-    start = act_not_implemented,
-  },
-  {
-    kind = .Npc_Menu, name = "npc_menu", title = "Pick an NPC option", cat = .System, params = PARAMS_NPC_MENU[:], can_fail = true,
-    blurb = "choose entry N of the open NPC menu",
-    not_built = true,
-    not_built_why = "needs NPC interaction + menu recon (dialogue open / menu select packets)",
-    start = act_not_implemented,
-  },
-  {
-    kind = .Sweep_Record, name = "sweep_record", title = "Record a path", cat = .Move, params = PARAMS_PATH_NAME[:], can_fail = true,
-    blurb = "record the path you walk and save it under <name>",
-    not_built = true,
-    not_built_why = "needs path recording + serialization (the 2.0 backlog item) - 'sweep to <x,z>' works today",
-    start = act_not_implemented,
-  },
-  {
-    kind = .Sweep_Play, name = "sweep_play", title = "Replay a path", cat = .Move, params = PARAMS_PATH_NAME[:], can_fail = true,
-    blurb = "replay a recorded path as a sweep lane",
-    not_built = true,
-    not_built_why = "needs path recording + serialization (the 2.0 backlog item) - 'sweep to <x,z>' works today",
-    start = act_not_implemented,
-  },
 }
 
 // --- the event catalog -----------------------------------------------------------------------
@@ -1361,29 +1217,6 @@ EVENTS := [?]Event_Def {
     kind = .Var_Below, name = "var_below", title = "Variable is less than", cat = .Vars, params = PARAMS_VAR_BELOW[:],
     blurb = "a numeric variable is below N ('not var_below' is 'at least N')",
     fired = ev_var_below,
-  },
-
-  // --- NOT YET IMPLEMENTED (see the note on the action side) -----------------------------------
-  {
-    kind = .Chat_Msg, name = "chat_msg", title = "Chat says", cat = .Sense, params = PARAMS_CHAT_TEXT[:],
-    blurb = "a chat message containing <text> appeared",
-    not_built = true,
-    not_built_why = "needs chat-read recon (where incoming chat lands, and how to watch it)",
-    fired = ev_not_implemented,
-  },
-  {
-    kind = .Whisper_From, name = "whisper_from", title = "Whisper from", cat = .Sense, params = PARAMS_WHISPER_FROM[:],
-    blurb = "that player whispered you",
-    not_built = true,
-    not_built_why = "needs chat-read recon (where incoming chat lands, and how to watch it)",
-    fired = ev_not_implemented,
-  },
-  {
-    kind = .Captcha, name = "captcha", title = "CAPTCHA appeared", cat = .Sense, params = {},
-    blurb = "an anti-bot CAPTCHA popup appeared",
-    not_built = true,
-    not_built_why = "needs CAPTCHA popup recon (finding the dialog's live state)",
-    fired = ev_not_implemented,
   },
 }
 
@@ -1822,9 +1655,6 @@ script_pick_ctx :: proc(ctx: ^Behaviour_Context, opts: Rung_Opts) -> (pick_conte
     now                = ctx.now,
     name_filtered      = len(run.cand_names) > 0,
     require_fresh      = true,
-    aggro_on           = true,
-    melee_on           = true,
-    pocket_on          = true,
     gate               = reach_gate_active(s),
     sweep_on           = false, // pick_in_range is the block form of the sweep short-circuit
     fence_on           = s.fence.active,
@@ -1837,7 +1667,6 @@ script_pick_ctx :: proc(ctx: ^Behaviour_Context, opts: Rung_Opts) -> (pick_conte
     recent             = s.tc_recent[:],
     blocked            = s.auto_blocked[:],
     density            = run.cand_dens,
-    density_on         = true,
     min_gain           = min_gain,
     max_detour         = max_detour,
     cluster_committed  = s.cluster_committed,
@@ -1926,125 +1755,18 @@ script_consume_batch :: proc(ctx: ^Behaviour_Context) -> bool {
   run.cand_dens = nil
   if len(run.cands) > 0 {
     _, engage := pick_ranges(s)
-    // context.allocator, NOT the default temp: this batch is read by the rungs on later ticks, and
-    // behaviour_tick free_all's the scratch arena temp points at every tick.
+    // context.allocator, NOT the default temp: this batch is read on later ticks, and behaviour_tick
+    // free_all's the scratch arena temp points at every tick.
     run.cand_dens = compute_densities(run.cands[:], density_radius(engage), context.allocator)
   }
   return true
 }
 
-act_scan_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  // The block's own names are the chart's answer; `auto 'Aibatt'` is a RUN-SCOPED override of it.
-  // That is the whole of what the target spec still means now that the config layer is gone: not a
-  // setting that rebuilds the chart, just an argument to this run, which is why it wins over a blank
-  // block and loses to one that names something.
-  spec := script_arg(ctx, step.action.strs[0])
-  if spec == "" && len(ctx.session.auto_names) > 0 {
-    spec = strings.join(ctx.session.auto_names[:], ",", context.temp_allocator)
-  }
-  script_set_cand_names(&ctx.session.script, spec)
-  if script_consume_batch(ctx) {
-    return .Done // a prefetched batch was already waiting - no wait at all
-  }
-  if !script_request_scan(ctx) {
-    return .Failed
-  }
-  return .Running
-}
-
-act_scan_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  if script_consume_batch(ctx) {
-    return .Done
-  }
-  // The worker can be dropped mid-flight (a generation bump from `auto` stopping, a detach), so
-  // re-request rather than waiting forever on a batch that will never arrive.
-  if !ctx.session.scan_job.active {
-    if !script_request_scan(ctx) {
-      return .Failed
-    }
-  }
-  return .Running
-}
-
-// --- the rungs --------------------------------------------------------------------------------
-
-act_pick_aggro :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  return script_run_rung(ctx, rung_aggro)
-}
-
-act_pick_melee :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  return script_run_rung(ctx, rung_melee, Rung_Opts{melee = step.action.nums[0]})
-}
-
-// The one rung with a precondition outside the candidate list: it only means anything right after a
-// skip armed the opposite-side hint. Unarmed it must fail so the ladder moves on, or it would just
-// return the nearest mob under a misleading stage name.
-act_pick_avoid :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  if !ctx.session.auto_avoid_on {
-    return .Failed
-  }
-  return script_run_rung(ctx, rung_avoid)
-}
-
-act_pick_pocket :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  return script_run_rung(ctx, rung_pocket)
-}
-
-act_pick_cluster :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  return script_run_rung(ctx, rung_cluster)
-}
-
-act_pick_density :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  return script_run_rung(ctx, rung_density, Rung_Opts{min_gain = step.action.nums[0], max_detour = step.action.nums[1]})
-}
-
-act_pick_nearest :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  return script_run_rung(ctx, rung_nearest)
-}
-
-act_pick_in_range :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  return script_run_rung(ctx, rung_sweep, Rung_Opts{engage = step.action.nums[0]})
-}
-
-// --- lock / approach / hold -------------------------------------------------------------------
-
-act_lock_target :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  s := ctx.session
-  run := &s.script
-  if !run.pick.set {
-    return .Failed
-  }
-  // COMMIT-TIME REVALIDATION. The pick came off a batch that may be a second old and was measured from
-  // wherever the last kill happened, so between the scan and here the mob can have wandered, been
-  // dragged behind cover, or left the fence. tc_precompute_still_valid re-reads its LIVE position and
-  // re-tests drift + reach + fence from where the player actually stands - a handful of reads, not a
-  // rescan.
-  //
-  // Legacy auto ran exactly this check at its commit site and the chart cutover dropped it, which left
-  // the reach gate's only say over a pre-selected pick being a test measured from the kill spot. That
-  // is the whole of "collisions get ignored": nothing between the scan and the lock ever asked whether
-  // the thing was reachable from HERE. Failing sends the chart back to rescan (lock's fail edge), and
-  // the fresh scan - anchored at the live player - then filters the mob out properly.
-  tpos, tok := tc_precompute_still_valid(s, run.pick.obj, run.pick.pos)
-  if !tok {
-    run.pick.set = false
-    return .Failed // freed, wandered too far, now blocked, or outside the fence
-  }
-  if !auto_commit_pick(s, run.pick.obj, tpos, run.pick.stage, run.pick.pack) {
-    run.pick.set = false
-    return .Failed // refused: freed, model-less, or already dead
-  }
-  run.pick.pos = tpos
-  s.auto_avoid_on = false // one-shot steer hint, consumed by a pick that stuck
-  return .Done
-}
+// --- walking in, and holding on ------------------------------------------------------------------
 
 @(private = "file")
 script_grace_ns :: proc(session: ^Session, param: f64) -> i64 {
   g := param
-  if g <= 0 {
-    g = f64(session.layout.combat_grace)
-  }
   if g <= 0 {
     g = f64(FLYFF_COMBAT_GRACE)
   }
@@ -2062,10 +1784,17 @@ script_grace_ns :: proc(session: ^Session, param: f64) -> i64 {
 //   - with it set, a mob that kept moving was chased hop after hop with nothing bounding it, because
 //     the only watchdog measured the current WAYPOINT and every new hop reset it. Perfect waypoint
 //     progress, no progress at all. From the outside: it follows the mob around and never finishes.
-// `sidestep` makes a jam step AROUND the obstacle and keep going instead of failing, which is what
-// hunt mode was - a chart that says that is asking not to give up, so the target watchdog side-steps
-// for it rather than failing.
-act_approach_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+
+// What an approach was asked for. Split out from the payload so the same walk can be driven by the
+// `approach` block AND from inside the `kill` verb, whose own arguments mean something else.
+Approach_Opts :: struct {
+  stop_within: f32, // how close counts as arrived; 0 = walk all the way to melee reach
+  spread:      f32, // waypoint jitter, so the path is not machine-straight
+  sidestep:    bool, // never give up on a blocked monster - step around it instead (this is hunt)
+}
+
+
+approach_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, opts: Approach_Opts) -> Step_Status {
   s := ctx.session
   run := &s.script
   if !run.pick.set {
@@ -2081,16 +1810,16 @@ act_approach_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_
     return .Failed
   }
   // Already close enough - nothing to walk. Self-guarding like this is what lets a chart put approach
-  // on the path unconditionally: auto had to test the distance at the CALL site (la_max_range for the
-  // shrinking hop, LA_STEP_MIN_DIST for a single detour) before deciding to enter the approach at all.
+  // on the path unconditionally: auto had to test the distance at the CALL site before deciding to
+  // enter the approach at all.
   d := engine.dist_horizontal(ppos, tpos)
-  if d <= script_approach_stop_within(step) {
+  if d <= approach_stop_within(opts.stop_within) {
     return .Done
   }
   step.scratch.obj = run.pick.obj
   step.scratch.target_best = d
   step.scratch.target_progress_at = ctx.now
-  if !script_approach_hop(ctx, step, ppos, tpos) {
+  if !script_approach_hop(ctx, step, ppos, tpos, opts) {
     return .Failed
   }
   return .Running
@@ -2098,21 +1827,16 @@ act_approach_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_
 
 // How close counts as arrived. ONE definition, used by start and by every poll - they disagreed
 // before, which is how "0 walks the whole way" ended up meaning "0 walks half way".
-@(private = "file")
-script_approach_stop_within :: proc(step: ^Script_Step) -> f32 {
-  within := f32(step.action.nums[0])
-  if within <= 0 {
-    within = LA_STEP_MIN_DIST
-  }
-  return within
+approach_stop_within :: proc(within: f32) -> f32 {
+  return within <= 0 ? LA_STEP_MIN_DIST : within
 }
 
 // Issue one leg of the walk and arm the waypoint watchdog against it. Shared by the first hop and
 // every shrinking hop after it.
 @(private = "file")
-script_approach_hop :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, ppos, tpos: [3]f32) -> bool {
+script_approach_hop :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, ppos, tpos: [3]f32, opts: Approach_Opts) -> bool {
   s := ctx.session
-  stop_within := script_approach_stop_within(step)
+  stop_within := approach_stop_within(opts.stop_within)
   remaining := engine.dist_horizontal(ppos, tpos)
   // THE LAST LEG GOES STRAIGHT AT THE MOB. A hop covers 40-60% of what is left and then jitters
   // sideways by up to la_step_spread, so once the gap is comparable to that jitter the hops stop
@@ -2122,8 +1846,7 @@ script_approach_hop :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, ppos, t
   if remaining <= max(stop_within * 2, LA_STEP_MIN_DIST) {
     wp = {tpos[0], ppos[1], tpos[2]}
   } else {
-    spread := f32(step.action.nums[1])
-    wp = lookalive_step_point(s, ppos, tpos, spread > 0 ? spread : -1)
+    wp = lookalive_step_point(s, ppos, tpos, opts.spread > 0 ? opts.spread : -1)
   }
   if !write_dest_pos(s, ppos, wp) {
     return false // fence-gated, or the move fields are unpinned
@@ -2135,7 +1858,8 @@ script_approach_hop :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, ppos, t
   return true
 }
 
-act_approach_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+
+approach_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, opts: Approach_Opts) -> Step_Status {
   s := ctx.session
   run := &s.script
   obj := step.scratch.obj
@@ -2153,12 +1877,8 @@ act_approach_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_S
     run.pick.set = false
     return .Failed // unreadable, or it drifted outside the geo-fence
   }
-  if s.lookalive_on {
-    lookalive_jump_core(s, tpos, ctx.now) // occasional travel-jump; self-throttling
-  }
-
-  stop_within := script_approach_stop_within(step)
-  sidestep := step.action.nums[2] != 0
+  stop_within := approach_stop_within(opts.stop_within)
+  sidestep := opts.sidestep
 
   // ARE WE THERE YET - asked first, and asked of the TARGET. This is the block's actual exit
   // condition, so it cannot be buried at the end behind "did we reach the waypoint": a mob that walks
@@ -2235,17 +1955,12 @@ act_approach_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_S
   if reach_gate_active(s) && !sidestep && !cand_reachable(s, world, ppos, tpos) {
     return .Failed // the next leg is blocked now
   }
-  if !script_approach_hop(ctx, step, ppos, tpos) {
+  if !script_approach_hop(ctx, step, ppos, tpos, opts) {
     return .Failed
   }
   return .Running
 }
 
-// Halt the walk. This is the Exit that auto had to hand-write at every site that left the approach -
-// without it, `script stop` mid-approach leaves the character strolling to the waypoint.
-act_approach_exit :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
-  move_stop(ctx.session)
-}
 
 // Stay on the locked mob until it is gone, and be the one place that decides to give up on it.
 //
@@ -2253,10 +1968,8 @@ act_approach_exit :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
 // falling?) and duplicating that across separate event blocks would give them racing baselines:
 //   - combat watch   - stamp the moment its HP last fell; suppresses both drops below
 //   - stuck plateau  - the distance stopped closing while still far = jammed on geometry
-//   - reach re-check - it got dragged behind cover after we locked it
-// Done = the mob is gone (ask target_died whether that was a kill). Failed = we are dropping it, so
-// the fail edge normally goes to skip_target.
-act_hold_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+
+hold_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
   s := ctx.session
   focus, fok := read_focus_ptr(s)
   if !fok || focus == 0 {
@@ -2274,7 +1987,8 @@ act_hold_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Stat
   return .Running
 }
 
-act_hold_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+
+hold_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, grace: f64) -> Step_Status {
   s := ctx.session
   sc := &step.scratch
   focus, fok := read_focus_ptr(s)
@@ -2293,13 +2007,13 @@ act_hold_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Statu
     }
     sc.hp_last = hp
   }
-  in_combat := s.combat_watch_on && sc.hp_drop_at != 0 && ctx.now - sc.hp_drop_at < script_grace_ns(s, step.action.nums[0])
+  in_combat := sc.hp_drop_at != 0 && ctx.now - sc.hp_drop_at < script_grace_ns(s, grace)
 
   // Pre-select: one background enumeration while the fight runs, anchored where the mob is (which is
   // where we will be standing when it dies), so the scan_mobs after the kill completes immediately.
   // This is all `preselect on|off` means now - there is no cache to invalidate, just a scan started
   // early or not.
-  if s.preselect_on && !sc.flag && !s.scan_job.active && !s.scan_job.res_ready {
+  if !sc.flag && !s.scan_job.active && !s.scan_job.res_ready {
     if world, player, _, aok := tc_resolve_anchors(s); aok {
       if tpos, tok := engine.read_vec3(s.proc_info.handle, focus + uintptr(s.layout.pos_off)); tok {
         sc.flag = true
@@ -2324,8 +2038,8 @@ act_hold_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Statu
   case d < sc.best - PROGRESS_EPS:
     sc.best = d
     sc.progress_at = ctx.now
-  case s.auto_stuck_on && ctx.now - sc.progress_at >= STUCK_NS:
-    return .Failed // `stuck off` keeps holding instead - the old behaviour for ranged play
+  case ctx.now - sc.progress_at >= STUCK_NS:
+    return .Failed // jammed on geometry while still far from it
   }
 
   // Reach re-check: a mob can be dragged behind cover after it was locked. Probed on a slow cadence and
@@ -2353,34 +2067,411 @@ script_world_ptr :: proc(session: ^Session) -> uintptr {
   return world
 }
 
-// --- kill accounting / giving up ----------------------------------------------------------------
+// === THE VERBS ====================================================================================
+//
+// One block for the whole kill chain. The fine-grained blocks above it - scan_mobs, the eight pick_*
+// rungs, lock_target, approach, hold_target, count_kill, skip_target - exist because a GRAPH had to
+// draw the chain as wires, and drawing it was the only way to vary it. Measured across the corpus it
+// was never varied: the same six-node chain is pasted about thirty times, and `dungeon_aoe` spends
+// eight nodes saying "kill something", twice.
+//
+// So the chain becomes a state machine inside one block, driving exactly the same procs the blocks
+// drove. Nothing about the FARMING changes - the ladder is still tc_pick_one, the walk is still
+// approach_poll, the drop-watches are still hold_poll. What changes is that saying "kill things" is
+// one row instead of fourteen nodes and six wires.
+//
+// A phase that gives up (nothing to pick, the walk jammed, the mob went unreachable) FAILS the block,
+// and in a rule list that aborts the rule and re-reads from the top - which is what the fail wire to
+// skip_target used to spell out. Blacklisting still happens, here, because that is not control flow.
 
-// Everything auto did at its kill site, as a node: the tally, the leaderboard attribution, the
-// per-species count `kills_of` reads, the kill anchor the pocket/cluster rungs rank from, and the
-// radar's laser + zap. A no-op with nothing picked, so a chart that reaches it after a plain deselect
-// does not invent a kill.
-act_count_kill :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+// How often the attack key is re-pressed during a fight. The corpus arrived at ~1.2s by hand (every
+// chart pairs press_key with `wait 1.2`), which is about one swing - fast enough to recover from an
+// interrupted one, slow enough not to spam the client with input it throws away.
+KILL_REPRESS_NS :: i64(1_200_000_000)
+
+Kill_Phase :: enum {
+  Scan, // one background enumeration
+  Pick, // the whole ladder, in one call
+  Lock, // revalidate and commit the selection
+  Approach, // walk into range
+  Fight, // hold it and press the key until it is gone
+  Count, // tally the kill
+}
+
+@(rodata)
+PARAMS_KILL := [?]Param_Spec {
+  {
+    name = "names", kind = .Names, optional = true, title = "Monster names",
+    help = "Comma-separated list to hunt. Leave empty for any monster (or whatever 'auto' was started with).",
+  },
+  {
+    name = "key", kind = .Key, optional = true, title = "Attack key",
+    help = "The hotkey to attack with, such as F2. Pressed on a cadence for as long as the fight lasts. Leave empty if something else is doing the attacking (an armed interrupt, or you).",
+  },
+  {
+    name = "stop_within", kind = .Num, optional = true, def = 0, unit = "u", title = "Stop within", max_value = 200,
+    help = "Walk until the monster is this close, in world units. 0 means walk all the way in - to within melee reach.",
+  },
+  {
+    name = "sidestep", kind = .Num, optional = true, def = 0, unit = "bool", title = "Never give up",
+    help = "On: never drop a blocked monster, side-step around the obstacle instead. This is what hunt mode was.",
+  },
+  {
+    name = "in_range", kind = .Num, optional = true, def = 0, unit = "bool", title = "Only what is in reach",
+    help = "On: never walk to a monster - take only what is already within attack range. This is what keeps a sweep on its lane.",
+  },
+}
+
+@(private = "file")
+kill_opts :: proc(step: ^Script_Step) -> Approach_Opts {
+  return Approach_Opts {
+    stop_within = f32(step.action.nums[0]),
+    spread      = 0, // the scenic route is look-alive's business, not the verb's
+    sidestep    = step.action.nums[1] != 0,
+  }
+}
+
+act_kill_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+  s := ctx.session
+  // The block's own names are the chart's answer; `auto 'Aibatt'` is a RUN-SCOPED override of it - the
+  // same rule scan_mobs followed, kept so `auto <name>` still means what it always meant.
+  spec := script_arg(ctx, step.action.strs[0])
+  if spec == "" && len(s.auto_names) > 0 {
+    spec = strings.join(s.auto_names[:], ",", context.temp_allocator)
+  }
+  script_set_cand_names(&s.script, spec)
+  step.scratch.phase = int(Kill_Phase.Scan)
+  if script_consume_batch(ctx) {
+    step.scratch.phase = int(Kill_Phase.Pick) // a prefetched batch was waiting - no wait at all
+    return .Running
+  }
+  if !script_request_scan(ctx) {
+    return .Failed
+  }
+  return .Running
+}
+
+act_kill_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+  s := ctx.session
+  run := &s.script
+  opts := kill_opts(step)
+
+  // Up to one pass per phase per tick. The cheap phases (pick, lock) chain within a single tick so a
+  // kill starts the moment a scan lands, rather than losing 20ms to each hand-over; the phases that
+  // wait on the world (scan, approach, fight) return out of the loop.
+  for _ in 0 ..< len(Kill_Phase) {
+    switch Kill_Phase(step.scratch.phase) {
+    case .Scan:
+      if script_consume_batch(ctx) {
+        step.scratch.phase = int(Kill_Phase.Pick)
+        continue
+      }
+      // The worker can be dropped mid-flight (a generation bump from `auto` stopping, a detach), so
+      // re-request rather than waiting forever on a batch that will never arrive.
+      if !s.scan_job.active && !script_request_scan(ctx) {
+        return .Failed
+      }
+      return .Running
+
+    case .Pick:
+      // THE WHOLE LADDER IN ONE CALL. tc_pick_one is the composition the pick_* blocks were each one
+      // rung of, so this is the same decision by the same code - it just stops being eight nodes and
+      // seven fail wires.
+      //
+      // `in_range` swaps the whole ladder for the sweep rung, which is the one that may not propose a
+      // walk. Rungs 1 and 7 (aggro, nearest) are distance-unbounded by design and would pull the
+      // character off a painted lane - the single thing sweep mode exists to prevent.
+      picked := step.action.nums[2] != 0 \
+        ? script_run_rung(ctx, rung_sweep, Rung_Opts{engage = f64(opts.stop_within)}) \
+        : script_run_rung(ctx, tc_pick_one)
+      if picked != .Done {
+        return .Failed // nothing eligible: the rule aborts and the list is re-read from the top
+      }
+      step.scratch.phase = int(Kill_Phase.Lock)
+      continue
+
+    case .Lock:
+      // COMMIT-TIME REVALIDATION - the pick came off a batch that may be a second old and was measured
+      // from wherever the last kill happened. Between the scan and here the mob can have wandered, been
+      // dragged behind cover, or left the fence.
+      tpos, tok := tc_precompute_still_valid(s, run.pick.obj, run.pick.pos)
+      if !tok || !auto_commit_pick(s, run.pick.obj, tpos, run.pick.stage, run.pick.pack) {
+        run.pick.set = false
+        step.scratch.phase = int(Kill_Phase.Scan) // it went away under us - look again
+        return .Running
+      }
+      run.pick.pos = tpos
+      s.auto_avoid_on = false // one-shot steer hint, consumed by a pick that stuck
+      step.scratch.phase = int(Kill_Phase.Approach)
+      switch approach_start(ctx, step, opts) {
+      case .Done:
+        kill_begin_fight(ctx, step)
+        return .Running
+      case .Failed:
+        return kill_give_up(ctx, step, "could not start walking")
+      case .Running:
+      }
+      return .Running
+
+    case .Approach:
+      switch approach_poll(ctx, step, opts) {
+      case .Done:
+        move_stop(s) // the approach block's exit, inlined - stop walking before the fight
+        kill_begin_fight(ctx, step)
+        return .Running
+      case .Failed:
+        move_stop(s)
+        return kill_give_up(ctx, step, "walk jammed")
+      case .Running:
+        return .Running
+      }
+
+    case .Fight:
+      // Re-press on a cadence. The client keeps swinging on its own, but a re-press is what recovers
+      // from a swing that was interrupted, and it is what every chart in the corpus did by hand with a
+      // press_key / wait 1.2 pair.
+      // A blank key means something else is doing the damage - an armed interrupt, or the player.
+      // That is what `auto` has always done, so it has to stay expressible.
+      if key := script_arg(ctx, step.action.strs[1]); key != "" && ctx.now - step.scratch.deadline >= KILL_REPRESS_NS {
+        step.scratch.deadline = ctx.now
+        if vk, ok := vk_from_name(key); ok {
+          key_post(s, vk, true)
+          key_post(s, vk, false)
+        }
+      }
+      switch hold_poll(ctx, step, 0) {
+      case .Done:
+        step.scratch.phase = int(Kill_Phase.Count)
+        continue
+      case .Failed:
+        return kill_give_up(ctx, step, "lost it")
+      case .Running:
+        return .Running
+      }
+
+    case .Count:
+      // Only if it actually DIED. The hold ends on any disappearance - a kill, a despawn, a stray
+      // deselect - and counting all three is how a kill counter starts lying.
+      if kill_target_died(ctx) {
+        kill_count(ctx)
+      }
+      run.pick.set = false
+      return .Done
+    }
+  }
+  return .Running
+}
+
+// Stopping mid-kill must not leave the character strolling at a waypoint or a key held down. This is
+// the one path every ending goes through, which is what the approach block's own exit bought.
+act_kill_exit :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
+  if Kill_Phase(step.scratch.phase) == .Approach {
+    move_stop(ctx.session)
+  }
+}
+
+@(private = "file")
+kill_begin_fight :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
+  step.scratch.phase = int(Kill_Phase.Fight)
+  step.scratch.deadline = 0 // press on the very next poll
+  hold_start(ctx, step)
+}
+
+// Blacklist it and fail. `steer=true` because we jammed trying to reach it, so the obstacle is roughly
+// in its direction and the avoid rung should prefer the other side next pass.
+@(private = "file")
+kill_give_up :: proc(ctx: ^Behaviour_Context, step: ^Script_Step, reason: string) -> Step_Status {
+  s := ctx.session
+  run := &s.script
+  if run.pick.set {
+    ppos, _ := read_player_pos(s)
+    tpos, _ := engine.read_vec3(s.proc_info.handle, run.pick.obj + uintptr(s.layout.pos_off))
+    auto_skip_blocked(s, run.pick.obj, ppos, tpos, reason, true, ctx.now)
+    run.pick.set = false
+  } else {
+    clear_focus(s)
+  }
+  return .Failed
+}
+
+@(private = "file")
+kill_target_died :: proc(ctx: ^Behaviour_Context) -> bool {
   s := ctx.session
   run := &s.script
   if !run.pick.set {
-    return .Done
+    return false
   }
+  if !focus_obj_live(s, run.pick.obj) {
+    return true
+  }
+  hp, ok := read_mob_hp(s, run.pick.obj)
+  return ok && hp <= 0
+}
+
+// Everything auto did at its kill site: the tally, the leaderboard attribution, the per-species count
+// `kills_of` reads, the kill anchor the pocket/cluster rungs rank from, and the radar's laser + zap.
+@(private = "file")
+kill_count :: proc(ctx: ^Behaviour_Context) {
+  s := ctx.session
+  run := &s.script
   s.auto_count += 1
   lb_record_kill(s, run.pick.obj)
   script_note_kill(s, run.pick.obj)
   s.last_kill_pos = run.pick.pos
   s.last_kill_set = true
   record_kill_event(s, run.pick.pos, ctx.now)
-  run.pick.set = false
-  // auto_stats measures from auto_start, which cli_auto sets. A chart started directly (`script run
-  // auto`) never went through it, so without this the rate is computed against a zero epoch and prints
-  // a six-figure hour count.
+  // auto_stats measures from auto_start, which cli_auto sets. A chart started directly never went
+  // through it, so without this the rate is computed against a zero epoch.
   if s.auto_start == 0 {
     s.auto_start = run.started_at
   }
   fmt.printf("\n[auto] %s\n", auto_stats(s, ctx.now))
   fmt.print("memscan> ")
-  return .Done
+}
+
+// --- patrol ---------------------------------------------------------------------------------------
+//
+// Walk to the NEXT stop of a route, then finish. One stop per run of the block, so the rule list is
+// re-read between stops and anything more urgent gets its turn - which is the whole reason a route is
+// a verb here rather than a chain of 45 walk_to nodes. `wilds_v2` was 45 of them.
+//
+// THE CURSOR LIVES ON THE RUN, not in the program. That is the design's "state moves into the world":
+// which stop you are walking to is a thing you can see on the radar, and an interrupting kill resumes
+// the route at the same stop instead of restarting it at the top.
+
+@(rodata)
+PARAMS_PATROL := [?]Param_Spec {
+  {
+    name = "route", kind = .Str, optional = true, title = "Route",
+    help = "Name of a saved waypoint set to walk. Leave empty to use the behaviour's own route.",
+  },
+}
+
+@(private = "file")
+patrol_route_name :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> string {
+  if named := strings.trim_space(script_arg(ctx, step.action.strs[0])); named != "" {
+    return named
+  }
+  return ctx.session.script.route
+}
+
+act_patrol_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+  s := ctx.session
+  run := &s.script
+  if !script_movement_ok(ctx, "patrol") {
+    return .Failed
+  }
+  name := patrol_route_name(ctx, step)
+  if name == "" {
+    script_trace(s, step.id, .Error, "patrol: no route named, and the behaviour has none")
+    return .Failed
+  }
+  set, ok := waypoint_read(name)
+  if !ok || len(set.waypoints) == 0 {
+    script_trace(s, step.id, .Error, "patrol: no route '%s' (or it has no stops)", name)
+    if ok {
+      waypoint_set_free(&set)
+    }
+    return .Failed
+  }
+  defer waypoint_set_free(&set)
+
+  if run.route_stop < 0 || run.route_stop >= len(set.waypoints) {
+    run.route_stop = 0
+  }
+  stop := set.waypoints[run.route_stop]
+  ppos, pok := read_player_pos(s)
+  if !pok {
+    return .Failed
+  }
+  // Y comes from the player: the walk is horizontal and the client owns the ground height. Same rule
+  // walk_to follows, and the reason a route does not store Y at all.
+  dest := [3]f32{stop.position[0], ppos[1], stop.position[1]}
+  if !write_dest_pos(s, ppos, dest) {
+    return .Failed
+  }
+  remote_send_snapshot(s)
+  step.scratch.wp = dest
+  step.scratch.best = engine.dist_horizontal(ppos, dest)
+  step.scratch.progress_at = ctx.now
+  // Advance the cursor NOW, not on arrival: a stop we gave up on must not be retried forever, and an
+  // interrupt that ends the run mid-leg should resume at the next stop rather than re-walk this one.
+  run.route_stop = (run.route_stop + 1) % len(set.waypoints)
+  return .Running
+}
+
+// Arrival, progress and the stuck escape are all exactly walk_to's - a leg of a patrol IS a walk.
+act_patrol_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+  return act_walk_poll(ctx, step)
+}
+
+act_patrol_exit :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
+  move_stop(ctx.session)
+}
+
+// --- aoe ------------------------------------------------------------------------------------------
+//
+// Press one key while anything is close enough to be caught by it. No target, no walk, no single mob
+// to hold - which is what makes it a different verb from `kill` rather than a setting on it. Done when
+// nothing is in range any more, so the rule list moves on to whatever is next.
+
+@(rodata)
+PARAMS_AOE := [?]Param_Spec {
+  {
+    name = "key", kind = .Key, title = "Attack key",
+    help = "The area-attack hotkey to press, such as F5.",
+  },
+  {
+    name = "radius", kind = .Num, optional = true, def = 0, unit = "u", title = "Range", max_value = 200,
+    help = "How far the attack reaches, in world units. 0 uses the configured attack range.",
+  },
+}
+
+@(private = "file")
+aoe_in_range :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> bool {
+  s := ctx.session
+  radius := f32(step.action.nums[0])
+  if radius <= 0 {
+    _, radius = pick_ranges(s)
+  }
+  ppos, pok := read_player_pos(s)
+  if !pok {
+    return false
+  }
+  for c in s.script.cands {
+    if engine.dist_horizontal(ppos, c.pos) <= radius {
+      return true
+    }
+  }
+  return false
+}
+
+act_aoe_start :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+  step.scratch.deadline = 0 // press on the very first poll
+  step.scratch.started_at = ctx.now
+  if !script_request_scan(ctx) {
+    return .Failed
+  }
+  return .Running
+}
+
+act_aoe_poll :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
+  s := ctx.session
+  script_consume_batch(ctx) // keep the candidate list fresh; a miss just reuses the last one
+  if !s.scan_job.active && !s.scan_job.res_ready {
+    script_request_scan(ctx)
+  }
+  if !aoe_in_range(ctx, step) {
+    return .Done // nothing left in the circle
+  }
+  if ctx.now - step.scratch.deadline >= KILL_REPRESS_NS {
+    step.scratch.deadline = ctx.now
+    if vk, ok := vk_from_name(script_arg(ctx, step.action.strs[0])); ok {
+      key_post(s, vk, true)
+      key_post(s, vk, false)
+    }
+  }
+  return .Running
 }
 
 // --- the painted lane ---------------------------------------------------------------------------
@@ -2420,26 +2511,6 @@ act_sweep_lane_exit :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) {
     move_stop(s)
     s.sweep_walking = false
   }
-}
-
-act_skip_target :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  s := ctx.session
-  run := &s.script
-  if !run.pick.set {
-    clear_focus(s)
-    return .Done
-  }
-  reason := strings.trim_space(script_arg(ctx, step.action.strs[0]))
-  if reason == "" {
-    reason = "blocked"
-  }
-  ppos, _ := read_player_pos(s)
-  tpos, _ := engine.read_vec3(s.proc_info.handle, run.pick.obj + uintptr(s.layout.pos_off))
-  // steer=true: we jammed trying to reach it, so the obstacle is roughly in its direction and the
-  // avoid rung should prefer the other side next pass.
-  auto_skip_blocked(s, run.pick.obj, ppos, tpos, reason, true, ctx.now)
-  run.pick.set = false
-  return .Done
 }
 
 // --- event implementations ---------------------------------------------------------------------
@@ -3290,19 +3361,6 @@ ev_at_position :: proc(ctx: ^Behaviour_Context, ev: Script_Event, st: ^Event_Sta
   }
   target := [3]f32{cx, ppos[1], cz}
   return engine.dist_horizontal(ppos, target) <= f32(ev.nums[2])
-}
-
-// --- NOT-YET blocks: the stubs ---------------------------------------------------------------------
-// The reason each one is unavailable is a `not_built_why` string on its catalog row, not a proc: it is
-// a fact about the tool, not about this session, and there is no question to ask the Session. The stubs
-// below are unreachable in practice (a run is refused before it starts) and exist as defence in depth.
-
-act_not_implemented :: proc(ctx: ^Behaviour_Context, step: ^Script_Step) -> Step_Status {
-  return .Failed // unreachable: script_check_avail refuses the run before it starts
-}
-
-ev_not_implemented :: proc(ctx: ^Behaviour_Context, ev: Script_Event, st: ^Event_State) -> bool {
-  return false
 }
 
 // --- shared helpers used by the tables ---------------------------------------------------------

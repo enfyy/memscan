@@ -33,15 +33,15 @@ TILE_LINE_GAP :: f32(4) // between the title line and the line under it
 // One row in the browser. Both kinds of behaviour appear here: the ones compiled into the exe and the
 // ones saved as files, because "which behaviours exist" is a single question with a single answer.
 Gui_Bhv_Row :: struct {
-  name:      string, // owned
-  blurb:     string, // owned ("" for a saved chart - a file carries no description)
-  builtin:   bool, // defined in Odin: read-only, duplicate it to edit
-  shadowed:  bool, // a saved file of the same name wins over this built-in
-  test:      bool, // runs with nothing attached (the verification set)
-  interrupt: bool, // nothing but watchers: armed, not run - it belongs in the Interrupts tab
-  trigger:   string, // owned; the interrupt's trigger as one line ("" for a chart)
-  subchart:  bool, // declared `subchart`: placed in another chart, not run - the Your blocks tab
-  signature: string, // owned; `approach_and_kill <who> <spot>` for a block, "" otherwise
+  name:     string, // owned
+  blurb:    string, // owned ("" when a saved file carries no `desc`)
+  builtin:  bool, // defined in Odin: read-only, duplicate it to edit
+  shadowed: bool, // a saved file of the same name wins over this built-in
+  test:     bool, // runs with nothing attached (the verification set)
+  // The FIRST rule's WHEN, as one line. Shown in the Interrupts tab, where the question is "what would
+  // this take over on" - and the answer is the top rule's condition, because arming a behaviour arms
+  // its whole list and the list is read in order.
+  trigger:  string, // owned
 }
 
 gui_free_bhv_rows :: proc(ps: ^Panel_State) {
@@ -49,7 +49,6 @@ gui_free_bhv_rows :: proc(ps: ^Panel_State) {
     delete(r.name)
     delete(r.blurb)
     delete(r.trigger)
-    delete(r.signature)
   }
   clear(&ps.browser_rows)
 }
@@ -75,8 +74,7 @@ gui_scan_behaviours :: proc(ps: ^Panel_State) {
         builtin = true,
         shadowed = shadowed,
         test = d.test,
-        trigger = strings.clone(""),
-        signature = strings.clone(""),
+        trigger = gui_bhv_trigger_text(d.name),
       },
     )
   }
@@ -85,46 +83,47 @@ gui_scan_behaviours :: proc(ps: ^Panel_State) {
       name  = strings.clone(s),
       blurb = strings.clone(""),
     }
-    // Read the CONTENT to find out which tab it belongs in - a document is "something you arm" when it
-    // is nothing but watchers, and "something you place" when it says `subchart`. This is a file parse
-    // per saved chart per scan, which is why the scan is throttled to BROWSER_SCAN_INTERVAL - the same
+    // Read the CONTENT for the blurb and the top rule's condition. This is a file parse per saved
+    // behaviour per scan, which is why the scan is throttled to BROWSER_SCAN_INTERVAL - the same
     // reasoning as the directory listing itself (see the note at the top of this file).
     if doc, ok := bhv_open(s); ok {
       delete(row.blurb)
       row.blurb = strings.clone(doc.desc)
-      row.subchart = doc.is_subchart
-      if row.subchart {
-        row.signature = strings.clone(subchart_signature(s, subchart_params(&doc)))
-      }
-      // A block is placed, never armed - so the watchers-only test does not get to reclassify one.
-      row.interrupt = !row.subchart && script_doc_is_watchers_only(&doc)
-      if row.interrupt {
-        n := 0
-        b := strings.builder_make(context.temp_allocator)
-        for st in doc.steps {
-          if st.op != .On || st.goto_id == 0 {
-            continue
-          }
-          if n > 0 {
-            strings.write_string(&b, ", ")
-          }
-          script_write_event(&b, st.condition)
-          n += 1
-        }
-        row.trigger = strings.clone(strings.to_string(b))
-      }
+      row.trigger = gui_bhv_rules_trigger_text(&doc)
       behaviour_doc_free(&doc)
-    }
-    if row.trigger == "" {
+    } else {
       row.trigger = strings.clone("")
-    }
-    if row.signature == "" {
-      row.signature = strings.clone("")
     }
     append(&ps.browser_rows, row)
   }
   ps.browser_scan_at = rl.GetTime()
   ps.browser_rescan = false
+}
+
+// The top rule's WHEN, spelled the way `script show` spells it. Owned by the caller.
+@(private = "file")
+gui_bhv_rules_trigger_text :: proc(doc: ^Behaviour_Doc) -> string {
+  if len(doc.rules) == 0 {
+    return strings.clone("")
+  }
+  b := strings.builder_make(context.temp_allocator)
+  script_write_condition(&b, doc.rules[0].condition, true)
+  return strings.clone(strings.to_string(b))
+}
+
+// Same, for a built-in - which has to be BUILT before it can be asked. Only run on a browser rescan.
+@(private = "file")
+gui_bhv_trigger_text :: proc(name: string) -> string {
+  def := behaviour_def(name)
+  if def == nil {
+    return strings.clone("")
+  }
+  doc, ok := bhv_from_builtin(def)
+  if !ok {
+    return strings.clone("")
+  }
+  defer behaviour_doc_free(&doc)
+  return gui_bhv_rules_trigger_text(&doc)
 }
 
 // ===========================================================================
@@ -174,7 +173,7 @@ gui_behaviour_dock :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
   name := fmt.ctprintf("%s", gui_ellipsize(f.script_name, 22))
   name_w := gui_text_button_w(name, 14)
   gap := px(DOCK_GAP)
-  row_w := name_w + 4 * (gap + px(ICON_BTN))
+  row_w := name_w + 3 * (gap + px(ICON_BTN)) // pause/resume, reset, stop - the step button went with the pc
 
   // The step readout, above the controls: position plus the block actually executing right now.
   line := f.script_line
@@ -195,13 +194,13 @@ gui_behaviour_dock :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
   // on?" had no answer short of running `interrupt list` in the REPL. One chip each, lit while it has
   // control, with its fire tally.
   watch_line := ""
-  if f.watcher_count > 0 {
+  if f.rule_count > 0 {
     b := strings.builder_make(context.temp_allocator)
-    for i in 0 ..< f.watcher_count {
+    for i in 0 ..< f.rule_count {
       if i > 0 {
         strings.write_string(&b, "   ")
       }
-      row := f.watchers[i]
+      row := f.rules[i]
       strings.write_string(&b, row.live ? "> " : "- ")
       strings.write_string(&b, gui_ellipsize(row.label, 28))
       if row.fires > 0 {
@@ -224,7 +223,7 @@ gui_behaviour_dock :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
     imgui.DrawList_AddText(wdl, {wp.x + 1, wp.y + 1}, u32_of({0, 0, 0, 0.75}), watch_c)
     imgui.DrawList_AddText(wdl, wp, u32_of(f.script_in_watcher ? COL_WARN : tint(COL_TEXT_DIM, 0.95)), watch_c)
     if imgui.IsItemHovered() {
-      imgui.SetTooltip("Watchers armed for this run - its own, any it borrows, and anything set to always watch. Checked before every step, first match wins.")
+      imgui.SetTooltip("This behaviour's rules, in the order they are read. Every tick the list is read top to bottom and the first one whose condition holds runs - the lit one is that rule.")
     }
   }
 
@@ -255,12 +254,8 @@ gui_behaviour_dock :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
     }
   }
   imgui.SameLine(0, gap)
-  if gui_icon_button("tp_reset", ICON_REPLAY, false, "Rewind to the start node  ('script reset')") {
+  if gui_icon_button("tp_reset", ICON_REPLAY, false, "Start the list over - every rule re-armed  ('script reset')") {
     panel_enqueue(ps, "script reset")
-  }
-  imgui.SameLine(0, gap)
-  if gui_icon_button("tp_step", ICON_STEP, f.script_step, f.script_step ? "Execute one block  ('script step', 'script step off' to resume)" : "Single-step: freeze the walker and run one block at a time  ('script step')") {
-    panel_enqueue(ps, "script step")
   }
   imgui.SameLine(0, gap)
   if gui_icon_button("tp_stop", ICON_STOP, false, "Stop - anything in flight is torn down  ('script stop')", COL_BAD) {
@@ -302,40 +297,26 @@ gui_browser_window :: proc(ps: ^Panel_State, f: ^Gui_Frame) {
 
   imgui.Dummy({0, 2})
 
-  // THREE KINDS OF DOCUMENT, THREE TABS. They were one scroll region, which put the answer to three
-  // different questions - what can I run, what can I place, what is watching - in one list you had to
-  // read past. The SEARCH stays above the bar so it filters whichever tab is open; a per-tab search box
-  // would be three boxes to remember you had typed in.
+  // TWO TABS, for the two VERBS. A behaviour is something you RUN or something you ARM, and the same
+  // document can be either - arming one just puts its rule list above whatever else is running (see
+  // interrupt.odin). It used to be three, because a document could also be a sub-chart you PLACED; that
+  // third verb went away with the graph.
   //
-  // Counts in the labels, the same trick the editor's Problems tab uses: the tab itself is then the
-  // answer to "is there anything in there", so you do not have to open one to find out it is empty.
-  charts, blocks, watchers := 0, 0, 0
-  for r in ps.browser_rows {
-    if r.interrupt {
-      watchers += 1
-    } else if r.subchart {
-      blocks += 1
-    } else {
-      charts += 1
-    }
-  }
+  // The SEARCH stays above the bar so it filters whichever tab is open; a per-tab search box would be
+  // two boxes to remember you had typed in. Counts in the labels, the same trick the editor's Problems
+  // tab uses: the tab is then the answer to "is there anything in there".
+  behaviours := len(ps.browser_rows)
+  armed := f.armed_watcher_count
   // The list stops short of the bottom so the footer has a line; without the reservation the child
   // takes the whole remaining height and the footer lands outside the window.
   footer := imgui.GetTextLineHeightWithSpacing()
   if imgui.BeginChild("##bhvgrid", {0, -footer}, {}) {
     if imgui.BeginTabBar("##bhvtabs") {
-      if imgui.BeginTabItem(charts == 0 ? "Charts" : fmt.ctprintf("Charts (%d)", charts)) {
-        gui_bhv_tile_section(ps, f, filter, subchart = false)
+      if imgui.BeginTabItem(behaviours == 0 ? "Behaviours" : fmt.ctprintf("Behaviours (%d)", behaviours)) {
+        gui_bhv_tile_section(ps, f, filter)
         imgui.EndTabItem()
       }
-      if imgui.BeginTabItem(blocks == 0 ? "Your blocks" : fmt.ctprintf("Your blocks (%d)", blocks)) {
-        imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
-        imgui.TextWrapped("These are charts you turned into BLOCKS. You do not run one - you place it in another chart from the palette, and it becomes a single node there.")
-        imgui.PopStyleColor(1)
-        gui_bhv_tile_section(ps, f, filter, subchart = true)
-        imgui.EndTabItem()
-      }
-      if imgui.BeginTabItem(watchers == 0 ? "Interrupts" : fmt.ctprintf("Interrupts (%d)", watchers)) {
+      if imgui.BeginTabItem(armed == 0 ? "Interrupts" : fmt.ctprintf("Interrupts (%d)", armed)) {
         gui_bhv_irq_section(ps, f, filter)
         imgui.EndTabItem()
       }
@@ -388,19 +369,14 @@ gui_fit_right :: proc(s: string, avail: f32) -> cstring {
   return "..."
 }
 
-// One tab's worth of tiles. The two tile tabs differ only in which rows they take and what the New
-// button makes, so they share this rather than being written twice - the tile itself already knows how
-// to draw a block (see gui_bhv_tile).
+// Every behaviour, as tiles.
 @(private = "file")
-gui_bhv_tile_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string, subchart: bool) {
+gui_bhv_tile_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string) {
   // The New tile is first and is never filtered out: it is the way IN to the editor, and hiding it
   // behind a search that happens to match nothing is the moment you most want to make one.
-  gui_bhv_new_tile(ps, subchart)
+  gui_bhv_new_tile(ps)
   matched := 0
   for &r in ps.browser_rows {
-    if r.interrupt || r.subchart != subchart {
-      continue
-    }
     if filter != "" && !strings.contains(strings.to_lower(r.name, context.temp_allocator), filter) {
       continue
     }
@@ -409,13 +385,7 @@ gui_bhv_tile_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string, su
   }
   if matched == 0 {
     imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
-    if filter != "" {
-      imgui.TextUnformatted("Nothing matches that.")
-    } else if subchart {
-      imgui.TextWrapped("No blocks yet. Make one with the + tile, or open a chart you already have and tick 'Use as a block' in its options.")
-    } else {
-      imgui.TextUnformatted("No charts yet - the + tile starts one.")
-    }
+    imgui.TextUnformatted(filter != "" ? "Nothing matches that." : "No behaviours yet - the + tile starts one.")
     imgui.PopStyleColor(1)
   }
 }
@@ -428,37 +398,16 @@ gui_bhv_tile_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string, su
 // there is one kind of document now, and "something you arm" is a shape it can have.
 @(private = "file")
 gui_bhv_irq_section :: proc(ps: ^Panel_State, f: ^Gui_Frame, filter: string) {
-  any := false
-  for r in ps.browser_rows {
-    if r.interrupt {
-      any = true
-      break
-    }
-  }
   imgui.Dummy({0, px(8)})
   imgui.SeparatorText("Always watching - armed, not run")
   imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
-  imgui.TextWrapped("These are watchers, not charts. Ticked, one is checked whatever else is happening and takes over when it fires. A single chart can borrow one instead, from its options tab.")
+  imgui.TextWrapped("Ticked, a behaviour's rules are read whatever else is happening - above the rules of whatever is running - and the first one whose condition holds takes over. The behaviour underneath is suspended mid-step and resumes exactly where it was.")
+  imgui.Dummy({0, px(4)})
+  imgui.TextWrapped("ANY behaviour can be armed; there is no separate kind of document. One with a single edge-triggered rule is what you usually want here - a whole farm loop armed as an interrupt would take over and never give the tick back.")
   imgui.PopStyleColor(1)
-  // The EMPTY STATE is not optional now that this is a tab rather than a trailing section. As a
-  // section, having nothing to say meant drawing nothing and letting the charts above it fill the
-  // window; as a tab, drawing nothing is a blank panel that reads as a broken feature. It also has to
-  // say WHY the list is empty, because "a watcher-only document" is not a thing you would guess you
-  // needed to make.
-  if !any && f.armed_watcher_count == 0 {
-    imgui.Dummy({0, px(6)})
-    imgui.PushStyleColorImVec4(.Text, COL_TEXT_DIM)
-    imgui.TextWrapped("Nothing here yet. A document shows up in this list when it is NOTHING BUT watchers - an 'on' node wired to the steps it should run, and no start node of its own.")
-    imgui.Dummy({0, px(4)})
-    imgui.TextWrapped("Make one from the Charts tab: + New chart, add an 'on' node, wire it to a body, and save. An 'on' node inside an ordinary chart is not this - it belongs to that chart and arms only while it runs.")
-    imgui.PopStyleColor(1)
-    return
-  }
+  imgui.Dummy({0, px(6)})
 
   for &r in ps.browser_rows {
-    if !r.interrupt {
-      continue
-    }
     if filter != "" && !strings.contains(strings.to_lower(r.name, context.temp_allocator), filter) {
       continue
     }
@@ -602,7 +551,7 @@ gui_bhv_tile_body :: proc(rmin, rmax: imgui.Vec2, t: Bhv_Tile_Text) {
 // The first tile: start a blank chart in the node editor. Drawn as an outline rather than a filled
 // button so it reads as "the empty slot", not as another behaviour that happens to be called New.
 @(private = "file")
-gui_bhv_new_tile :: proc(ps: ^Panel_State, subchart := false) {
+gui_bhv_new_tile :: proc(ps: ^Panel_State) {
   imgui.PushID("##newtile")
   defer imgui.PopID()
   imgui.PushStyleColorImVec4(.Button, tint(COL_ACCENT, 0.10))
@@ -618,23 +567,18 @@ gui_bhv_new_tile :: proc(ps: ^Panel_State, subchart := false) {
     {
       icon = ICON_ADD,
       icon_col = COL_ACCENT,
-      title = subchart ? "New block" : "New chart",
+      title = "New behaviour",
       title_col = COL_TEXT,
-      tag = "open the node editor",
+      tag = "open the editor",
       tag_col = COL_TEXT_DIM,
     },
   )
   if imgui.IsItemHovered() {
-    imgui.SetTooltip(
-      "%s",
-      subchart \
-      ? cstring("Draw a chart that other charts can place as one block. It runs once, takes settings you declare, and cannot have watchers of its own.") \
-      : cstring("Draw a behaviour as a node graph. It is saved to a .bhv file when you hit Save."),
-    )
+    imgui.SetTooltip("Write a behaviour as a list of rules - WHEN something holds, DO these steps. It is saved to a .bhv file when you hit Save.")
   }
   if clicked {
     ps.browser_open = false
-    gui_editor_new(ps, subchart)
+    gui_editor_new(ps)
   }
 }
 
@@ -703,26 +647,20 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
   if running {
     tag = f.script_paused ? "PAUSED" : "running"
     tag_col = f.script_paused ? COL_WARN : COL_OK
-  } else if r.subchart {
-    // Its SIGNATURE where a chart shows its status, because that is the thing you need from a block:
-    // what it is called and what you have to fill in. It has no run state to report - it never runs on
-    // its own.
-    tag = r.signature
-    tag_col = ed_cat_color(.Sub)
   }
   // The text stops where the button starts. Handing gui_bhv_tile_body a narrower rect is all it takes:
   // it fits the title and right-aligns the badge against whatever rect it is given, so the button's
   // width comes off the box rather than being special-cased inside the one layout proc.
   text_max := tile_max
-  if !inert && !r.subchart {
+  if !inert {
     text_max.x -= load_w + px(TILE_PAD)
   }
   gui_bhv_tile_body(
     tile_min,
     text_max,
     {
-      icon = r.subchart ? ICON_CAT_SUB : (r.builtin ? ICON_CODE : ICON_FILE),
-      icon_col = r.subchart ? ed_cat_color(.Sub) : icon_col,
+      icon = r.builtin ? ICON_CODE : ICON_FILE,
+      icon_col = icon_col,
       title = r.name,
       title_col = inert ? COL_TEXT_DIM : COL_TEXT,
       tag = tag,
@@ -749,33 +687,12 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
   // The right-click menu binds to the LAST ITEM, so it has to be claimed here while that is still the
   // tile - after the Load button it would bind to the button and the tile would stop answering.
   if imgui.BeginPopupContextItem("##ctx") {
-    // A BLOCK offers neither. Running one starts and stops in the same breath - it is a fragment of a
-    // chart, and `script run` refuses it - so the menu offers the thing you actually want instead:
-    // stop being a block, and go back to being a chart you can run.
-    if r.subchart {
-      if imgui.Selectable("Make it a chart again") {
-        panel_enqueue(ps, fmt.tprintf("script subchart %s off", r.name))
-      }
-      if imgui.IsItemHovered() {
-        imgui.SetTooltip("It stops appearing in the palette, and can be run on its own again. Charts that place it will say the block is missing.")
-      }
-      imgui.Separator()
-    } else {
-      if !inert && imgui.Selectable("Run") {
-        panel_enqueue(ps, fmt.tprintf("script run %s", r.name))
-      }
-      if running {
-        if imgui.Selectable("Stop") {
-          panel_enqueue(ps, "script stop")
-        }
-      }
-      // The other direction. Only for a SAVED chart: a built-in has no file to flag, and `script
-      // subchart` says so rather than doing something surprising.
-      if !r.builtin && imgui.Selectable("Use as a block") {
-        panel_enqueue(ps, fmt.tprintf("script subchart %s on", r.name))
-      }
-      if !r.builtin && imgui.IsItemHovered() {
-        imgui.SetTooltip("It moves to 'Your blocks' and appears in every chart's palette. It runs once, and cannot have watchers of its own.")
+    if !inert && imgui.Selectable("Run") {
+      panel_enqueue(ps, fmt.tprintf("script run %s", r.name))
+    }
+    if running {
+      if imgui.Selectable("Stop") {
+        panel_enqueue(ps, "script stop")
       }
     }
     // Opening a built-in is allowed and is how you make one editable: the editor loads the built
@@ -824,9 +741,7 @@ gui_bhv_tile :: proc(ps: ^Panel_State, f: ^Gui_Frame, r: ^Gui_Bhv_Row) {
   // immediately by an item, which is the condition ImGui asks for. Because the button is shorter than
   // the tile and centred in it, the row still advances by the tile's height and the grid is unchanged.
   //
-  // A BLOCK has no Load: there is nothing to start. Its tile is a click that opens the editor and a
-  // right-click menu, which is the whole set of things you can do to one.
-  if !inert && !r.subchart {
+  if !inert {
     imgui.SameLine(0, 0)
     imgui.SetCursorPosX(row_x + tile_w - load_w - px(TILE_PAD))
     imgui.SetCursorPosY(row_y + (tile_h - px(load_h)) * 0.5)

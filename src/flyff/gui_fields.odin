@@ -76,10 +76,11 @@ suggest_corpus :: proc(
 	case .Var_Name:
 		return suggest_filter(chart_variable_names(doc), query, exclude)
 	case .Chart_Name:
-		// Derived from what is on disk right now, like .Var_Name is derived from the open document. The
-		// registry is scanned on the browser's throttle rather than here - this runs per frame while a
-		// field is open, and a directory listing per frame is exactly what that cache exists to avoid.
-		return suggest_filter(subchart_registry_names(), query, exclude)
+		// Every saved behaviour, from what is on disk right now - the same corpus `script list` shows.
+		// This runs per frame while a field is open, so it is a directory listing per frame; acceptable
+		// because a field is only open while somebody is typing into it, and the alternative was a cache
+		// that had to be invalidated from every save path.
+		return suggest_filter(bhv_list_names(), query, exclude)
 	case .Str, .Num, .Duration, .Percent, .Coord:
 		return nil
 	}

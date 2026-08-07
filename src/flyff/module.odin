@@ -221,19 +221,10 @@ on_attach :: proc(es: ^engine.Session) {
     engine.ensure_hotkey_thread(&s.eng) // they are evaluated on the watcher tick
   }
 
-  // Runtime-toggle mirrors: the session bools stay authoritative at runtime; the layout copies exist
-  // only so they persist through flyff.cfg. Load them into the live session here; their CLI toggles
-  // (preselect / lookalive / reachgate / hunt) write both sides + save. sfx/fxlaser live on the layout only.
-  s.preselect_on = s.layout.preselect_on
-  s.lookalive_on = s.layout.lookalive_on
-  s.reach_gate_on = s.layout.reach_gate_on
+  // Runtime-toggle mirror: the session bool stays authoritative at runtime; the layout copy exists only
+  // so it persists through flyff.cfg. The CLI toggle writes both sides + saves. sfx/fxlaser live on the
+  // layout only.
   s.bgkeys_on = s.layout.bgkeys_on
-  s.hunt_on = s.layout.hunt_on
-  s.combat_watch_on = s.layout.combat_watch_on
-  s.auto_stuck_on = s.layout.auto_stuck_on
-  s.aggro_first_on = s.layout.aggro_first_on
-  s.melee_first_on = s.layout.melee_first_on
-  s.pocket_on = s.layout.pocket_on
 
   // srvsync defaults ON now that the anti-DC path is proven - it's always needed. It stays inert
   // (notify_server_target no-ops) until sendsettarget_rva/objid_off are set on a 32-bit client, so

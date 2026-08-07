@@ -289,9 +289,6 @@ sweep_arm :: proc(session: ^Session, w: ^Sweep_Wip) -> bool {
   if !session.auto_on {
     line = fmt.tprintf("%s - run 'auto' to start sweeping", line)
   }
-  if session.hunt_on {
-    line = fmt.tprintf("%s  (hunt suppressed while sweeping)", line)
-  }
   fmt.println(line)
   if !terrain_ready(session) {
     fmt.println("  note: terrain isn't calibrated ('worldscan'), so the lane was validated against placed objects only.")
@@ -546,9 +543,6 @@ sweep_print_status :: proc(session: ^Session) {
   fmt.println("  only mobs already inside attack_range are eligible while a lane is armed. 'sweep off' to drop it.")
   if !moveto_configured(session) {
     fmt.println("  note: 'findmove' isn't pinned, so the lane can't step you forward - run it to walk the lane hands-free.")
-  }
-  if session.hunt_on {
-    fmt.println("  note: hunt mode is suppressed while a lane is armed (it comes back when the sweep ends).")
   }
 }
 
